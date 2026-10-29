@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.orchard-out/
+app/menubar/.build/
+app/menubar/build/
+app/workerbar/.build/
+app/workerbar/build/
