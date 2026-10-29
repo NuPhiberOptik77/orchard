@@ -99,6 +99,26 @@ def test_check_shipping_size_cap(tmp_path, monkeypatch):
     engine.check_shipping_size(plain, "run")
 
 
+def test_tar_is_deterministic(tmp_path, monkeypatch):
+    # Same tree, different clock and different temp-file names: the bytes (and
+    # so the inbox sha) must match, or every run re-uploads the tarball.
+    proj = tmp_path / "proj"
+    (proj / "pkg").mkdir(parents=True)
+    (proj / "a.py").write_text("print(1)")
+    (proj / "pkg" / "b.py").write_text("print(2)")
+    blobs = []
+    for i, clock in enumerate((1_000_000_000.0, 2_000_000_000.0)):
+        monkeypatch.setattr(engine.gzip.time, "time", lambda c=clock: c)
+        path = tmp_path / f"run-{i}.tgz"
+        with open(path, "wb") as fh:
+            engine._tar_into(fh, proj)
+        blobs.append(path.read_bytes())
+    assert blobs[0] == blobs[1]
+    assert engine.build_tar_bytes(proj) == blobs[0]
+    with tarfile.open(fileobj=BytesIO(blobs[0]), mode="r:gz") as tar:
+        assert sorted(tar.getnames()) == ["a.py", "pkg/b.py"]
+
+
 def test_tracked_files_outside_repo(tmp_path):
     plain = tmp_path / "plain"
     plain.mkdir()

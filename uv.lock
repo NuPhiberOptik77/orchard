@@ -52,7 +52,7 @@ wheels = [
 
 [[package]]
 name = "orchard"
-version = "0.5.2"
+version = "0.6.4"
 source = { editable = "." }
 dependencies = [
     { name = "pyyaml" },

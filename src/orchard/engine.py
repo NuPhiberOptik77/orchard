@@ -7,6 +7,7 @@ status polling, log/artifact collection, and kill.
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import os
@@ -154,11 +155,15 @@ def iter_shipped(root: Path, tracked_only: bool = False):
 
 
 def _tar_into(fobj, root: Path, tracked_only: bool = False) -> int:
+    # mode="w:gz" stamps the gzip header with the current time and the temp
+    # file's random name, so an unchanged tree never hashed the same and the
+    # worker's inbox check (`test -f <sha>.tgz`) never skipped an upload.
     count = 0
-    with tarfile.open(fileobj=fobj, mode="w:gz") as tar:
-        for full, arcname in iter_shipped(root, tracked_only):
-            tar.add(full, arcname=arcname, recursive=False)
-            count += 1
+    with gzip.GzipFile(filename="", mode="wb", fileobj=fobj, mtime=0) as gz:
+        with tarfile.open(fileobj=gz, mode="w") as tar:
+            for full, arcname in iter_shipped(root, tracked_only):
+                tar.add(full, arcname=arcname, recursive=False)
+                count += 1
     return count
 
 
