@@ -212,10 +212,14 @@ use, on battery, or thermally throttled flips to running locally once it has wai
 `fallback_after_s` (dispatch.json, default 900) — the Air just does the work. Jobs
 whose tags or platform needs exclude the Air (e.g. `x86_64`) keep waiting instead,
 with the reason shown in the queue note. A job that loses contact mid-run for
-`max_misses` polls (default 40 ≈ 10 min) is requeued locally the same way, or fails
-with the blocking reason if the Air can't run it. An abandoned remote job from a
-lost-contact fallback is remembered as an orphan, with its attempt number. When
-the worker answers again, the dispatcher reads the orphan's status before acting:
+`max_misses` polls (default 40 ≈ 10 min) is requeued locally the same way. If the
+Air can't run it, the job stays running on its worker, with the reason in its note
+and one `held` event, and stops counting as that worker's busy job so the rest of
+its queue can still fall back. Its status is collected as usual once the worker
+answers; a worker that answers with no status for the job fails it. An abandoned
+remote job from a lost-contact fallback, or from a cancel whose remote kill failed,
+is remembered as an orphan, with its attempt number. When the worker answers
+again, the dispatcher reads the orphan's status before acting:
 
 - still running or paused: killed;
 - finished under a different attempt number: ignored as stale;
@@ -226,8 +230,8 @@ the worker answers again, the dispatcher reads the orphan's status before acting
   collected beside the rerun into `<state dir>/orphan` and
   `.orchard-out/<id>/orphan`.
 
-Each case logs an `orphan` event with the outcome and `duplicate: true` when both
-copies ran. Contact loss can't be told apart from a dead worker in time to avoid
+Each case logs an `orphan` event with the outcome and `duplicate: true` when the
+job was launched again after the orphan's attempt. Contact loss can't be told apart from a dead worker in time to avoid
 the rerun, so a job whose side effects must not repeat should key them on
 `ORCHARD_JOB_ID` and check `ORCHARD_ATTEMPT`.
 

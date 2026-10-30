@@ -152,5 +152,16 @@ def test_remote_job_running(monkeypatch):
     assert engine.remote_job_running(worker, "j1") is False
 
 
+def test_remote_status_missing(monkeypatch):
+    class Proc:
+        def __init__(self, code, out):
+            self.returncode, self.stdout = code, out
+
+    worker = Worker(name="pro", host="10.0.0.9")
+    for code, out, want in ((0, b"no\n", True), (0, b"yes\n", False), (255, b"", False)):
+        monkeypatch.setattr(engine.transport, "run", lambda *a, c=code, o=out, **k: Proc(c, o))
+        assert engine.remote_status_missing(worker, "/Users/x/.orchard/jobs/j1") is want
+
+
 def test_remote_job_dir():
     assert engine.remote_job_dir("/Users/x", "abc-1") == "/Users/x/.orchard/jobs/abc-1"

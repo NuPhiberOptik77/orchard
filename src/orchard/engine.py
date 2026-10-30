@@ -289,6 +289,15 @@ def remote_status(worker: Worker, rjob: str) -> dict | None:
         return None
 
 
+def remote_status_missing(worker: Worker, rjob: str) -> bool:
+    """True only when the worker answers and the job has no status.json."""
+    try:
+        proc = transport.run(worker, f'[ -f "{rjob}/status.json" ] && echo yes || echo no', timeout=20)
+    except subprocess.TimeoutExpired:
+        return False
+    return proc.returncode == 0 and proc.stdout.decode("utf-8", "replace").strip() == "no"
+
+
 def watch_remote(worker: Worker, rjob: str, interval: float = 4.0) -> dict | None:
     last_state = None
     while True:

@@ -33,7 +33,8 @@ to `out/` comes back to `./.orchard-out/<job-id>/out/`.
   correctly fails with a reason instead of running somewhere wrong.
 - **Falls back.** If the worker is unavailable for about 15 minutes, queued jobs
   run on the controller instead, except jobs that need the worker. A job that
-  loses contact mid-run is requeued. When the worker is back, the abandoned copy
+  loses contact mid-run is requeued; one that only the worker can run waits for
+  it and is collected when it answers. When the worker is back, the abandoned copy
   is killed if it is still running. If it already finished, its result is read,
   not thrown away: a success is adopted and the rerun stopped, and anything else
   is kept beside the rerun with an `orphan` event that flags the duplicate run.

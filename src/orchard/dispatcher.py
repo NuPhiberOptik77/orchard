@@ -337,7 +337,9 @@ def tick(workers: list[Worker] | None = None) -> list[str]:
             entry["note"] = f"dispatch error: {exc}"
             save_entry(entry)
             lines.append(f"{entry['id']}: dispatch error: {exc}")
-        if entry.get("state") == "running":
+        # A job stranded on a worker that stopped answering doesn't hold that
+        # worker's queue, or its other jobs could never reach their fallback.
+        if entry.get("state") == "running" and entry.get("misses", 0) <= cfg["max_misses"]:
             busy.add(entry["worker"])
 
     for entry in entries:
@@ -621,10 +623,14 @@ def poll_running(entry: dict, worker_map: dict[str, Worker], cfg: dict) -> list[
         save_entry(entry)
         return [f"{job_id}: held (worker not configured)"]
 
-    status = engine.remote_status(worker, engine.remote_job_dir(entry["rhome"], job_id))
+    rjob = engine.remote_job_dir(entry["rhome"], job_id)
+    status = engine.remote_status(worker, rjob)
     if status is None:
         entry["misses"] = entry.get("misses", 0) + 1
         if entry["misses"] > cfg["max_misses"]:
+            waiting = f"lost contact with {worker_name}; waiting for it"
+            if (entry.get("note") or "").startswith(waiting):
+                return _wait_stranded(entry, worker, rjob)
             job = spec_of(entry)
             ok, why = _local_fallback(job)
             if ok:
@@ -647,15 +653,34 @@ def poll_running(entry: dict, worker_map: dict[str, Worker], cfg: dict) -> list[
                 save_entry(entry)
                 events.append("requeued", job=job_id, worker="local", detail=f"lost contact with {worker_name}")
                 return [f"{job_id}: lost contact with {worker_name}; requeued locally"]
-            entry.update(state="failed", note=f"lost contact with worker (not runnable locally: {why})")
+            # Only this worker can run it, and it may still be running or have
+            # finished there: keep the job running and wait for the worker.
+            entry["note"] = f"{waiting} (not runnable locally: {why})"
             save_entry(entry)
-            events.append("failed", job=job_id, worker=worker_name, detail=f"lost contact; not runnable locally: {why}")
-            return [f"{job_id}: FAILED (lost contact with worker)"]
+            events.append("held", job=job_id, worker=worker_name, reason=entry["note"])
+            return [f"{job_id}: lost contact with {worker_name}; waiting for it (not runnable locally)"]
         save_entry(entry)
         return [f"{job_id}: no status from {worker_name} ({entry['misses']}/{cfg['max_misses']})"]
 
     entry["misses"] = 0
     return finish_or_track(entry, status, worker_map, cfg)
+
+
+def _wait_stranded(entry: dict, worker: Worker, rjob: str) -> list[str]:
+    """One tick of a lost-contact job that only its worker can run.
+
+    The worker's status is collected normally once it answers again. A worker
+    that answers but has no status.json for the job (its folder was cleaned up,
+    or it never really started) will never report one, so the job fails then.
+    """
+    job_id = entry["id"]
+    if engine.remote_status_missing(worker, rjob):
+        entry.update(state="failed", note=f"{worker.name} answers again but has no status for the job")
+        save_entry(entry)
+        events.append("failed", job=job_id, worker=worker.name, detail="lost contact; no status after it came back")
+        return [f"{job_id}: FAILED ({worker.name} has no status for the job)"]
+    save_entry(entry)
+    return [f"{job_id}: waiting for {worker.name} (lost contact; not runnable locally)"]
 
 
 def finish_or_track(
@@ -717,8 +742,8 @@ def settle_orphan(entry: dict, worker: Worker) -> list[str]:
     read before anything is killed. A success is adopted if the local rerun has
     not finished: the rerun is stopped and the worker's result becomes the job's.
     Any other finished orphan is kept beside the rerun's result (sdir/orphan and
-    .orchard-out/<id>/orphan), and an `orphan` event with duplicate=True records
-    that the command ran twice. The attempt number fences stale results: a
+    .orchard-out/<id>/orphan), and the `orphan` event's duplicate flag records
+    whether the command also ran again. The attempt number fences stale results: a
     status written by a different attempt is never adopted.
     """
     job_id = entry["id"]
@@ -746,6 +771,12 @@ def settle_orphan(entry: dict, worker: Worker) -> list[str]:
     sdir, cwd = Path(entry["sdir"]), Path(entry["cwd"])
     rerun = entry.get("state")
     local_rerun = entry.get("worker") == "local" and rerun in ("queued", "running")
+    # Every launch bumps attempts, so a count past the orphan's means the
+    # command started again. Records without an attempt go by the state.
+    if expected is None:
+        ran_again = rerun not in ("queued", "cancelled")
+    else:
+        ran_again = entry.get("attempts", 0) > expected
     if state == "succeeded" and local_rerun:
         if rerun == "running":
             _stop_local_rerun(entry, sdir)
@@ -778,7 +809,7 @@ def settle_orphan(entry: dict, worker: Worker) -> list[str]:
             state=state,
             attempt=attempt,
             rerun=rerun,
-            duplicate=rerun == "running",
+            duplicate=ran_again,
         )
         return [f"{job_id}: adopted result from {worker.name} ({stopped})"]
 
@@ -795,7 +826,7 @@ def settle_orphan(entry: dict, worker: Worker) -> list[str]:
         state=state,
         attempt=attempt,
         rerun=rerun,
-        duplicate=rerun != "queued",
+        duplicate=ran_again,
     )
     return [f"{job_id}: orphan {state} on {worker.name}; result kept beside the rerun"]
 

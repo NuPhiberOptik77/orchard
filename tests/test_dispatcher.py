@@ -148,7 +148,7 @@ def _orphaned(tmp_path, monkeypatch, remote, state, **fields):
     sdir.mkdir(exist_ok=True)
     cwd.mkdir(exist_ok=True)
     entry = dispatcher.enqueue(make_job(), "demo-o", cwd, sdir, worker="local")
-    entry.update(state=state, attempts=2, orphan=dict(ORPHAN), note="lost contact with worker", **fields)
+    entry.update({"state": state, "attempts": 2, "orphan": dict(ORPHAN), "note": "lost contact with worker", **fields})
     dispatcher.save_entry(entry)
     return sdir, cwd, kills, collected
 
@@ -192,7 +192,7 @@ def test_orphan_success_adopted_and_rerun_stopped(tmp_path, monkeypatch):
 
 def test_orphan_success_adopted_before_rerun_starts(tmp_path, monkeypatch):
     remote = {"state": "succeeded", "exit_code": 0, "attempt": 1}
-    sdir, _cwd, _kills, collected = _orphaned(tmp_path, monkeypatch, remote, "queued")
+    sdir, _cwd, _kills, collected = _orphaned(tmp_path, monkeypatch, remote, "queued", attempts=1)
     monkeypatch.setattr(dispatcher, "start_queued", lambda *a, **k: [])
     dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
     entry = dispatcher.load_entries()[0]
@@ -240,6 +240,16 @@ def test_orphan_from_other_attempt_ignored(tmp_path, monkeypatch):
     assert "attempt 3, expected 1" in entry["note"]
 
 
+def test_orphan_of_cancelled_job_not_duplicate(tmp_path, monkeypatch):
+    remote = {"state": "succeeded", "exit_code": 0, "attempt": 1}
+    sdir, _cwd, _kills, collected = _orphaned(tmp_path, monkeypatch, remote, "cancelled", worker="pro", attempts=1)
+    dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
+    assert collected[0][0] == sdir / "orphan"
+    assert dispatcher.load_entries()[0]["state"] == "cancelled"
+    orphan = [r for r in events.load() if r["event"] == "orphan"][0]
+    assert (orphan["outcome"], orphan["duplicate"]) == ("kept", False)
+
+
 def test_local_pid_liveness_marks_failed(tmp_path, monkeypatch):
     monkeypatch.setattr(dispatcher, "QUEUE_DIR", tmp_path / "queue")
     monkeypatch.setattr(dispatcher, "_pid_alive", lambda pid: False)
@@ -274,17 +284,75 @@ def test_pid_alive_detects_dead_process():
     assert dispatcher._pid_alive(os.getpid()) is True
 
 
-def test_lost_contact_not_runnable_locally_fails(tmp_path, monkeypatch):
+def test_lost_contact_not_runnable_locally_waits(tmp_path, monkeypatch):
     monkeypatch.setattr(dispatcher, "QUEUE_DIR", tmp_path / "queue")
     monkeypatch.setattr(dispatcher.engine, "remote_status", lambda worker, rdir: None)
-    monkeypatch.setattr(dispatcher, "_local_fallback", lambda job: (False, "missing tags: x86_64"))
+    monkeypatch.setattr(dispatcher.engine, "remote_status_missing", lambda worker, rdir: False)
+    checks = []
+    monkeypatch.setattr(
+        dispatcher, "_local_fallback", lambda job: checks.append(job) or (False, "missing tags: x86_64")
+    )
     entry = dispatcher.enqueue(make_job(), "demo-lost2", Path("/tmp/p"), Path("/tmp/s"), worker="pro")
-    entry.update(state="running", rhome="/Users/x/.orchard", misses=dispatcher.DISPATCH_DEFAULTS["max_misses"])
+    entry.update(state="running", rhome="/Users/x", misses=dispatcher.DISPATCH_DEFAULTS["max_misses"])
     dispatcher.save_entry(entry)
+    workers = [Worker(name="pro", host="10.0.0.9")]
+    assert any("waiting for it" in line for line in dispatcher.tick(workers=workers))
+    assert any("waiting for pro" in line for line in dispatcher.tick(workers=workers))
+    entry = dispatcher.load_entries()[0]
+    assert (entry["state"], entry["worker"]) == ("running", "pro")
+    assert entry["note"].startswith("lost contact with pro; waiting for it")
+    assert "x86_64" in entry["note"]
+    assert len(checks) == 1
+    assert [r["event"] for r in events.load()] == ["held"]
+
+
+def _stranded(tmp_path, monkeypatch, job_id="demo-strand"):
+    """A running job past max_misses that only its worker can run."""
+    monkeypatch.setattr(dispatcher, "QUEUE_DIR", tmp_path / "queue")
+    entry = dispatcher.enqueue(make_job(), job_id, tmp_path, tmp_path / "s", worker="pro")
+    entry.update(
+        state="running",
+        rhome="/Users/x",
+        attempts=1,
+        misses=dispatcher.DISPATCH_DEFAULTS["max_misses"] + 5,
+        note="lost contact with pro; waiting for it (not runnable locally: missing tags: x86_64)",
+    )
+    dispatcher.save_entry(entry)
+
+
+def test_stranded_job_does_not_hold_worker_queue(tmp_path, monkeypatch):
+    _stranded(tmp_path, monkeypatch)
+    monkeypatch.setattr(dispatcher.engine, "remote_status", lambda worker, rdir: None)
+    monkeypatch.setattr(dispatcher.engine, "remote_status_missing", lambda worker, rdir: False)
+    monkeypatch.setattr(dispatcher.engine, "remote_caps", lambda worker: None)
+    dispatcher.enqueue(make_job(), "demo-next", Path("/tmp/p"), Path("/tmp/s2"), worker="pro")
+    lines = dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
+    assert not any("worker busy" in line for line in lines)
+    assert any("demo-next" in line and "unreachable" in line for line in lines)
+
+
+def test_stranded_job_finishes_when_worker_returns(tmp_path, monkeypatch):
+    _stranded(tmp_path, monkeypatch)
+    remote = {"state": "succeeded", "exit_code": 0, "attempt": 1}
+    monkeypatch.setattr(dispatcher.engine, "remote_status", lambda worker, rdir: remote)
+    collected = []
+    monkeypatch.setattr(dispatcher.engine, "collect_remote", lambda *a, **k: collected.append(a[2]))
     dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
     entry = dispatcher.load_entries()[0]
+    assert (entry["state"], entry["misses"]) == ("done", 0)
+    assert collected == ["/Users/x/.orchard/jobs/demo-strand"]
+
+
+def test_stranded_job_fails_when_worker_has_no_status(tmp_path, monkeypatch):
+    _stranded(tmp_path, monkeypatch)
+    monkeypatch.setattr(dispatcher.engine, "remote_status", lambda worker, rdir: None)
+    monkeypatch.setattr(dispatcher.engine, "remote_status_missing", lambda worker, rdir: True)
+    monkeypatch.setattr(dispatcher, "_local_fallback", lambda job: (_ for _ in ()).throw(AssertionError))
+    lines = dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
+    assert any("FAILED" in line for line in lines)
+    entry = dispatcher.load_entries()[0]
     assert entry["state"] == "failed"
-    assert "x86_64" in entry["note"]
+    assert "no status for the job" in entry["note"]
 
 
 def test_tick_holds_when_worker_busy(tmp_path, monkeypatch):

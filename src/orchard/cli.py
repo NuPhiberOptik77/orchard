@@ -490,7 +490,12 @@ def cancel(job: str = typer.Argument(..., help="job id or unique prefix")) -> No
             except Exception:
                 killed = False
         if not killed and worker is not None and rjob:
-            entry["orphan"] = {"worker": worker.name, "rjob": rjob}
+            entry["orphan"] = {
+                "worker": worker.name,
+                "rjob": rjob,
+                "rhome": entry.get("rhome"),
+                "attempt": entry.get("attempts"),
+            }
             print("warning: could not kill remote job now; dispatcher will retry")
 
     entry.update(
