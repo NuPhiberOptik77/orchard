@@ -10,9 +10,11 @@ seconds. The agent fails closed: when that file is missing, unreadable or more
 than 60 s old, it holds new jobs and pauses running ones.
 
 register-task.ps1 starts it from two tasks. The startup task runs it with
--Startup from boot, and only that copy starts WSL or writes the file. A
-distro started from a sign-in session stops when that session signs out; one
-started from boot runs until Windows shuts down. While nobody is signed in it
+-Startup from boot, and only that copy starts WSL or writes the file. WSL's VM
+belongs to the Windows session that first started WSL since the WSL service
+last started, and stops when that session signs out. Started from boot, it
+runs until Windows shuts down, and wsl --shutdown doesn't change whose it is;
+this copy starts the distro again on its next pass. While nobody is signed in it
 counts the PC idle from the moment it saw that. When someone signs in, it
 marks the PC in use once, then passes on what the sign-in task reports.
 
@@ -226,9 +228,11 @@ while ($true) {
             if ($idle -lt 0 -or -not [OrchardHost]::InConsoleSession()) { $idle = 0 }
             Write-SessionFile (Get-Status $idle 'windows')
         } else {
-            # Restart a writer that died, at most once a minute.
+            # Restart a writer that died, say after wsl --shutdown, on the next
+            # pass: the file goes stale after 60 s and jobs pause. The pause
+            # between passes keeps a failing wsl.exe from spinning.
             if (($null -eq $writer -or $writer.HasExited) -and
-                ($null -eq $lastStart -or $lastStart.Elapsed.TotalSeconds -ge 60)) {
+                ($null -eq $lastStart -or $lastStart.Elapsed.TotalSeconds -ge 5)) {
                 $lastStart = [System.Diagnostics.Stopwatch]::StartNew()
                 $writer = Start-Writer
             }

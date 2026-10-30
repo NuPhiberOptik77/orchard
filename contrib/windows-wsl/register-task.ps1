@@ -14,13 +14,15 @@ runs in your session, because Windows only reports keyboard, mouse and
 controller input to the session that owns them, and hands those numbers to the
 startup task. Windows only lets an admin register a task like the startup one.
 
-Running it again replaces both tasks and restarts them. It shuts WSL down
-first, so the startup task starts the distro again itself: a distro started
-from your session stops when you sign out. That closes open distro windows and
-stops running jobs, which the dispatcher runs again.
+Running it again replaces both tasks and restarts them. It restarts the WSL
+service first, so the startup task is the first to start WSL again. WSL's VM
+belongs to the Windows session that first started WSL since the service last
+started, and stops when that session signs out; wsl --shutdown leaves it with
+that session. That closes open distro windows and stops running jobs, which
+the dispatcher runs again.
 
 If your admin prompt runs as another account, pass -User with your own, and
-restart Windows afterwards: WSL shutdown only reaches the account running this.
+restart Windows afterwards.
 #>
 param(
     [string]$Distro = 'Ubuntu-24.04',
@@ -65,12 +67,25 @@ foreach ($name in $startupName, $TaskName) {
         Stop-ScheduledTask -TaskName $name
     }
 }
+# Stopping a task can leave its PowerShell running, and that copy would keep
+# writing the status file the old way.
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+    Where-Object CommandLine -like '*orchard-host-status.ps1*' |
+    Invoke-CimMethod -MethodName Terminate -ErrorAction SilentlyContinue | Out-Null
 
-# WSL runs one VM per account, and this can only shut down its own.
-if ($User -eq $self) {
-    Write-Host 'Shutting WSL down, so the startup task starts it. Open distro windows close,'
-    Write-Host 'and running jobs stop until the dispatcher runs them again.'
-    & $wsl --shutdown
+# The VM stays with whichever session first started WSL since the WSL service
+# last started, even across wsl --shutdown. Restarting the service hands it to
+# the startup task, which starts WSL first below.
+Write-Host 'Restarting WSL, so the startup task starts it. Open distro windows close,'
+Write-Host 'and running jobs stop until the dispatcher runs them again.'
+$restart = $false
+try {
+    Stop-Service -Name WSLService -Force
+} catch {
+    # An older WSL with no service of its own: only a restart hands the VM over.
+    Write-Warning "Couldn't stop the WSL service: $($_.Exception.Message)"
+    $restart = $true
+    if ($User -eq $self) { & $wsl --shutdown }
 }
 
 function Register-Worker($Name, $Action, $Trigger, $Principal) {
@@ -101,6 +116,6 @@ if ($state -ne 'Running') {
     Write-Warning "'$startupName' is $state (last result $result), so nothing writes the status file."
 }
 Write-Host "Registered and started '$startupName' and '$TaskName'."
-if ($User -ne $self) {
+if ($restart -or $User -ne $self) {
     Write-Host "Restart Windows, so the startup task starts $User's distro."
 }

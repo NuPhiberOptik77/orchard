@@ -37,9 +37,11 @@ distro's own free space and C:'s.
 Two tasks run it, and both run as you:
 
 - **The startup task** runs from boot, before anyone signs in. It is the only
-  thing that starts the distro or writes the file. A distro started from your
-  session would stop when you sign out, and take any running job with it; this
-  one runs until Windows shuts down.
+  thing that starts the distro or writes the file. WSL's VM belongs to the
+  Windows session that first started WSL since the WSL service last started,
+  and stops when that session signs out, taking any running job with it.
+  Started from boot, it belongs to this task and runs until Windows shuts
+  down. If the distro stops, this task starts it again within seconds.
 - **The sign-in task** runs in your session, because Windows only reports
   keyboard, mouse and game controller input to the session that owns the
   screen. A service or a SYSTEM task would see a PC that is always idle. It
@@ -125,9 +127,11 @@ harmlessly.
    powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\Orchard\register-task.ps1"
    ```
 
-   It runs `wsl --shutdown` first, so the startup task starts the distro
-   itself. That closes open distro windows and stops running jobs, which the
-   dispatcher runs again. Then it prints `Registered and started 'Orchard WSL
+   It restarts the WSL service first, so the startup task is the first to
+   start WSL and the VM is its own. `wsl --shutdown` wouldn't do: the VM
+   would stay with whichever session started WSL first. That closes open
+   distro windows and stops running jobs, which the dispatcher runs again.
+   Then it prints `Registered and started 'Orchard WSL
    worker (startup)' and 'Orchard WSL worker'.` Admin is only needed to
    register the startup task, which runs without your password stored; both
    tasks run as you, without admin rights. If your account isn't an admin, the
@@ -191,10 +195,9 @@ the PC.
 - **Only XInput game controllers count as input.** That covers Xbox pads and
   most PC ones; others, such as a PlayStation pad, read as idle. A pad with
   stick drift keeps the PC in use while it is connected.
-- **After running `wsl --shutdown` yourself,** wait a minute before opening
-  the distro, so the startup task starts it first. A distro you start stops
-  when you sign out, and any running job with it; the dispatcher then runs
-  that job again.
+- **`wsl --shutdown` stops running jobs,** which the dispatcher runs again.
+  The startup task starts the distro again within seconds, and the VM stays
+  its own even if you open the distro first.
 - **Other Linux machines** work as workers too, but they need something that
   writes `host-status.json`, or every job stays held. On a headless server
   nobody uses, a cron job or systemd timer that writes `"power": "ac"`, a large
