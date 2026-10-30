@@ -2,8 +2,8 @@
 
 These files turn a Windows 11 PC into an Orchard worker that runs Linux jobs
 inside WSL2. The agent runs in the Linux distro like it does on a Mac: over
-SSH, from `~/.orchard`, with no daemon of its own. Windows adds one sign-in
-task that tells the agent when someone is using the PC.
+SSH, from `~/.orchard`, with no daemon of its own. Windows adds two small
+tasks that tell the agent when someone is using the PC.
 
 Linux workers only take jobs that ask for them. A job with no `os:*` tag is a
 macOS job, so nothing you already run moves to the PC. Opt a job in with
@@ -34,11 +34,28 @@ and `orchard doctor` and the queue's hold note name the reason:
 `host status missing`, `host status stale (75s old)` and so on. Free disk is the smaller of the
 distro's own free space and C:'s.
 
-The task must run in your signed-in session. Windows only reports input idle
-time to the session that owns the keyboard, so a service or a SYSTEM task
-would see a PC that is always idle. A locked screen is fine. After a reboot,
-nothing runs until you sign in, and queued jobs fall back to the controller
-after the usual 15 minutes.
+Two tasks run it, and both run as you:
+
+- **The startup task** runs from boot, before anyone signs in. It is the only
+  thing that starts the distro or writes the file. A distro started from your
+  session would stop when you sign out, and take any running job with it; this
+  one runs until Windows shuts down.
+- **The sign-in task** runs in your session, because Windows only reports
+  keyboard, mouse and game controller input to the session that owns the
+  screen. A service or a SYSTEM task would see a PC that is always idle. It
+  writes its numbers to `session-status.json` next to the scripts, and the
+  startup task passes them on. A locked screen is fine.
+
+While nobody is signed in, the startup task counts the PC as idle from the
+moment it saw that, so jobs start about three minutes after a restart or after
+the last person signs out. Those samples say `"source": "windows-signed-out"`.
+When someone signs in, it marks the PC in use once, then passes on what the
+sign-in task reports. If that is missing or more than 30 s old, it writes
+nothing and the file goes stale. If it can't tell whether anyone is signed in,
+it assumes someone is.
+
+So a restart, such as a Windows update overnight, doesn't take the worker
+offline until you next sign in.
 
 ## Setup
 
@@ -80,13 +97,16 @@ harmlessly.
    which needs its own rule. The GUID is WSL's fixed VM creator id.
 
    ```powershell
-   New-NetFirewallHyperVRule -Name OrchardSSH -DisplayName "Orchard SSH (WSL)" -Direction Inbound -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -Protocol TCP -LocalPorts 2222
+   New-NetFirewallHyperVRule -Name OrchardSSH -DisplayName "Orchard SSH (WSL)" -Direction Inbound -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -Protocol TCP -LocalPorts 2222 -Profiles Private
    New-NetFirewallRule -DisplayName "Orchard SSH (WSL)" -Direction Inbound -Protocol TCP -LocalPort 2222 -Action Allow -Profile Private
    Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private
    ```
 
-   The last line marks your current network Private. Skip it if you'd rather
-   do that in Settings, or if this isn't your own network.
+   Both rules apply only on Private networks, so sshd stays closed on public
+   Wi-Fi. The last line marks your current network Private. Skip it if you'd
+   rather do that in Settings, or if this isn't your own network. A Hyper-V
+   rule made without `-Profiles` applies everywhere; fix it with
+   `Set-NetFirewallHyperVRule -Name OrchardSSH -Profiles Private`.
 7. **Keep it awake on the charger**, lid closed included:
 
    ```powershell
@@ -98,18 +118,35 @@ harmlessly.
 
    A laptop that stays plugged in lasts longer with a charge limit, if the
    maker's app has one.
-8. **Register the status task.** Put both `.ps1` files in one folder and run,
-   from a normal PowerShell:
+8. **Register the status tasks.** Put both `.ps1` files in one folder and run,
+   from an admin PowerShell:
 
    ```powershell
    powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\Orchard\register-task.ps1"
    ```
 
-   It prints `Registered and started 'Orchard WSL worker'.` If Windows says
-   "Access is denied", run it from an admin PowerShell; the task still runs
-   as you. Pass `-Distro <name>` if yours isn't `Ubuntu-24.04`. The task also
-   keeps the distro running, and a minute later
+   It runs `wsl --shutdown` first, so the startup task starts the distro
+   itself. That closes open distro windows and stops running jobs, which the
+   dispatcher runs again. Then it prints `Registered and started 'Orchard WSL
+   worker (startup)' and 'Orchard WSL worker'.` Admin is only needed to
+   register the startup task, which runs without your password stored; both
+   tasks run as you, without admin rights. If your account isn't an admin, the
+   admin prompt runs as another one: give the full path to your folder, add
+   `-User <pc>\<you>`, and restart Windows afterwards. Run it again after
+   updating the scripts: it replaces and restarts both. Pass `-Distro <name>`
+   if yours isn't `Ubuntu-24.04`. A minute later
    `cat ~/.orchard/host-status.json` in the distro shows fresh numbers.
+9. **Clean up old jobs.** Nothing deletes finished job folders on the worker
+   by itself, and they fill C: in the end. A cron line in the distro runs the
+   agent's cleanup every 6 hours: folders older than 2 days go, then newer
+   ones while under 15 GB is free, counting C:. Running and paused jobs are
+   kept; one that died with the PC goes once it is 2 days old. The agent
+   arrives with the first job, and until then the line does nothing. In the
+   distro:
+
+   ```sh
+   ( crontab -l 2>/dev/null; echo '17 */6 * * * test -f "$HOME/.orchard/bin/orchard-agent.py" && /usr/bin/python3 "$HOME/.orchard/bin/orchard-agent.py" gc 2 15 >/dev/null 2>&1' ) | crontab -
+   ```
 
 ## On the controller
 
@@ -147,6 +184,17 @@ the PC.
   User input and power are the real guards here.
 - **The RAM the worker reports is the `.wslconfig` cap,** not the PC's total,
   and `requires.mem_gb` is checked against that cap.
+- **Someone else on the PC holds every job.** While another account is
+  signed in and you aren't, nothing reports. While another account has the
+  screen through Switch user, your session reports the PC as in use, and so
+  does the Switch user screen itself.
+- **Only XInput game controllers count as input.** That covers Xbox pads and
+  most PC ones; others, such as a PlayStation pad, read as idle. A pad with
+  stick drift keeps the PC in use while it is connected.
+- **After running `wsl --shutdown` yourself,** wait a minute before opening
+  the distro, so the startup task starts it first. A distro you start stops
+  when you sign out, and any running job with it; the dispatcher then runs
+  that job again.
 - **Other Linux machines** work as workers too, but they need something that
   writes `host-status.json`, or every job stays held. On a headless server
   nobody uses, a cron job or systemd timer that writes `"power": "ac"`, a large
