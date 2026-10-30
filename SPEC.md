@@ -25,8 +25,10 @@ Goals:
   submit time, not mid-run.
 - Tiny, reversible footprint on workers: everything lives under `~/.orchard`.
 
-Non-goals (for now): more than two machines, GPU distribution, live migration of a
-running process, Windows/Linux workers, mobile apps, automatic macOS version upgrades.
+Non-goals (for now): GPU distribution, live migration of a running process, native
+Windows workers, mobile apps, automatic macOS version upgrades. Linux workers,
+including a Windows PC running Linux under WSL2, are supported but opt-in per job
+(§5, `contrib/windows-wsl/`).
 
 ## 2. Verified facts (probed 2026-10-18)
 
@@ -170,6 +172,15 @@ Missing tags read `missing tags: <list>`; when a tagged job has no eligible work
 errors out instead of silently running locally (tagged builds on the wrong arch are
 never useful).
 
+OS tags: the agent adds `os:macos` or `os:linux` to the worker's tags, and Linux
+workers resolve requirements against `x86_64|aarch64-unknown-linux-gnu`. A job's
+`os:*` tags are an allow-list, not required tags, and a job with none allows only
+`macos`. So no existing job can land on a Linux worker: it has to ask with
+`-t os:linux`, or `-t os:any` for anywhere. An agent too old to report an OS tag is
+a Mac. A mismatch reads `worker OS is linux; job allows macos (add -t os:linux to
+allow it)`, and the fallback rule below treats it like any other job the Air can't
+run.
+
 Policy (M1):
 
 - `--where auto` (default): interactive jobs run locally; `--background` jobs prefer
@@ -184,8 +195,9 @@ Policy (M1):
 Background queue (M2): `orchard run --background` enqueues a job in
 `~/.orchard/state/queue/<id>.json`; `orchard dispatch [--watch]` processes the queue.
 A queued job starts only when its worker is reachable, still eligible (RAM/disk) and
-idle: no HID input for ≥ 180 s + 30 s margin, on AC power, no thermal throttle. One
-job per worker at a time. Running jobs are polled; finished ones are collected;
+idle: no HID input for ≥ 180 s + 30 s margin, on AC power, no thermal throttle. On a
+Linux worker idle and power come from the host status file (§6); a status other than
+`ok`, or a missing idle time, holds the job. One job per worker at a time. Running jobs are polled; finished ones are collected;
 long paused ones are preempted and requeued.
 
 The worker also refuses a second job while *anything* runs on it: every execution
@@ -246,7 +258,7 @@ marks the entry failed instead of tracking it forever.
 | Suspend when user active | yes; "in use" = input in last 3 min | BOINC default |
 | Suspend on battery | yes | BOINC default |
 | Suspend when non-orchard CPU > 25% | **off by default** (opt-in: `policy.json` → `max_other_cpu_pct`) | BOINC default available but noisy on macOS |
-| Thermal preemption | pause below limit 50, resume at 60 (hysteresis) | `pmset -g therm` |
+| Thermal preemption | pause below limit 50, resume at 60 (hysteresis); macOS only | `pmset -g therm` |
 | Short suspends | SIGSTOP in place (instant resume) | BOINC "leave tasks in memory" |
 | Long suspends (>30 min) | dispatcher kills and requeues; resumes from checkpoint | BOINC unload model |
 | Job process class | full speed; `caffeinate -is` only. `background_qos: true` opts into nice 10 + `taskpolicy -b` | measured 2.4x slower wrapped on the Pro; preemption already protects the user |
@@ -259,12 +271,23 @@ re-read on every poll (~5 s), so policy edits apply live. Defaults:
 thermal_pause_below=50, thermal_resume_at=60, max_other_cpu_pct=null,
 background_qos=false, pause_on_low_battery_pct=20`.
 
+Linux workers can't see the host's input or power, and under WSL the guest can't
+either. The host writes them to `~/.orchard/host-status.json` (`ts`, `idle_seconds`,
+`power`, `battery_pct`, `disk_free_gb`, `source`); `contrib/windows-wsl/` has the
+Windows writer, a sign-in task that rewrites it every 10 s. The agent fails closed:
+a file that is missing, unreadable, incomplete or older than 60 s by its mtime reads
+as "user active, power unknown", which holds new jobs and pauses running ones, and
+`host_status` says which. The thermal check is skipped there, and
+`max_other_cpu_pct` sees only the guest's processes.
+
 ## 7. Resource guards
 
 - Worker must retain ≥2 GB free disk after staging (Pro has ~7 GB: jobs are refused
   otherwise). Worker GC (`agent.py gc [max_age_days] [min_free_gb]`, defaults 14 / 3)
   removes unprotected job dirs and inbox blobs older than max_age_days, or until
   min_free_gb is restored; running/paused jobs are never touched.
+- On a Linux worker free disk is the smaller of statvfs and the host's
+  `disk_free_gb`: a WSL disk is a file on the host's C: and can't outgrow it.
 - RAM ceiling enforced on the 8 GB Pro via `requires.mem_gb`.
 - Per-job timeout enforced by the agent (SIGTERM to process group, then SIGKILL).
 - All remote state lives in `~/.orchard` — `rm -rf ~/.orchard` is the full uninstall.

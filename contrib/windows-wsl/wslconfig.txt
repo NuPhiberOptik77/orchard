@@ -1,0 +1,21 @@
+# Save as %UserProfile%\.wslconfig on Windows, then run `wsl --shutdown` so it
+# takes effect.
+# memory is a cap, not a reservation: jobs run while your apps stay open, so
+# size it to what Task Manager shows free during normal use. A 16 GB PC whose
+# Windows sits near 8 GB in use gets memory=8GB.
+# Leave sparseVhd out: current WSL releases refuse sparse disks over data
+# corruption reports.
+
+[wsl2]
+memory=8GB
+swap=4GB
+networkingMode=mirrored
+firewall=true
+
+[general]
+# WSL stops an idle distro after 15 s by default; -1 never does.
+instanceIdleTimeout=-1
+
+[experimental]
+# Hands memory a finished job left in the Linux cache back to Windows.
+autoMemoryReclaim=gradual

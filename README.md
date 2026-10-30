@@ -51,6 +51,10 @@ to `out/` comes back to `./.orchard-out/<job-id>/out/`.
   3.12+, which uv provides.
 - On the worker: nothing beyond macOS. On the first remote run Orchard installs uv
   and a managed CPython into `~/.orchard`.
+- Optionally, Linux workers. They take only jobs tagged `-t os:linux` (or
+  `-t os:any`), and they need the host to report idle time and power;
+  [contrib/windows-wsl](contrib/windows-wsl/README.md) sets up a Windows PC under
+  WSL2.
 
 ## Install
 
@@ -139,7 +143,7 @@ Both are ad-hoc signed and install to `~/Applications`.
 
 ## Limits
 
-Orchard is a personal tool, shaped around one user, two Macs and one home
+Orchard is a personal tool, shaped around one user, a few machines and one home
 network. The worker runs one job at a time. It moves code as a tarball over SSH,
 so it suits source trees, not large datasets. There's no GPU support, and recent
 PyTorch, TensorFlow and JAX releases don't ship Intel-Mac packages, so the
