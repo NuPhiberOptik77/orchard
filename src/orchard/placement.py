@@ -7,6 +7,9 @@ from .job import JobSpec
 DISK_HEADROOM_GB = 2.0
 DEFAULT_DISK_NEED_GB = 1.0
 DEFAULT_MEM_NEED_GB = 1.0
+OS_TAG_PREFIX = "os:"
+DEFAULT_OS = "macos"
+ANY_OS = "any"
 
 
 @dataclass
@@ -23,13 +26,32 @@ class Decision:
     reasons: list[str] = field(default_factory=list)
 
 
+def worker_os(caps: dict) -> str:
+    """The worker's OS from its `os:*` tag. Agents from before OS tags only ran on macOS."""
+    oses = sorted(t[len(OS_TAG_PREFIX):] for t in caps.get("tags") or [] if t.startswith(OS_TAG_PREFIX))
+    if not oses:
+        return DEFAULT_OS
+    # Conflicting tags (say a static `os:*` in workers.toml) match no allow-list.
+    return ",".join(oses)
+
+
+def allowed_oses(job: JobSpec) -> set[str]:
+    """OSes the job may run on. Default-deny: a job with no `os:*` tag is a macOS job."""
+    return {t[len(OS_TAG_PREFIX):] for t in job.tags or [] if t.startswith(OS_TAG_PREFIX)} or {DEFAULT_OS}
+
+
 def problems(job: JobSpec, caps: dict) -> list[str]:
     probs = []
-    required = set(job.tags or [])
+    required = {t for t in job.tags or [] if not t.startswith(OS_TAG_PREFIX)}
     if required:
         missing = sorted(required - set(caps.get("tags") or []))
         if missing:
             probs.append(f"missing tags: {', '.join(missing)}")
+    allowed = allowed_oses(job)
+    os_name = worker_os(caps)
+    if ANY_OS not in allowed and os_name not in allowed:
+        hint = f" (add -t {OS_TAG_PREFIX}{os_name} to allow it)" if "," not in os_name else ""
+        probs.append(f"worker OS is {os_name}; job allows {', '.join(sorted(allowed))}{hint}")
     if not caps.get("platform_ok", True):
         probs.append(f"platform resolve failed ({caps.get('platform_note', 'unknown')})")
     mem_need = float(job.requires.get("mem_gb", DEFAULT_MEM_NEED_GB))

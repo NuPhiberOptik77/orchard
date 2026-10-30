@@ -236,7 +236,7 @@ def _offload_target(job: JobSpec, worker: Optional[str], cfg: dict) -> tuple[Opt
             continue
         if job.requirements:
             ok, note = env.resolve_for_platform(
-                job.requirements, job.python, env.platform_tag(caps["machine"])
+                job.requirements, job.python, env.platform_tag(caps["machine"], placement.worker_os(caps))
             )
             if not ok:
                 why = f"{w.name}: {note}"
@@ -355,7 +355,9 @@ def submit(job: JobSpec, where: str, background: bool, now: bool, cwd: Path) -> 
             print(f"worker {w.name}: unreachable (skipped)")
             continue
         if job.kind == "run":
-            ok, note = env.resolve_for_platform(job.requirements, job.python, env.platform_tag(caps["machine"]))
+            ok, note = env.resolve_for_platform(
+                job.requirements, job.python, env.platform_tag(caps["machine"], placement.worker_os(caps))
+            )
             caps["platform_ok"] = ok
             caps["platform_note"] = note
         else:
@@ -683,6 +685,8 @@ def doctor() -> None:
         line = f"  {mark}  {w.name}: {idle_txt} · {caps.get('power', '?')} · {disk:.1f} GB free"
         if caps.get("policy_paused"):
             line += " · paused by owner"
+        if caps.get("host_status") not in (None, "ok"):
+            line += f" · host status {caps['host_status']}"
         print(line)
         if transport.file_sha256_remote(w, env.AGENT_REMOTE_PATH) != local_sha:
             print(f"  warn  {w.name}: agent outdated; uploads automatically on next launch")

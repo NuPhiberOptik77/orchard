@@ -85,7 +85,12 @@ def pull_bytes(worker: Worker, remote_path: str, timeout: float = 300) -> bytes:
 
 
 def file_sha256_remote(worker: Worker, remote_path: str) -> str | None:
-    proc = run(worker, f'test -f "{remote_path}" && shasum -a 256 "{remote_path}"')
+    # shasum ships with macOS; minimal Linux images may only have sha256sum.
+    proc = run(
+        worker,
+        f'test -f "{remote_path}" && '
+        f'{{ shasum -a 256 "{remote_path}" 2>/dev/null || sha256sum "{remote_path}"; }}',
+    )
     if proc.returncode != 0:
         return None
     out = proc.stdout.decode("utf-8", "replace").strip()

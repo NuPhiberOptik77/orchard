@@ -1,7 +1,9 @@
 """Orchard worker agent.
 
 Single file, stdlib only, Python >= 3.9, so it runs under stock /usr/bin/python3
-on any Mac before any bootstrap has happened.
+on any Mac before any bootstrap has happened. It also runs on Linux (including
+WSL), where idle, power and host disk come from a status file the host writes;
+see read_host_status.
 
 Usage:
   python3 agent.py status [bench_python]
@@ -16,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -27,6 +30,9 @@ import time
 TERMINAL_STATES = ("succeeded", "failed", "timed_out", "killed")
 
 ORCHARD_HOME = os.path.expanduser("~/.orchard")
+HOST_STATUS_PATH = os.path.join(ORCHARD_HOME, "host-status.json")
+HOST_STATUS_MAX_AGE_S = 60
+HOST_POWER_STATES = ("ac", "battery", "unknown")
 
 
 def _running_dir():
@@ -120,6 +126,79 @@ def _sysctl(name):
     return _run(["sysctl", "-n", name]).strip()
 
 
+def _read_text(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def os_family():
+    """`macos` or `linux`; anything else is reported as-is and matches no job by default."""
+    sysname = os.uname().sysname
+    return {"Darwin": "macos", "Linux": "linux"}.get(sysname, sysname.lower())
+
+
+def parse_meminfo_total_gb(meminfo_text):
+    m = re.search(r"^MemTotal:\s+(\d+)\s*kB", meminfo_text, re.M)
+    return round(int(m.group(1)) * 1024 / 1e9, 2) if m else 0.0
+
+
+def parse_os_release(os_release_text):
+    fields = {}
+    for line in os_release_text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            fields[key.strip()] = value.strip().strip("\"'")
+    return (fields.get("ID") or "linux") + fields.get("VERSION_ID", "")
+
+
+def _finite_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def read_host_status(path=None, now=None, max_age=HOST_STATUS_MAX_AGE_S):
+    """Idle time, power and free disk reported by the host OS.
+
+    On Linux nothing in the guest can see the owner's keyboard or the charger,
+    so the host writes them to HOST_STATUS_PATH (contrib/windows-wsl has the
+    Windows writer). Fails closed: a missing, stale or malformed file reads as
+    "user active, power unknown" and `host_status` names the problem, which
+    holds new jobs and pauses running ones. Age comes from the file's mtime on
+    this side, so the host's clock never matters.
+    """
+    path = path or HOST_STATUS_PATH
+    now = time.time() if now is None else now
+    closed = {"idle_seconds": 0.0, "power": "unknown", "battery_pct": None, "disk_free_gb": None}
+    try:
+        age = now - os.path.getmtime(path)
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return dict(closed, host_status="missing")
+    except (OSError, ValueError):
+        return dict(closed, host_status="unreadable")
+    if abs(age) > max_age:
+        return dict(closed, host_status="stale (%.0fs old)" % age)
+    if not isinstance(data, dict):
+        return dict(closed, host_status="unreadable")
+    idle = data.get("idle_seconds")
+    power = data.get("power")
+    disk = data.get("disk_free_gb")
+    if not (_finite_number(idle) and idle >= 0 and power in HOST_POWER_STATES
+            and _finite_number(disk) and disk >= 0):
+        return dict(closed, host_status="incomplete")
+    pct = data.get("battery_pct")
+    return {
+        "idle_seconds": float(idle),
+        "power": power,
+        "battery_pct": int(pct) if _finite_number(pct) else None,
+        "disk_free_gb": round(float(disk), 2),
+        "host_status": "ok",
+    }
+
+
 def parse_hid_idle(ioreg_text):
     m = re.search(r'"HIDIdleTime"\s*=\s*(\d+)', ioreg_text)
     if not m:
@@ -164,6 +243,14 @@ def thermal_limit():
 def disk_free_gb(path):
     st = os.statvfs(path)
     return round(st.f_bavail * st.f_frsize / 1e9, 2)
+
+
+def worker_disk_free_gb(path, host=None):
+    """Free space for jobs. Under WSL the guest disk is a file on the host's C:,
+    so the host's free space caps what statvfs reports."""
+    free = disk_free_gb(path)
+    host_free = (host or {}).get("disk_free_gb")
+    return min(free, host_free) if host_free is not None else free
 
 
 BENCH_CODE = (
@@ -222,24 +309,27 @@ def _xcode_path():
     return proc.stdout.strip() if proc.returncode == 0 else None
 
 
-def capability_tags(os_version=None):
-    tags = {os.uname().machine}
-    if os_version is None:
-        os_version = _run(["sw_vers", "-productVersion"]).strip()
-    try:
-        tags.add("macos%s" % os_version.split(".")[0])
-    except IndexError:
-        pass
+def capability_tags(os_version=None, family=None):
+    family = family or os_family()
+    tags = {os.uname().machine, "os:%s" % family}
+    if family == "macos":
+        if os_version is None:
+            os_version = _run(["sw_vers", "-productVersion"]).strip()
+        try:
+            tags.add("macos%s" % os_version.split(".")[0])
+        except IndexError:
+            pass
     for tool in ("swift", "clang", "git", "make"):
         if shutil.which(tool):
             tags.add(tool)
     if os.path.exists(os.path.join(ORCHARD_HOME, "tools", "uv")):
         tags.add("uv")
-    path = _xcode_path()
-    if path and path.endswith(".app/Contents/Developer"):
-        tags.add("xcode")
-    elif path:
-        tags.add("clt")
+    if family == "macos":
+        path = _xcode_path()
+        if path and path.endswith(".app/Contents/Developer"):
+            tags.add("xcode")
+        elif path:
+            tags.add("clt")
     return tags
 
 
@@ -270,20 +360,35 @@ def cached_bench(python_path, cache_dir=None, ttl=BENCH_TTL_S):
 
 
 def collect_caps(bench_python=None):
-    os_version = _run(["sw_vers", "-productVersion"]).strip()
+    family = os_family()
+    home = os.path.expanduser("~")
+    if family == "macos":
+        os_version = _run(["sw_vers", "-productVersion"]).strip()
+        cores = int(_sysctl("hw.ncpu") or 0)
+        ram_gb = round(int(_sysctl("hw.memsize") or 0) / 1e9, 2)
+        disk = disk_free_gb(home)
+        idle, power, thermal, host_status = hid_idle_seconds(), battery_state(), thermal_limit(), None
+    else:
+        host = read_host_status()
+        os_version = parse_os_release(_read_text("/etc/os-release"))
+        cores = os.cpu_count() or 0
+        ram_gb = parse_meminfo_total_gb(_read_text("/proc/meminfo"))
+        disk = worker_disk_free_gb(home, host)
+        idle, power, thermal, host_status = host["idle_seconds"], host["power"], None, host["host_status"]
     busy = running_jobs()
     return {
         "hostname": os.uname().nodename,
         "machine": os.uname().machine,
         "os": os_version,
-        "tags": sorted(capability_tags(os_version)),
+        "tags": sorted(capability_tags(os_version, family)),
         "python": sys.version.split()[0],
-        "cores": int(_sysctl("hw.ncpu") or 0),
-        "ram_gb": round(int(_sysctl("hw.memsize") or 0) / 1e9, 2),
-        "disk_free_gb": disk_free_gb(os.path.expanduser("~")),
-        "idle_seconds": hid_idle_seconds(),
-        "power": battery_state(),
-        "thermal_limit": thermal_limit(),
+        "cores": cores,
+        "ram_gb": ram_gb,
+        "disk_free_gb": disk,
+        "idle_seconds": idle,
+        "power": power,
+        "thermal_limit": thermal,
+        "host_status": host_status,
         "has_taskpolicy": bool(shutil.which("taskpolicy")),
         "bench": cached_bench(bench_python),
         "bench_python": bench_python or sys.executable,
@@ -305,13 +410,24 @@ def load_policy():
 
 
 def sample_preemption_state(policy, own_pgid):
-    sample = {
-        "idle_seconds": hid_idle_seconds(),
-        "power": battery_state(),
-        "battery_pct": battery_pct(),
-        "thermal_limit": thermal_limit(),
-        "other_cpu_pct": None,
-    }
+    if os_family() == "macos":
+        sample = {
+            "idle_seconds": hid_idle_seconds(),
+            "power": battery_state(),
+            "battery_pct": battery_pct(),
+            "thermal_limit": thermal_limit(),
+            "other_cpu_pct": None,
+        }
+    else:
+        host = read_host_status()
+        sample = {
+            "idle_seconds": host["idle_seconds"],
+            "power": host["power"],
+            "battery_pct": host["battery_pct"],
+            "thermal_limit": None,
+            "other_cpu_pct": None,
+            "host_status": host["host_status"],
+        }
     if policy.get("max_other_cpu_pct") is not None:
         sample["other_cpu_pct"] = other_cpu_pct(own_pgid)
     return sample
@@ -323,6 +439,9 @@ def decide_preemption(sample, policy, paused):
             return (None, None)
         return ("pause", "paused by owner")
     blockers = []
+    host = sample.get("host_status")
+    if host is not None and host != "ok":
+        blockers.append("host status %s" % host)
     idle = sample.get("idle_seconds")
     margin = RESUME_MARGIN_S if paused else 0
     if policy.get("pause_if_user_active") and idle is not None:
@@ -696,12 +815,17 @@ def _gc_entries(now):
     return entries
 
 
+def _gc_free_gb():
+    host = read_host_status() if os_family() != "macos" else None
+    return worker_disk_free_gb(ORCHARD_HOME, host)
+
+
 def cmd_gc(argv):
     max_age = float(argv[0]) if len(argv) > 0 else 14.0
     min_free = float(argv[1]) if len(argv) > 1 else 3.0
     os.makedirs(ORCHARD_HOME, exist_ok=True)
     now = time.time()
-    picked = select_garbage(_gc_entries(now), now, max_age, min_free, disk_free_gb(ORCHARD_HOME))
+    picked = select_garbage(_gc_entries(now), now, max_age, min_free, _gc_free_gb())
     freed = 0
     for entry in picked:
         try:
@@ -715,7 +839,7 @@ def cmd_gc(argv):
     print(json.dumps({
         "removed": len(picked),
         "freed_mb": round(freed / 1e6, 1),
-        "free_gb": disk_free_gb(ORCHARD_HOME),
+        "free_gb": _gc_free_gb(),
     }))
     return 0
 

@@ -33,11 +33,21 @@ def _uv_spec_major_minor(python_spec: str) -> str:
     return python_spec
 
 
-def platform_tag(machine: str) -> str:
-    mapping = {"arm64": "aarch64-apple-darwin", "x86_64": "x86_64-apple-darwin"}
-    if machine not in mapping:
-        raise ValueError(f"unsupported machine architecture: {machine}")
-    return mapping[machine]
+PLATFORM_TAGS = {
+    ("macos", "arm64"): "aarch64-apple-darwin",
+    ("macos", "x86_64"): "x86_64-apple-darwin",
+    ("linux", "x86_64"): "x86_64-unknown-linux-gnu",
+    ("linux", "aarch64"): "aarch64-unknown-linux-gnu",
+    ("linux", "arm64"): "aarch64-unknown-linux-gnu",
+}
+
+
+def platform_tag(machine: str, os_name: str = "macos") -> str:
+    """uv's `--python-platform` for a worker, so wheels are checked for its OS too."""
+    tag = PLATFORM_TAGS.get((os_name, machine))
+    if tag is None:
+        raise ValueError(f"unsupported platform: {machine} on {os_name}")
+    return tag
 
 
 def capture_python(cwd: Path) -> str:

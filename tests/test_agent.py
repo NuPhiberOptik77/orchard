@@ -133,6 +133,151 @@ def test_capability_tags_include_platform():
     tags = agent.capability_tags("14.5")
     assert agent.os.uname().machine in tags
     assert "macos14" in tags
+    assert "os:macos" in tags
+
+
+def test_capability_tags_linux_has_no_mac_tags(monkeypatch):
+    monkeypatch.setattr(agent, "_xcode_path", lambda: "/Applications/Xcode.app/Contents/Developer")
+    tags = agent.capability_tags("ubuntu24.04", family="linux")
+    assert "os:linux" in tags
+    assert not any(t.startswith("macos") or t == "os:macos" for t in tags)
+    assert "xcode" not in tags and "clt" not in tags
+
+
+def test_os_family(monkeypatch):
+    class Uname:
+        def __init__(self, sysname):
+            self.sysname = sysname
+
+    for sysname, family in (("Darwin", "macos"), ("Linux", "linux"), ("FreeBSD", "freebsd")):
+        monkeypatch.setattr(agent.os, "uname", lambda s=sysname: Uname(s))
+        assert agent.os_family() == family
+
+
+def test_parse_meminfo_total_gb():
+    text = "MemTotal:       10169532 kB\nMemFree:         9001234 kB\n"
+    assert agent.parse_meminfo_total_gb(text) == 10.41
+    assert agent.parse_meminfo_total_gb("") == 0.0
+
+
+def test_parse_os_release():
+    text = 'PRETTY_NAME="Ubuntu 24.04.1 LTS"\nID=ubuntu\nVERSION_ID="24.04"\n'
+    assert agent.parse_os_release(text) == "ubuntu24.04"
+    assert agent.parse_os_release("") == "linux"
+
+
+def write_host_status(path, now, age=5.0, **over):
+    data = {"ts": "x", "idle_seconds": 600, "power": "ac", "battery_pct": 90, "disk_free_gb": 120.5}
+    data.update(over)
+    path.write_text(json.dumps(data))
+    os.utime(path, (now - age, now - age))
+    return path
+
+
+def write_raw(path, now, text):
+    path.write_text(text)
+    os.utime(path, (now, now))
+    return path
+
+
+def test_read_host_status_fresh(tmp_path):
+    now = 1.9e9
+    path = write_host_status(tmp_path / "host.json", now)
+    assert agent.read_host_status(str(path), now=now) == {
+        "idle_seconds": 600.0, "power": "ac", "battery_pct": 90, "disk_free_gb": 120.5, "host_status": "ok",
+    }
+
+
+@pytest.mark.parametrize("setup, problem", [
+    (lambda p, now: None, "missing"),
+    (lambda p, now: write_host_status(p, now, age=120), "stale"),
+    (lambda p, now: write_host_status(p, now, age=-120), "stale"),
+    (lambda p, now: write_raw(p, now, "{not json"), "unreadable"),
+    (lambda p, now: write_raw(p, now, "[1, 2]"), "unreadable"),
+    (lambda p, now: write_host_status(p, now, idle_seconds=None), "incomplete"),
+    (lambda p, now: write_host_status(p, now, idle_seconds=-1), "incomplete"),
+    (lambda p, now: write_host_status(p, now, idle_seconds=True), "incomplete"),
+    (lambda p, now: write_host_status(p, now, idle_seconds="600"), "incomplete"),
+    (lambda p, now: write_host_status(p, now, power="mains"), "incomplete"),
+    (lambda p, now: write_host_status(p, now, disk_free_gb=None), "incomplete"),
+])
+def test_read_host_status_fails_closed(tmp_path, setup, problem):
+    now = 1.9e9
+    path = tmp_path / "host.json"
+    setup(path, now)
+    status = agent.read_host_status(str(path), now=now)
+    assert status["host_status"].startswith(problem)
+    assert status["idle_seconds"] == 0.0
+    assert status["power"] == "unknown"
+    assert status["disk_free_gb"] is None
+
+
+def test_read_host_status_rejects_infinite_idle(tmp_path):
+    now = 1.9e9
+    path = write_raw(tmp_path / "host.json", now, '{"idle_seconds": Infinity, "power": "ac", "disk_free_gb": 10}')
+    assert agent.read_host_status(str(path), now=now)["host_status"] == "incomplete"
+
+
+def test_worker_disk_free_gb_takes_host_minimum(tmp_path):
+    free = agent.disk_free_gb(str(tmp_path))
+    assert agent.worker_disk_free_gb(str(tmp_path)) == free
+    assert agent.worker_disk_free_gb(str(tmp_path), {"disk_free_gb": None}) == free
+    assert agent.worker_disk_free_gb(str(tmp_path), {"disk_free_gb": 0.5}) == min(free, 0.5)
+
+
+def fake_linux(monkeypatch, tmp_path, host_status):
+    files = {
+        "/etc/os-release": 'ID=ubuntu\nVERSION_ID="24.04"\n',
+        "/proc/meminfo": "MemTotal:       10169532 kB\n",
+    }
+    monkeypatch.setattr(agent, "os_family", lambda: "linux")
+    monkeypatch.setattr(agent, "_read_text", lambda path: files.get(path, ""))
+    monkeypatch.setattr(agent, "_run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no mac probes")))
+    monkeypatch.setattr(agent, "_xcode_path", lambda: (_ for _ in ()).throw(AssertionError("no xcode probe")))
+    monkeypatch.setattr(agent, "cached_bench", lambda python: 1234)
+    monkeypatch.setattr(agent, "HOST_STATUS_PATH", str(tmp_path / "host-status.json"))
+    monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path))
+    if host_status is not None:
+        write_host_status(tmp_path / "host-status.json", agent.time.time(), **host_status)
+
+
+def test_collect_caps_linux_reads_host_status(monkeypatch, tmp_path):
+    fake_linux(monkeypatch, tmp_path, {"idle_seconds": 900, "power": "battery", "disk_free_gb": 0.25})
+    caps = agent.collect_caps()
+    assert caps["os"] == "ubuntu24.04"
+    assert "os:linux" in caps["tags"]
+    assert not any(t.startswith("macos") for t in caps["tags"])
+    assert caps["cores"] == (os.cpu_count() or 0)
+    assert caps["ram_gb"] == 10.41
+    assert caps["idle_seconds"] == 900.0
+    assert caps["power"] == "battery"
+    assert caps["thermal_limit"] is None
+    assert caps["disk_free_gb"] == 0.25
+    assert caps["host_status"] == "ok"
+
+
+def test_collect_caps_linux_fails_closed_without_host_status(monkeypatch, tmp_path):
+    fake_linux(monkeypatch, tmp_path, None)
+    caps = agent.collect_caps()
+    assert caps["host_status"] == "missing"
+    assert caps["idle_seconds"] == 0.0
+    assert caps["power"] == "unknown"
+    assert caps["disk_free_gb"] == agent.disk_free_gb(os.path.expanduser("~"))
+
+
+def test_sample_preemption_linux_uses_host_status(monkeypatch, tmp_path):
+    fake_linux(monkeypatch, tmp_path, None)
+    sample_ = agent.sample_preemption_state(dict(agent.DEFAULT_POLICY), 0)
+    assert sample_["host_status"] == "missing"
+    assert agent.decide_preemption(sample_, dict(agent.DEFAULT_POLICY), False) == ("pause", "host status missing")
+
+
+def test_collect_caps_macos_has_no_host_status():
+    if agent.os_family() != "macos":
+        pytest.skip("macOS only")
+    caps = agent.collect_caps()
+    assert caps["host_status"] is None
+    assert "os:macos" in caps["tags"]
 
 
 def test_benchmark_falls_back_on_bad_python():
@@ -217,6 +362,16 @@ def test_decide_pause_when_user_active():
 
 def test_decide_runs_when_idle():
     assert agent.decide_preemption(sample(), agent.DEFAULT_POLICY, paused=False) == (None, None)
+
+
+def test_decide_host_status_problem_pauses_and_blocks_resume():
+    policy = dict(agent.DEFAULT_POLICY, pause_if_user_active=False, pause_on_battery=False)
+    assert agent.decide_preemption(sample(host_status="stale (90s old)"), policy, False) == (
+        "pause", "host status stale (90s old)"
+    )
+    assert agent.decide_preemption(sample(host_status="missing"), policy, True) == (None, None)
+    assert agent.decide_preemption(sample(host_status="ok"), policy, False) == (None, None)
+    assert agent.decide_preemption(sample(host_status="ok"), policy, True) == ("resume", None)
 
 
 def test_decide_no_pause_when_idle_unknown():

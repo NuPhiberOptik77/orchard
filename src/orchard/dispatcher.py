@@ -385,7 +385,12 @@ def idle_hold(caps: dict, cfg: dict) -> str | None:
     busy = caps.get("busy_jobs") or []
     if busy:
         return f"worker running {busy[0]}"
+    host = caps.get("host_status")
+    if host is not None and host != "ok":
+        return f"worker host status {host}"
     idle = caps.get("idle_seconds")
+    if idle is None and placement.worker_os(caps) != placement.DEFAULT_OS:
+        return "worker idle time unknown"
     threshold = cfg["idle_threshold_s"] + engine.RESUME_MARGIN_S
     if idle is not None and idle < threshold:
         return f"worker in use (idle {idle:.0f}s < {threshold}s)"

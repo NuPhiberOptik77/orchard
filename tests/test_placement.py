@@ -1,7 +1,7 @@
 import pytest
 
 from orchard.job import JobSpec
-from orchard.placement import Candidate, choose, problems
+from orchard.placement import Candidate, choose, problems, worker_os
 
 
 def caps(ram=16, disk=50, bench=1000, platform_ok=True, note="resolve ok", tags=None):
@@ -107,3 +107,74 @@ def test_tag_shared_by_local_stays_local_interactive():
     ]
     decision = choose(tagged_job("swift"), candidates)
     assert decision.candidate.kind == "local"
+
+
+def test_worker_os_defaults_to_macos_for_untagged_agents():
+    assert worker_os(caps(tags=["x86_64"])) == "macos"
+    assert worker_os(caps(tags=["x86_64", "os:linux"])) == "linux"
+    assert worker_os(caps(tags=["os:linux", "os:macos"])) == "linux,macos"
+
+
+def test_os_default_deny_refuses_linux_for_untagged_job():
+    linux = caps(tags=["x86_64", "os:linux"])
+    assert problems(job(), linux) == ["worker OS is linux; job allows macos (add -t os:linux to allow it)"]
+    assert problems(tagged_job("x86_64"), linux) == [
+        "worker OS is linux; job allows macos (add -t os:linux to allow it)"
+    ]
+
+
+def test_os_tag_allows_listed_oses():
+    linux = caps(tags=["x86_64", "os:linux"])
+    mac = caps(tags=["x86_64", "os:macos"])
+    assert problems(tagged_job("x86_64", "os:linux"), linux) == []
+    assert problems(tagged_job("os:any"), linux) == []
+    assert problems(tagged_job("os:any"), mac) == []
+    assert problems(tagged_job("os:linux", "os:macos"), linux) == []
+    assert problems(tagged_job("os:linux", "os:macos"), mac) == []
+    assert "worker OS is macos" in problems(tagged_job("os:linux"), mac)[0]
+
+
+def test_os_tag_is_not_a_required_tag():
+    # os:* tags pick the OS; they never show up as missing capability tags.
+    assert problems(tagged_job("os:linux"), caps(tags=["os:linux"])) == []
+    assert not any("missing tags" in p for p in problems(tagged_job("os:linux"), caps(tags=["arm64"])))
+
+
+def test_conflicting_worker_os_tags_match_nothing():
+    both = caps(tags=["os:linux", "os:macos"])
+    assert problems(job(), both) == ["worker OS is linux,macos; job allows macos"]
+    assert problems(tagged_job("os:any"), both) == []
+
+
+def test_mac_x86_64_job_still_lands_on_pro_beside_linux_worker():
+    # A higher-scoring x86_64 Linux worker must never take an untagged Intel Mac job,
+    # whether the Pro's agent reports os:macos or predates OS tags.
+    for pro_tags in (["x86_64", "swift"], ["x86_64", "swift", "os:macos"]):
+        candidates = [
+            Candidate("local", "local", caps(tags=["arm64", "swift", "os:macos"])),
+            Candidate("pro", "remote", caps(tags=pro_tags), 0.2),
+            Candidate("laptop", "remote", caps(tags=["x86_64", "swift", "os:linux"], bench=9000), 1.0),
+        ]
+        decision = choose(tagged_job("x86_64"), candidates, background=True)
+        assert decision.candidate.name == "pro"
+        assert any("skipped laptop: worker OS is linux" in r for r in decision.reasons)
+        assert choose(tagged_job("x86_64"), candidates).candidate.name == "pro"
+
+
+def test_untagged_background_job_skips_linux_worker():
+    candidates = [
+        Candidate("local", "local", caps(tags=["arm64", "os:macos"])),
+        Candidate("laptop", "remote", caps(tags=["x86_64", "os:linux"], bench=9000), 1.0),
+    ]
+    decision = choose(job(), candidates, background=True)
+    assert decision.candidate.name == "local"
+
+
+def test_linux_job_picks_linux_worker_or_raises():
+    laptop = Candidate("laptop", "remote", caps(tags=["x86_64", "os:linux"]), 1.0)
+    pro = Candidate("pro", "remote", caps(tags=["x86_64", "os:macos"]), 0.2)
+    local = Candidate("local", "local", caps(tags=["arm64", "os:macos"]))
+    decision = choose(tagged_job("os:linux"), [local, pro, laptop], background=True)
+    assert decision.candidate.name == "laptop"
+    with pytest.raises(ValueError, match="required tags"):
+        choose(tagged_job("os:linux"), [local, pro], background=True)

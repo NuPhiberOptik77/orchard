@@ -176,7 +176,9 @@ def test_orphan_success_adopted_and_rerun_stopped(tmp_path, monkeypatch):
         lines = dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
     finally:
         proc.kill()
-    assert any("adopted result from pro (local rerun stopped)" in line for line in lines), (lines, dispatcher.load_entries()[0])
+    assert any("adopted result from pro (local rerun stopped)" in line for line in lines), (
+        lines, dispatcher.load_entries()[0]
+    )
     assert proc.poll() is not None
     assert kills == []
     assert collected == [(sdir, None)]
@@ -448,6 +450,22 @@ def test_idle_hold_reasons():
     assert dispatcher.idle_hold({"idle_seconds": 999, "power": "ac", "thermal_limit": 100}, cfg) is None
     assert "battery" in dispatcher.idle_hold({"idle_seconds": 999, "power": "battery", "thermal_limit": 100}, cfg)
     assert "thermal" in dispatcher.idle_hold({"idle_seconds": 999, "power": "ac", "thermal_limit": 30}, cfg)
+
+
+def test_idle_hold_host_status_fails_closed():
+    cfg = dispatcher.DISPATCH_DEFAULTS
+    ok = {"idle_seconds": 999, "power": "ac", "thermal_limit": None, "tags": ["os:linux"]}
+    assert dispatcher.idle_hold({**ok, "host_status": "ok"}, cfg) is None
+    assert "host status missing" in dispatcher.idle_hold({**ok, "host_status": "missing"}, cfg)
+    assert "host status stale" in dispatcher.idle_hold({**ok, "host_status": "stale (90s old)"}, cfg)
+
+
+def test_idle_hold_unknown_idle_holds_only_off_macos():
+    cfg = dispatcher.DISPATCH_DEFAULTS
+    mac = {"idle_seconds": None, "power": "ac", "thermal_limit": 100}
+    assert dispatcher.idle_hold(mac, cfg) is None
+    assert dispatcher.idle_hold({**mac, "tags": ["os:macos"]}, cfg) is None
+    assert "idle time unknown" in dispatcher.idle_hold({**mac, "tags": ["os:linux"]}, cfg)
 
 
 def test_idle_hold_worker_busy_with_interactive_job():

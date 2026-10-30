@@ -1,4 +1,6 @@
-from orchard.env import _filter_requirements
+import pytest
+
+from orchard.env import _filter_requirements, platform_tag
 
 
 def test_filter_requirements_drops_local_paths():
@@ -19,3 +21,15 @@ def test_filter_requirements_keeps_plain_pins():
     kept, dropped = _filter_requirements(lines)
     assert kept == lines
     assert dropped == 0
+
+
+def test_platform_tag_knows_the_os():
+    assert platform_tag("arm64") == "aarch64-apple-darwin"
+    assert platform_tag("x86_64") == "x86_64-apple-darwin"
+    assert platform_tag("x86_64", "macos") == "x86_64-apple-darwin"
+    assert platform_tag("x86_64", "linux") == "x86_64-unknown-linux-gnu"
+    assert platform_tag("aarch64", "linux") == "aarch64-unknown-linux-gnu"
+    with pytest.raises(ValueError, match="unsupported platform"):
+        platform_tag("x86_64", "freebsd")
+    with pytest.raises(ValueError, match="unsupported platform"):
+        platform_tag("aarch64", "macos")
