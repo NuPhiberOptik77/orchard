@@ -392,20 +392,23 @@ def _wrap(cmd, policy=None):
 
 
 def _terminate_group(pgid, grace=10.0):
+    # macOS answers EPERM, not ESRCH, for a group whose members are all
+    # unreaped zombies, so both mean nothing is left to stop.
+    gone = (ProcessLookupError, PermissionError)
     try:
         os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
+    except gone:
         return
     deadline = time.time() + grace
     while time.time() < deadline:
         try:
             os.killpg(pgid, 0)
-        except ProcessLookupError:
+        except gone:
             return
         time.sleep(0.25)
     try:
         os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
+    except gone:
         pass
 
 
@@ -440,6 +443,9 @@ def cmd_exec(argv):
         if cmd and cmd[0] == "python":
             cmd = [os.path.join(venv, "bin", "python")] + cmd[1:]
     env["ORCHARD_JOB_ID"] = str(job.get("id"))
+    attempt = job.get("attempt")
+    if attempt is not None:
+        env["ORCHARD_ATTEMPT"] = str(attempt)
     env["ORCHARD_CKPT_DIR"] = ckpt_dir
     resuming = bool(os.listdir(ckpt_dir))
     if resuming:
@@ -452,6 +458,7 @@ def cmd_exec(argv):
     started = time.time()
     status = {
         "id": job.get("id"),
+        "attempt": attempt,
         "state": "running",
         "cmd": cmd,
         "workdir": workdir,

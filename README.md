@@ -33,8 +33,10 @@ to `out/` comes back to `./.orchard-out/<job-id>/out/`.
   correctly fails with a reason instead of running somewhere wrong.
 - **Falls back.** If the worker is unavailable for about 15 minutes, queued jobs
   run on the controller instead, except jobs that need the worker. A job that
-  loses contact mid-run is requeued, and the abandoned process is killed once the
-  worker is back.
+  loses contact mid-run is requeued. When the worker is back, the abandoned copy
+  is killed if it is still running. If it already finished, its result is read,
+  not thrown away: a success is adopted and the rerun stopped, and anything else
+  is kept beside the rerun with an `orphan` event that flags the duplicate run.
 - **Stays small on the worker.** The worker side is one standard-library Python
   file that runs under the stock `/usr/bin/python3` (3.9+). Everything lives in
   `~/.orchard`; `rm -rf ~/.orchard` uninstalls it. No daemon, no sudo, no open
@@ -98,7 +100,10 @@ requires: {mem_gb: 2, disk_gb: 1}
 ```
 
 Long jobs should write checkpoints to `$ORCHARD_CKPT_DIR` and resume when
-`$ORCHARD_RESUME` is set.
+`$ORCHARD_RESUME` is set. `$ORCHARD_JOB_ID` and `$ORCHARD_ATTEMPT` (1 on the first
+launch, one higher after each requeue) identify the run, so a job with side
+effects, like a deploy or a notification, can key them on the job id and skip work
+an earlier attempt already did.
 
 ## Using it with AI coding agents
 

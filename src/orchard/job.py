@@ -88,10 +88,17 @@ def new_job_id(name: str) -> str:
 
 
 def agent_job_payload(
-    job: JobSpec, job_id: str, job_dir: str, workdir: str, venv: str | None, preempt: bool = False
+    job: JobSpec,
+    job_id: str,
+    job_dir: str,
+    workdir: str,
+    venv: str | None,
+    preempt: bool = False,
+    attempt: int = 1,
 ) -> dict:
     return {
         "id": job_id,
+        "attempt": attempt,
         "cmd": job.cmd,
         "venv": venv,
         "workdir": workdir,

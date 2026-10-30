@@ -122,6 +122,8 @@ on whichever machine runs it. Only declared names ever leave the Air; undeclared
 variables are not forwarded and missing ones are reported at submit.
 
 Checkpoint contract (settled in M2): the agent exports `ORCHARD_JOB_ID`,
+`ORCHARD_ATTEMPT` (the launch number: 1, then one higher after each requeue or
+fallback; also written to status.json and the `finished` event),
 `ORCHARD_CKPT_DIR` (= `<job dir>/ckpt`, deliberately outside the staged workdir so
 re-staging never wipes it) and, when the checkpoint dir is non-empty at start,
 `ORCHARD_RESUME=1`. Jobs write checkpoints into `$ORCHARD_CKPT_DIR`. A preempted job
@@ -212,8 +214,22 @@ whose tags or platform needs exclude the Air (e.g. `x86_64`) keep waiting instea
 with the reason shown in the queue note. A job that loses contact mid-run for
 `max_misses` polls (default 40 ≈ 10 min) is requeued locally the same way, or fails
 with the blocking reason if the Air can't run it. An abandoned remote job from a
-lost-contact fallback is remembered as an orphan and killed the moment the worker
-becomes reachable again, so a network blip can't cause duplicate execution.
+lost-contact fallback is remembered as an orphan, with its attempt number. When
+the worker answers again, the dispatcher reads the orphan's status before acting:
+
+- still running or paused: killed;
+- finished under a different attempt number: ignored as stale;
+- succeeded while the local rerun is queued or running: adopted. Its log, status
+  and artifacts are collected as the job's own, the rerun is stopped, and the
+  rerun's log and status move to `<state dir>/rerun`;
+- any other finish (a failure, or a success after the rerun already ended):
+  collected beside the rerun into `<state dir>/orphan` and
+  `.orchard-out/<id>/orphan`.
+
+Each case logs an `orphan` event with the outcome and `duplicate: true` when both
+copies ran. Contact loss can't be told apart from a dead worker in time to avoid
+the rerun, so a job whose side effects must not repeat should key them on
+`ORCHARD_JOB_ID` and check `ORCHARD_ATTEMPT`.
 
 Local liveness: local jobs record the agent's pid; if the status file still says
 running but the process is gone (e.g. the Air shut down mid-job), the dispatcher
@@ -269,7 +285,7 @@ background_qos=false, pause_on_low_battery_pct=20`.
 
 - `~/.orchard/state/events.jsonl` is the durable trace: one JSON line per lifecycle
   event (`submitted`, `launched`, `held`, `adopted`, `fallback`, `requeued`,
-  `finished`, `failed`, `cancelled`). "Held" carries the scheduler reason and is
+  `finished`, `failed`, `cancelled`, `orphan`). "Held" carries the scheduler reason and is
   logged once per distinct reason per job (re-logged on dispatcher restart, which
   doubles as a restart marker). Rotation: one generation to `events.jsonl.1` at
   5 MB. Appends never raise — logging can't break job control.

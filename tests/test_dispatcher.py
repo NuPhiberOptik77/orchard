@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -98,7 +99,12 @@ def test_lost_contact_requeues_locally(tmp_path, monkeypatch):
     entry = dispatcher.load_entries()[0]
     assert entry["worker"] == "local"
     assert entry["state"] == "running"
-    assert entry["orphan"] == {"worker": "pro", "rjob": "/Users/x/.orchard/jobs/demo-lost"}
+    assert entry["orphan"] == {
+        "worker": "pro",
+        "rjob": "/Users/x/.orchard/jobs/demo-lost",
+        "rhome": "/Users/x",
+        "attempt": 0,
+    }
 
 
 def test_orphan_cancelled_when_worker_reachable(tmp_path, monkeypatch):
@@ -118,6 +124,120 @@ def test_orphan_cancelled_when_worker_reachable(tmp_path, monkeypatch):
     entry = dispatcher.load_entries()[0]
     assert entry["orphan"] is None
     assert "orphan cancelled" in entry["note"]
+
+
+ORPHAN = {"worker": "pro", "rjob": "/Users/x/.orchard/jobs/demo-o", "rhome": "/Users/x", "attempt": 1}
+
+
+def _orphaned(tmp_path, monkeypatch, remote, state, **fields):
+    """A job requeued locally after lost contact, whose worker now answers with `remote`."""
+    monkeypatch.setattr(dispatcher, "QUEUE_DIR", tmp_path / "queue")
+    monkeypatch.setattr(dispatcher.engine, "remote_caps", lambda worker: {"machine": "x86_64"})
+    monkeypatch.setattr(dispatcher.engine, "remote_status", lambda worker, rjob: remote)
+    kills = []
+    monkeypatch.setattr(dispatcher.engine, "kill_remote", lambda w, rjob: kills.append(rjob) or True)
+    collected = []
+
+    def collect(worker, job_id, rjob, into, cwd, artifacts=None):
+        collected.append((into, artifacts))
+        (into / "status.json").write_text(json.dumps(remote))
+        return remote
+
+    monkeypatch.setattr(dispatcher.engine, "collect_remote", collect)
+    sdir, cwd = tmp_path / "state", tmp_path / "proj"
+    sdir.mkdir(exist_ok=True)
+    cwd.mkdir(exist_ok=True)
+    entry = dispatcher.enqueue(make_job(), "demo-o", cwd, sdir, worker="local")
+    entry.update(state=state, attempts=2, orphan=dict(ORPHAN), note="lost contact with worker", **fields)
+    dispatcher.save_entry(entry)
+    return sdir, cwd, kills, collected
+
+
+def test_orphan_success_adopted_and_rerun_stopped(tmp_path, monkeypatch):
+    remote = {"state": "succeeded", "exit_code": 0, "attempt": 1}
+    sdir, cwd, kills, collected = _orphaned(tmp_path, monkeypatch, remote, "running")
+    job_json = sdir / "job.json"
+    job_json.write_text(json.dumps({
+        "id": "demo-o", "attempt": 2, "cmd": ["sleep", "30"], "venv": None, "workdir": str(cwd),
+        "job_dir": str(sdir), "timeout_s": 60, "preempt": False, "env": {},
+    }))
+    proc = subprocess.Popen(
+        [sys.executable, dispatcher.agent.__file__, "exec", str(job_json)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+        env={**os.environ, "HOME": str(tmp_path)},
+    )
+    try:
+        deadline = time.time() + 10
+        while not (dispatcher.engine.local_status(sdir) or {}).get("pgid") and time.time() < deadline:
+            time.sleep(0.1)
+        entry = dispatcher.load_entries()[0]
+        entry["local_pid"] = proc.pid
+        dispatcher.save_entry(entry)
+        lines = dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
+    finally:
+        proc.kill()
+    assert any("adopted result from pro (local rerun stopped)" in line for line in lines), (lines, dispatcher.load_entries()[0])
+    assert proc.poll() is not None
+    assert kills == []
+    assert collected == [(sdir, None)]
+    entry = dispatcher.load_entries()[0]
+    assert (entry["state"], entry["worker"], entry["rhome"], entry["orphan"]) == ("done", "pro", "/Users/x", None)
+    assert json.loads((sdir / "status.json").read_text())["attempt"] == 1
+    assert json.loads((sdir / "rerun" / "status.json").read_text())["attempt"] == 2
+    recs = events.load()
+    assert [r for r in recs if r["event"] == "finished"][0]["attempt"] == 1
+    orphan = [r for r in recs if r["event"] == "orphan"][0]
+    assert (orphan["outcome"], orphan["duplicate"]) == ("adopted", True)
+
+
+def test_orphan_success_adopted_before_rerun_starts(tmp_path, monkeypatch):
+    remote = {"state": "succeeded", "exit_code": 0, "attempt": 1}
+    sdir, _cwd, _kills, collected = _orphaned(tmp_path, monkeypatch, remote, "queued")
+    monkeypatch.setattr(dispatcher, "start_queued", lambda *a, **k: [])
+    dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
+    entry = dispatcher.load_entries()[0]
+    assert (entry["state"], entry["worker"]) == ("done", "pro")
+    assert "local rerun not started" in entry["note"]
+    assert collected == [(sdir, None)]
+    orphan = [r for r in events.load() if r["event"] == "orphan"][0]
+    assert orphan["duplicate"] is False
+
+
+def test_orphan_after_finished_rerun_kept_as_duplicate(tmp_path, monkeypatch):
+    remote = {"state": "succeeded", "exit_code": 0, "attempt": 1}
+    sdir, cwd, kills, collected = _orphaned(tmp_path, monkeypatch, remote, "done")
+    lines = dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
+    assert any("result kept beside the rerun" in line for line in lines)
+    assert kills == []
+    assert collected == [(sdir / "orphan", cwd / ".orchard-out" / "demo-o" / "orphan")]
+    entry = dispatcher.load_entries()[0]
+    assert (entry["state"], entry["worker"], entry["orphan"]) == ("done", "local", None)
+    orphan = [r for r in events.load() if r["event"] == "orphan"][0]
+    assert (orphan["outcome"], orphan["rerun"], orphan["duplicate"]) == ("kept", "done", True)
+
+
+def test_orphan_failure_leaves_rerun_running(tmp_path, monkeypatch):
+    remote = {"state": "failed", "exit_code": 1, "attempt": 1}
+    sdir, cwd, kills, collected = _orphaned(tmp_path, monkeypatch, remote, "running", local_pid=os.getpid())
+    (sdir / "status.json").write_text(json.dumps({"state": "running", "attempt": 2}))
+    monkeypatch.setattr(dispatcher, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(dispatcher, "_stop_local_rerun", lambda *a: (_ for _ in ()).throw(AssertionError))
+    dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
+    assert collected == [(sdir / "orphan", cwd / ".orchard-out" / "demo-o" / "orphan")]
+    entry = dispatcher.load_entries()[0]
+    assert (entry["state"], entry["worker"], entry["orphan"]) == ("running", "local", None)
+    assert "orphan failed on pro" in entry["note"]
+
+
+def test_orphan_from_other_attempt_ignored(tmp_path, monkeypatch):
+    remote = {"state": "succeeded", "exit_code": 0, "attempt": 3}
+    _sdir, _cwd, kills, collected = _orphaned(tmp_path, monkeypatch, remote, "done")
+    lines = dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
+    assert any("ignored stale orphan result" in line for line in lines)
+    assert (kills, collected) == ([], [])
+    entry = dispatcher.load_entries()[0]
+    assert entry["orphan"] is None
+    assert "attempt 3, expected 1" in entry["note"]
 
 
 def test_local_pid_liveness_marks_failed(tmp_path, monkeypatch):

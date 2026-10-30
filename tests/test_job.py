@@ -77,6 +77,8 @@ def test_agent_job_payload_includes_env():
     job = JobSpec(name="t", cmd=["true"], env=["HF_TOKEN"], env_values={"HF_TOKEN": "x"})
     payload = agent_job_payload(job, "id1", "/j", "/w", None)
     assert payload["env"] == {"HF_TOKEN": "x"}
+    assert payload["attempt"] == 1
+    assert agent_job_payload(job, "id1", "/j", "/w", None, attempt=3)["attempt"] == 3
 
 
 def test_slugify():

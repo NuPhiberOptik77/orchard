@@ -202,7 +202,13 @@ def check_shipping_size(cwd: Path, kind: str) -> None:
 
 
 def launch_remote(
-    worker: Worker, job: JobSpec, job_id: str, sdir: Path, cwd: Path, rhome: str | None = None
+    worker: Worker,
+    job: JobSpec,
+    job_id: str,
+    sdir: Path,
+    cwd: Path,
+    rhome: str | None = None,
+    attempt: int = 1,
 ) -> tuple[str, str]:
     rhome = rhome or remote_home(worker)
     rroot = f"{rhome}/.orchard"
@@ -259,7 +265,7 @@ def launch_remote(
         )
         print(f"environment ready ({job.python})")
 
-    payload = agent_job_payload(job, job_id, rjob, rwork, venv, preempt=True)
+    payload = agent_job_payload(job, job_id, rjob, rwork, venv, preempt=True, attempt=attempt)
     transport.push_bytes(worker, f"{rjob}/job.json", json.dumps(payload, indent=2).encode())
 
     start = (
@@ -338,7 +344,9 @@ def _remote_dir_bytes(worker: Worker, rpath: str) -> int:
         return 0
 
 
-def collect_remote(worker: Worker, job_id: str, rjob: str, sdir: Path, cwd: Path) -> dict:
+def collect_remote(
+    worker: Worker, job_id: str, rjob: str, sdir: Path, cwd: Path, artifacts: Path | None = None
+) -> dict:
     status = None
     try:
         (sdir / "log.txt").write_bytes(transport.pull_bytes(worker, f"{rjob}/log.txt"))
@@ -348,7 +356,7 @@ def collect_remote(worker: Worker, job_id: str, rjob: str, sdir: Path, cwd: Path
         print(f"warning: could not collect logs: {exc}")
 
     workdir = (status or {}).get("workdir") or f"{rjob}/work"
-    artifacts = cwd / ".orchard-out" / job_id
+    artifacts = artifacts or cwd / ".orchard-out" / job_id
     size_bytes = _remote_dir_bytes(worker, f"{workdir}/out")
     if size_bytes:
         verdict, msg = artifact_pull_verdict(size_bytes, shutil.disk_usage(cwd).free, artifact_warn_bytes())
@@ -402,21 +410,25 @@ def kill_remote(worker: Worker, rjob: str) -> bool:
     return proc.returncode == 0
 
 
-def prepare_local_job(job: JobSpec, job_id: str, sdir: Path, cwd: Path) -> tuple[Path | None, Path]:
+def prepare_local_job(
+    job: JobSpec, job_id: str, sdir: Path, cwd: Path, attempt: int = 1
+) -> tuple[Path | None, Path]:
     job_json = sdir / "job.json"
     if job.kind == "build":
-        payload = agent_job_payload(job, job_id, str(sdir), str(cwd), None, preempt=False)
+        payload = agent_job_payload(job, job_id, str(sdir), str(cwd), None, preempt=False, attempt=attempt)
         job_json.write_text(json.dumps(payload, indent=2) + "\n")
         return None, job_json
     key = env.env_key(job.python, job.requirements)
     venv = env.ensure_env_local(key, job.python, job.requirements)
-    payload = agent_job_payload(job, job_id, str(sdir), str(cwd), str(venv), preempt=False)
+    payload = agent_job_payload(job, job_id, str(sdir), str(cwd), str(venv), preempt=False, attempt=attempt)
     job_json.write_text(json.dumps(payload, indent=2) + "\n")
     return venv, job_json
 
 
-def launch_local(job: JobSpec, job_id: str, sdir: Path, cwd: Path) -> tuple[Path | None, int]:
-    venv, job_json = prepare_local_job(job, job_id, sdir, cwd)
+def launch_local(
+    job: JobSpec, job_id: str, sdir: Path, cwd: Path, attempt: int = 1
+) -> tuple[Path | None, int]:
+    venv, job_json = prepare_local_job(job, job_id, sdir, cwd, attempt)
     proc = subprocess.Popen(
         [sys.executable, str(Path(agent.__file__)), "exec", str(job_json)],
         stdout=subprocess.DEVNULL,

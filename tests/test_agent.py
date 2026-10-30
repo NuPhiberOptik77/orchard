@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,34 @@ def test_agent_runs_under_stock_python(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert "Traceback" not in result.stderr
+
+
+def _exec(tmp_path, cmd, **fields):
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    job = {"id": "j1", "cmd": cmd, "venv": None, "workdir": str(tmp_path), "job_dir": str(job_dir),
+           "timeout_s": None, "preempt": False, "env": {}, **fields}
+    (job_dir / "job.json").write_text(json.dumps(job))
+    subprocess.run(
+        [sys.executable, str(Path(agent.__file__)), "exec", str(job_dir / "job.json")],
+        capture_output=True,
+        timeout=60,
+        env={**os.environ, "HOME": str(tmp_path)},
+    )
+    return json.loads((job_dir / "status.json").read_text())
+
+
+def test_exec_records_attempt(tmp_path):
+    status = _exec(tmp_path, ["sh", "-c", 'echo "$ORCHARD_ATTEMPT" > attempt.txt'], attempt=3)
+    assert (status["state"], status["attempt"]) == ("succeeded", 3)
+    assert (tmp_path / "attempt.txt").read_text().strip() == "3"
+
+
+def test_exec_timeout_stops_group(tmp_path):
+    # A leader killed by SIGTERM stays a zombie until reaped; macOS then
+    # answers the group probe with EPERM, which used to crash the agent.
+    status = _exec(tmp_path, ["sleep", "30"], timeout_s=1)
+    assert status["state"] == "timed_out"
 
 
 def test_running_marker_roundtrip(tmp_path, monkeypatch):

@@ -12,6 +12,7 @@ import os
 import plistlib
 import re
 import shutil
+import signal
 import subprocess
 import time
 from collections.abc import Callable
@@ -368,13 +369,9 @@ def tick(workers: list[Worker] | None = None) -> list[str]:
         if caps_of(worker) is None:
             continue
         try:
-            ok = engine.kill_remote(worker, orphan["rjob"])
-        except Exception:
-            continue
-        entry["orphan"] = None
-        entry["note"] = f"{entry.get('note') or ''}; orphan cancelled ({'ok' if ok else 'no-op'})"
-        save_entry(entry)
-        lines.append(f"{entry['id']}: cancelled orphaned remote job on {orphan['worker']}")
+            lines += settle_orphan(entry, worker)
+        except Exception as exc:
+            lines.append(f"{entry['id']}: orphan check failed: {exc}")
 
     _log_holds(entries, stale)
     return lines
@@ -445,6 +442,16 @@ def _pid_alive(pid: int) -> bool:
         return False
     except OSError:
         return True
+
+
+def _child_gone(pid: int) -> bool:
+    """True once pid has exited, reaping it if it is this process's child."""
+    try:
+        if os.waitpid(int(pid), os.WNOHANG)[0]:
+            return True
+    except ChildProcessError:
+        pass
+    return not _pid_alive(pid)
 
 
 def acquire_tick_lock() -> bool:
@@ -521,7 +528,7 @@ def start_queued(
                 entry["note"] = f"air busy (load {engine.air_load():.1f})"
                 save_entry(entry)
                 return [f"{entry['id']}: held ({entry['note']})"]
-        venv, pid = engine.launch_local(job, entry["id"], sdir, cwd)
+        venv, pid = engine.launch_local(job, entry["id"], sdir, cwd, attempt=entry.get("attempts", 0) + 1)
         entry.update(
             state="running",
             attempts=entry.get("attempts", 0) + 1,
@@ -567,7 +574,9 @@ def start_queued(
         return _hold_or_fallback(entry, job, cfg, hold)
 
     try:
-        rhome, _rjob = engine.launch_remote(worker, job, entry["id"], sdir, cwd)
+        rhome, _rjob = engine.launch_remote(
+            worker, job, entry["id"], sdir, cwd, attempt=entry.get("attempts", 0) + 1
+        )
     except Exception as exc:
         return _note_launch_error(entry, cfg, exc)
     entry.update(
@@ -624,6 +633,8 @@ def poll_running(entry: dict, worker_map: dict[str, Worker], cfg: dict) -> list[
                     orphan = {
                         "worker": worker_name,
                         "rjob": engine.remote_job_dir(entry["rhome"], job_id),
+                        "rhome": entry["rhome"],
+                        "attempt": entry.get("attempts"),
                     }
                 entry.update(
                     state="queued",
@@ -694,8 +705,126 @@ def finish(entry: dict, status: dict, worker_map: dict[str, Worker]) -> list[str
         state=state,
         exit_code=status.get("exit_code"),
         elapsed_s=status.get("elapsed_s"),
+        attempt=status.get("attempt"),
     )
     return [f"{job_id}: {state} on {worker_name}"]
+
+
+def settle_orphan(entry: dict, worker: Worker) -> list[str]:
+    """Resolve the remote job a lost-contact fallback left behind, once its worker answers.
+
+    The worker may have finished the job while out of contact, so its status is
+    read before anything is killed. A success is adopted if the local rerun has
+    not finished: the rerun is stopped and the worker's result becomes the job's.
+    Any other finished orphan is kept beside the rerun's result (sdir/orphan and
+    .orchard-out/<id>/orphan), and an `orphan` event with duplicate=True records
+    that the command ran twice. The attempt number fences stale results: a
+    status written by a different attempt is never adopted.
+    """
+    job_id = entry["id"]
+    orphan = entry["orphan"]
+    rjob = orphan["rjob"]
+    status = engine.remote_status(worker, rjob) or {}
+    state = status.get("state")
+    expected = orphan.get("attempt")
+    attempt = status.get("attempt", expected)
+    note = entry.get("note") or ""
+
+    if state not in agent.TERMINAL_STATES:
+        ok = engine.kill_remote(worker, rjob)
+        entry.update(orphan=None, note=f"{note}; orphan cancelled ({'ok' if ok else 'no-op'})")
+        save_entry(entry)
+        events.append("orphan", job=job_id, worker=worker.name, outcome="cancelled", attempt=expected)
+        return [f"{job_id}: cancelled orphaned remote job on {worker.name}"]
+
+    if attempt is not None and expected is not None and attempt != expected:
+        entry.update(orphan=None, note=f"{note}; orphan ignored (attempt {attempt}, expected {expected})")
+        save_entry(entry)
+        events.append("orphan", job=job_id, worker=worker.name, outcome="stale", state=state, attempt=attempt)
+        return [f"{job_id}: ignored stale orphan result on {worker.name}"]
+
+    sdir, cwd = Path(entry["sdir"]), Path(entry["cwd"])
+    rerun = entry.get("state")
+    local_rerun = entry.get("worker") == "local" and rerun in ("queued", "running")
+    if state == "succeeded" and local_rerun:
+        if rerun == "running":
+            _stop_local_rerun(entry, sdir)
+        engine.collect_remote(worker, job_id, rjob, sdir, cwd)
+        stopped = "local rerun stopped" if rerun == "running" else "local rerun not started"
+        entry.update(
+            state="done",
+            worker=worker.name,
+            rhome=orphan.get("rhome"),
+            local_pid=None,
+            orphan=None,
+            paused_since=None,
+            note=f"succeeded on {worker.name} while out of contact (exit {status.get('exit_code')}); {stopped}",
+        )
+        save_entry(entry)
+        events.append(
+            "finished",
+            job=job_id,
+            worker=worker.name,
+            state=state,
+            exit_code=status.get("exit_code"),
+            elapsed_s=status.get("elapsed_s"),
+            attempt=attempt,
+        )
+        events.append(
+            "orphan",
+            job=job_id,
+            worker=worker.name,
+            outcome="adopted",
+            state=state,
+            attempt=attempt,
+            rerun=rerun,
+            duplicate=rerun == "running",
+        )
+        return [f"{job_id}: adopted result from {worker.name} ({stopped})"]
+
+    side = sdir / "orphan"
+    side.mkdir(parents=True, exist_ok=True)
+    engine.collect_remote(worker, job_id, rjob, side, cwd, artifacts=cwd / ".orchard-out" / job_id / "orphan")
+    entry.update(orphan=None, note=f"{note}; orphan {state} on {worker.name} while out of contact (kept in {side})")
+    save_entry(entry)
+    events.append(
+        "orphan",
+        job=job_id,
+        worker=worker.name,
+        outcome="kept",
+        state=state,
+        attempt=attempt,
+        rerun=rerun,
+        duplicate=rerun != "queued",
+    )
+    return [f"{job_id}: orphan {state} on {worker.name}; result kept beside the rerun"]
+
+
+def _stop_local_rerun(entry: dict, sdir: Path) -> None:
+    """Stop a running local rerun and move its log and status to sdir/rerun."""
+    pid = entry.get("local_pid")
+    deadline = time.time() + 10
+    # A rerun launched this tick may not have written its pgid yet.
+    while True:
+        pgid = (engine.local_status(sdir) or {}).get("pgid")
+        if pgid:
+            agent._terminate_group(pgid, grace=5.0)
+            break
+        if not pid or _child_gone(pid) or time.time() > deadline:
+            break
+        time.sleep(0.25)
+    while pid and not _child_gone(pid) and time.time() < deadline:
+        time.sleep(0.25)
+    if pid and not _child_gone(pid):
+        try:
+            os.kill(int(pid), signal.SIGKILL)
+        except OSError:
+            pass
+    keep = sdir / "rerun"
+    keep.mkdir(parents=True, exist_ok=True)
+    for name in ("log.txt", "status.json"):
+        if (sdir / name).exists():
+            (sdir / name).replace(keep / name)
 
 
 def track_paused(entry: dict, status: dict, worker_map: dict[str, Worker], cfg: dict) -> list[str]:
