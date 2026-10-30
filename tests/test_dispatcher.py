@@ -658,3 +658,61 @@ def test_local_start_runs_after_air_busy_backstop(tmp_path, monkeypatch):
     dispatcher.save_entry(entry)
     lines = dispatcher.tick(workers=[])
     assert any("started locally" in line for line in lines)
+
+
+def _stalled(tmp_path, monkeypatch, alive, statuses=None):
+    """A running remote job whose status stops changing; `alive` answers remote_job_alive."""
+    monkeypatch.setattr(dispatcher, "QUEUE_DIR", tmp_path / "queue")
+    reads = list(statuses or [])
+    running = {"state": "running", "attempt": 1, "elapsed_s": 40}
+    monkeypatch.setattr(dispatcher.engine, "remote_status", lambda worker, rjob: reads.pop(0) if reads else running)
+    asked = []
+    monkeypatch.setattr(dispatcher.engine, "remote_job_alive", lambda worker, job_id: asked.append(job_id) or alive)
+    sdir, cwd = tmp_path / "state", tmp_path / "proj"
+    sdir.mkdir(parents=True)
+    cwd.mkdir()
+    entry = dispatcher.enqueue(make_job(), "demo-s", cwd, sdir, worker="pro")
+    entry.update({"state": "running", "rhome": "/Users/x", "attempts": 1})
+    dispatcher.save_entry(entry)
+    return entry, asked
+
+
+def _poll(entry, times):
+    workers = {"pro": Worker(name="pro", host="10.0.0.9")}
+    cfg = dict(dispatcher.DISPATCH_DEFAULTS)
+    return [dispatcher.poll_running(entry, workers, cfg) for _ in range(times)]
+
+
+def test_stalled_run_with_dead_agent_requeued_on_same_worker(tmp_path, monkeypatch):
+    entry, asked = _stalled(tmp_path, monkeypatch, alive=False)
+    out = _poll(entry, 5)
+    # One poll records the progress, then stall_polls quiet ones.
+    assert entry["state"] == "queued" and entry["worker"] == "pro"
+    assert "lost the job mid-run" in out[-1][0]
+    assert asked == ["demo-s"]
+    assert any(e["event"] == "requeued" and e.get("detail") == "agent gone mid-run" for e in events.load())
+
+
+def test_stalled_run_kept_when_agent_alive_or_unknown(tmp_path, monkeypatch):
+    for alive in (True, None):
+        entry, asked = _stalled(tmp_path / str(alive), monkeypatch, alive=alive)
+        _poll(entry, 9)
+        assert entry["state"] == "running"
+        # Asked once per quiet spell, not on every poll.
+        assert asked == ["demo-s", "demo-s"]
+
+
+def test_changing_status_never_asks_the_agent(tmp_path, monkeypatch):
+    ticking = [{"state": "running", "attempt": 1, "elapsed_s": 5 * i} for i in range(10)]
+    entry, asked = _stalled(tmp_path, monkeypatch, alive=False, statuses=ticking)
+    _poll(entry, 10)
+    assert entry["state"] == "running" and asked == []
+
+
+def test_stalled_run_that_just_finished_is_not_requeued(tmp_path, monkeypatch):
+    running = {"state": "running", "attempt": 1, "elapsed_s": 40}
+    done = {"state": "succeeded", "exit_code": 0, "attempt": 1}
+    entry, asked = _stalled(tmp_path, monkeypatch, alive=False, statuses=[running] * 5 + [done])
+    monkeypatch.setattr(dispatcher, "finish_or_track", lambda entry, status, *a: [])
+    _poll(entry, 5)
+    assert asked == ["demo-s"] and entry["state"] == "running"

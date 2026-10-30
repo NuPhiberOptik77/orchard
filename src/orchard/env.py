@@ -8,6 +8,7 @@ from pathlib import Path
 
 from . import transport
 from .config import ORCHARD_HOME, Worker
+from .placement import worker_os
 
 REMOTE_EXPORTS = (
     'export PATH="$HOME/.orchard/tools:$PATH"; '
@@ -48,6 +49,22 @@ def platform_tag(machine: str, os_name: str = "macos") -> str:
     if tag is None:
         raise ValueError(f"unsupported platform: {machine} on {os_name}")
     return tag
+
+
+def resolve_for_worker(requirements: str | None, python_spec: str, caps: dict) -> tuple[bool, str]:
+    """resolve_for_platform for a worker's caps.
+
+    A worker uv has no platform tag for (conflicting os:* tags, or an OS and
+    CPU pair not in PLATFORM_TAGS) can't take a job with requirements; that is
+    a placement answer, not a crash.
+    """
+    if not requirements or not requirements.strip():
+        return True, "no requirements"
+    try:
+        platform = platform_tag(caps.get("machine") or "", worker_os(caps))
+    except ValueError as exc:
+        return False, str(exc)
+    return resolve_for_platform(requirements, python_spec, platform)
 
 
 def capture_python(cwd: Path) -> str:

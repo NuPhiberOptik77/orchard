@@ -235,9 +235,7 @@ def _offload_target(job: JobSpec, worker: Optional[str], cfg: dict) -> tuple[Opt
             why = f"{w.name}: {'; '.join(probs)}"
             continue
         if job.requirements:
-            ok, note = env.resolve_for_platform(
-                job.requirements, job.python, env.platform_tag(caps["machine"], placement.worker_os(caps))
-            )
+            ok, note = env.resolve_for_worker(job.requirements, job.python, caps)
             if not ok:
                 why = f"{w.name}: {note}"
                 continue
@@ -355,9 +353,7 @@ def submit(job: JobSpec, where: str, background: bool, now: bool, cwd: Path) -> 
             print(f"worker {w.name}: unreachable (skipped)")
             continue
         if job.kind == "run":
-            ok, note = env.resolve_for_platform(
-                job.requirements, job.python, env.platform_tag(caps["machine"], placement.worker_os(caps))
-            )
+            ok, note = env.resolve_for_worker(job.requirements, job.python, caps)
             caps["platform_ok"] = ok
             caps["platform_note"] = note
         else:

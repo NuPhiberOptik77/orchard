@@ -53,13 +53,22 @@ def _group_alive(pid):
         return True
 
 
+def boot_id():
+    """An id that changes at every boot, or None if unknown."""
+    if os_family() == "linux":
+        value = _read_text("/proc/sys/kernel/random/boot_id").strip()
+    else:
+        value = _sysctl("kern.bootsessionuuid")
+    return value or None
+
+
 def write_running_marker(job_id, pgid):
     """Record that a job's process group is alive (best effort, atomic)."""
     try:
         os.makedirs(_running_dir(), exist_ok=True)
         tmp = _marker_path(job_id) + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({"job_id": job_id, "pgid": pgid, "started_at": time.time()}, f)
+            json.dump({"job_id": job_id, "pgid": pgid, "started_at": time.time(), "boot_id": boot_id()}, f)
         os.replace(tmp, _marker_path(job_id))
     except OSError:
         pass
@@ -73,12 +82,17 @@ def clear_running_marker(job_id):
 
 
 def running_jobs():
-    """Job ids whose process groups are alive; stale markers are pruned."""
+    """Job ids whose process groups are alive; stale markers are pruned.
+
+    A marker from an earlier boot is stale even if its pgid is in use again:
+    after a restart that number can belong to an unrelated process.
+    """
     try:
         names = os.listdir(_running_dir())
     except OSError:
         return []
     alive = []
+    boot = boot_id()
     for name in names:
         if not name.endswith(".json"):
             continue
@@ -89,7 +103,9 @@ def running_jobs():
         except (OSError, json.JSONDecodeError):
             data = None
         pid = (data or {}).get("pgid")
-        if pid and _group_alive(pid):
+        marker_boot = (data or {}).get("boot_id")
+        same_boot = not (boot and marker_boot) or marker_boot == boot
+        if pid and same_boot and _group_alive(pid):
             alive.append(data.get("job_id") or name[:-5])
         else:
             try:
@@ -614,6 +630,7 @@ def cmd_exec(argv):
     write_running_marker(str(job.get("id")), pgid)
     status["pid"] = proc.pid
     status["pgid"] = pgid
+    status["boot_id"] = boot_id()
     _atomic_write_json(status_path, status)
 
     state = "succeeded"
@@ -706,6 +723,13 @@ def cmd_signal(argv, sig, label, cont_first=False):
     if pid is None:
         print("no pid file in %s" % argv[0], file=sys.stderr)
         return 1
+    # After a restart the pid can belong to an unrelated process.
+    started_boot = (read_status(argv[0]) or {}).get("boot_id")
+    boot = boot_id()
+    if started_boot and boot and started_boot != boot:
+        clear_running_marker(os.path.basename(argv[0].rstrip("/")))
+        print("process group not running (the machine restarted)", file=sys.stderr)
+        return 1
     try:
         pgid = os.getpgid(pid)
         if cont_first:
@@ -772,7 +796,7 @@ def _dir_size(path):
     return total
 
 
-def _gc_entries(now):
+def _gc_entries(now, max_age_days=14.0):
     entries = []
     live_workdirs = []
     inbox = os.path.join(ORCHARD_HOME, "inbox")
@@ -784,21 +808,30 @@ def _gc_entries(now):
                 entries.append({"path": path, "mtime": st.st_mtime, "size": st.st_size, "protected": False})
     jobs_dir = os.path.join(ORCHARD_HOME, "jobs")
     if os.path.isdir(jobs_dir):
+        live = set(running_jobs())
         for name in os.listdir(jobs_dir):
             path = os.path.join(jobs_dir, name)
             if not os.path.isdir(path):
                 continue
             status = read_status(path) or {}
-            protected = status.get("state") in ("running", "paused")
-            if protected and status.get("workdir"):
-                live_workdirs.append(status["workdir"])
             try:
                 mtime = os.path.getmtime(path)
             except OSError:
                 mtime = now
             status_path = os.path.join(path, "status.json")
+            status_mtime = None
             if os.path.exists(status_path):
-                mtime = max(mtime, os.path.getmtime(status_path))
+                status_mtime = os.path.getmtime(status_path)
+                mtime = max(mtime, status_mtime)
+            # A run that says "running" with no live process died with its
+            # machine (a restart, a WSL shutdown) and will never finish. The
+            # dispatcher may still resume it from its ckpt/, so it is kept as
+            # long as a finished job would be, but not forever.
+            protected = status.get("state") in ("running", "paused") and (
+                name in live or (status_mtime is not None and now - status_mtime < max_age_days * 86400)
+            )
+            if protected and status.get("workdir"):
+                live_workdirs.append(status["workdir"])
             entries.append({"path": path, "mtime": mtime, "size": _dir_size(path), "protected": protected})
     builds_dir = os.path.join(ORCHARD_HOME, "builds")
     if os.path.isdir(builds_dir):
@@ -825,7 +858,7 @@ def cmd_gc(argv):
     min_free = float(argv[1]) if len(argv) > 1 else 3.0
     os.makedirs(ORCHARD_HOME, exist_ok=True)
     now = time.time()
-    picked = select_garbage(_gc_entries(now), now, max_age, min_free, _gc_free_gb())
+    picked = select_garbage(_gc_entries(now, max_age), now, max_age, min_free, _gc_free_gb())
     freed = 0
     for entry in picked:
         try:

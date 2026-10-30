@@ -34,6 +34,7 @@ DISPATCH_DEFAULTS = {
     "hold_on_air_busy": True,
     "air_busy_load": engine.AIR_BUSY_LOAD,
     "air_busy_max_hold_s": 1800,
+    "stall_polls": 4,
 }
 
 DISPATCH_PID = STATE_DIR / "dispatch.pid"
@@ -668,7 +669,51 @@ def poll_running(entry: dict, worker_map: dict[str, Worker], cfg: dict) -> list[
         return [f"{job_id}: no status from {worker_name} ({entry['misses']}/{cfg['max_misses']})"]
 
     entry["misses"] = 0
+    if status.get("state") in ("running", "paused"):
+        lost = _lost_run(entry, status, worker, rjob, cfg)
+        if lost:
+            return lost
     return finish_or_track(entry, status, worker_map, cfg)
+
+
+def _lost_run(entry: dict, status: dict, worker: Worker, rjob: str, cfg: dict) -> list[str] | None:
+    """Requeue a job whose worker answers but whose agent died mid-run.
+
+    The agent rewrites status.json every few seconds while a job runs, paused
+    or not. A restart, or a WSL VM shutting down, kills it without a final
+    status, and the job would read "running" forever and keep the worker busy.
+    So a status that stops changing for `stall_polls` polls is checked against
+    the worker's running markers. Only a clear "not running" requeues it;
+    nothing is killed, because after a restart its pid can belong to another
+    process.
+    """
+    job_id = entry["id"]
+    progress = [status.get("attempt"), status.get("elapsed_s")]
+    if entry.get("last_progress") != progress:
+        entry.update(last_progress=progress, stalled_polls=0)
+        return None
+    entry["stalled_polls"] = entry.get("stalled_polls", 0) + 1
+    if entry["stalled_polls"] < cfg["stall_polls"]:
+        return None
+    if engine.remote_job_alive(worker, job_id) is not False:
+        # Alive, or no clear answer: ask again after another quiet spell.
+        entry["stalled_polls"] = 0
+        return None
+    # It may have finished between the two reads.
+    status = engine.remote_status(worker, rjob)
+    if status is None or status.get("state") not in ("running", "paused"):
+        return None
+    entry.update(
+        state="queued",
+        misses=0,
+        paused_since=None,
+        last_progress=None,
+        stalled_polls=0,
+        note=f"{worker.name} lost the job mid-run; resumes from checkpoint",
+    )
+    save_entry(entry)
+    events.append("requeued", job=job_id, worker=worker.name, detail="agent gone mid-run")
+    return [f"{job_id}: {worker.name} lost the job mid-run; requeued"]
 
 
 def _wait_stranded(entry: dict, worker: Worker, rjob: str) -> list[str]:

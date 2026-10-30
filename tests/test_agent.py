@@ -1,7 +1,9 @@
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -80,6 +82,82 @@ def test_running_marker_ignores_garbage(tmp_path, monkeypatch):
     with open(path, "w") as f:
         f.write("{not json")
     assert agent.running_jobs() == []
+
+
+def test_running_marker_from_earlier_boot_is_stale(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
+    proc = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
+    try:
+        monkeypatch.setattr(agent, "boot_id", lambda: "boot-a")
+        agent.write_running_marker("job-3", proc.pid)
+        assert agent.running_jobs() == ["job-3"]
+        # After a restart the same pgid can belong to another process.
+        monkeypatch.setattr(agent, "boot_id", lambda: "boot-b")
+        assert agent.running_jobs() == []
+        assert not os.path.exists(agent._marker_path("job-3"))
+        # Markers written before boot ids, or with no id to compare, go by the pgid.
+        monkeypatch.setattr(agent, "boot_id", lambda: None)
+        agent.write_running_marker("job-4", proc.pid)
+        monkeypatch.setattr(agent, "boot_id", lambda: "boot-b")
+        assert agent.running_jobs() == ["job-4"]
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_boot_id_is_stable():
+    first = agent.boot_id()
+    assert first and first == agent.boot_id()
+
+
+def _job_with_status(home, job_id, state, age_s):
+    job_dir = os.path.join(home, "jobs", job_id)
+    os.makedirs(job_dir)
+    status_path = os.path.join(job_dir, "status.json")
+    with open(status_path, "w") as f:
+        json.dump({"state": state}, f)
+    stamp = time.time() - age_s
+    os.utime(status_path, (stamp, stamp))
+    os.utime(job_dir, (stamp, stamp))
+
+
+def test_gc_frees_runs_that_died_with_their_machine(tmp_path, monkeypatch):
+    home = str(tmp_path / "home")
+    monkeypatch.setattr(agent, "ORCHARD_HOME", home)
+    _job_with_status(home, "dead", "running", 3 * 86400)
+    # Died an hour ago: kept, so the dispatcher can resume it from ckpt/.
+    _job_with_status(home, "recent", "running", 3600)
+    _job_with_status(home, "fresh", "running", 5)
+    _job_with_status(home, "live", "paused", 3 * 86400)
+    proc = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
+    try:
+        agent.write_running_marker("live", proc.pid)
+        protected = {os.path.basename(e["path"]): e["protected"] for e in agent._gc_entries(time.time(), 2)}
+    finally:
+        proc.kill()
+        proc.wait()
+    assert protected == {"dead": False, "recent": True, "fresh": True, "live": True}
+
+
+def test_kill_skips_a_pid_from_an_earlier_boot(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
+    job_dir = tmp_path / "home" / "jobs" / "job-k"
+    job_dir.mkdir(parents=True)
+    proc = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
+    try:
+        (job_dir / "pid").write_text(str(proc.pid))
+        (job_dir / "status.json").write_text(json.dumps({"state": "running", "boot_id": "boot-a"}))
+        # After a restart the old pid may be someone else's process.
+        monkeypatch.setattr(agent, "boot_id", lambda: "boot-b")
+        assert agent.cmd_signal([str(job_dir)], signal.SIGTERM, "kill", cont_first=True) == 1
+        assert proc.poll() is None
+        monkeypatch.setattr(agent, "boot_id", lambda: "boot-a")
+        assert agent.cmd_signal([str(job_dir)], signal.SIGTERM, "kill", cont_first=True) == 0
+        assert proc.wait(timeout=5) is not None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
 
 
 def test_cmd_running(capsys, tmp_path, monkeypatch):

@@ -152,6 +152,25 @@ def test_remote_job_running(monkeypatch):
     assert engine.remote_job_running(worker, "j1") is False
 
 
+def test_remote_job_alive_tells_gone_from_unknown(monkeypatch):
+    class Proc:
+        returncode = 0
+
+        def __init__(self, out):
+            self.stdout = out
+
+    def timeout(*a, **k):
+        raise subprocess.TimeoutExpired("ssh", 30)
+
+    worker = Worker(name="pro", host="10.0.0.9")
+    for out, want in ((b"yes\n", True), (b"no\n", False), (b"", None), (b"Traceback\n", None)):
+        monkeypatch.setattr(engine.transport, "run", lambda *a, o=out, **k: Proc(o))
+        assert engine.remote_job_alive(worker, "j1") is want
+    monkeypatch.setattr(engine.transport, "run", timeout)
+    assert engine.remote_job_alive(worker, "j1") is None
+    assert engine.remote_job_running(worker, "j1") is False
+
+
 def test_remote_status_missing(monkeypatch):
     class Proc:
         def __init__(self, code, out):

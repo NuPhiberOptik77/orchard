@@ -83,22 +83,32 @@ def remote_home(worker: Worker) -> str:
     return transport.run_checked(worker, "echo $HOME", timeout=20).strip()
 
 
+def remote_job_alive(worker: Worker, job_id: str) -> bool | None:
+    """Whether the worker's agent reports this job's process group alive.
+
+    None when the worker can't be asked or gives no clear answer, so callers
+    can tell "gone" from "don't know".
+    """
+    script = (
+        f'M="$HOME/.orchard/state/running/{job_id}.json"; '
+        f'if [ -f "$M" ]; then /usr/bin/python3 "$HOME/.orchard/bin/orchard-agent.py" running "{job_id}"; '
+        f'else echo no; fi'
+    )
+    try:
+        proc = transport.run(worker, script, timeout=30)
+    except subprocess.TimeoutExpired:
+        return None
+    answer = proc.stdout.decode("utf-8", "replace").strip()
+    return {"yes": True, "no": False}.get(answer)
+
+
 def remote_job_running(worker: Worker, job_id: str) -> bool:
     """True when the worker's agent reports this job's process group is still alive.
 
     Used to adopt a job whose "running" state was lost (e.g. the Air died right
     after the remote agent started) instead of relaunching it twice.
     """
-    script = (
-        f'M="$HOME/.orchard/state/running/{job_id}.json"; '
-        f'[ -f "$M" ] && /usr/bin/python3 "$HOME/.orchard/bin/orchard-agent.py" running "{job_id}" '
-        f'|| echo no'
-    )
-    try:
-        proc = transport.run(worker, script, timeout=30)
-    except subprocess.TimeoutExpired:
-        return False
-    return proc.stdout.decode("utf-8", "replace").strip() == "yes"
+    return remote_job_alive(worker, job_id) is True
 
 
 def remote_job_dir(rhome: str, job_id: str) -> str:

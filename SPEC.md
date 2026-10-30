@@ -224,7 +224,11 @@ use, on battery, or thermally throttled flips to running locally once it has wai
 `fallback_after_s` (dispatch.json, default 900) — the Air just does the work. Jobs
 whose tags or platform needs exclude the Air (e.g. `x86_64`) keep waiting instead,
 with the reason shown in the queue note. A job that loses contact mid-run for
-`max_misses` polls (default 40 ≈ 10 min) is requeued locally the same way. If the
+`max_misses` polls (default 40 ≈ 10 min) is requeued locally the same way. A job whose
+worker answers but whose progress (`attempt`, `elapsed_s`) hasn't moved for
+`stall_polls` polls (default 4) is checked for a live agent process; if there is
+none, as after the machine restarted under it, it is requeued on the same worker.
+If the
 Air can't run it, the job stays running on its worker, with the reason in its note
 and one `held` event, and stops counting as that worker's busy job so the rest of
 its queue can still fall back. Its status is collected as usual once the worker
@@ -274,7 +278,10 @@ background_qos=false, pause_on_low_battery_pct=20`.
 Linux workers can't see the host's input or power, and under WSL the guest can't
 either. The host writes them to `~/.orchard/host-status.json` (`ts`, `idle_seconds`,
 `power`, `battery_pct`, `disk_free_gb`, `source`); `contrib/windows-wsl/` has the
-Windows writer, a sign-in task that rewrites it every 10 s. The agent fails closed:
+Windows writer: a startup task that starts the distro and rewrites the file every
+10 s, counting idle time from boot while nobody is signed in and passing on what a
+sign-in task reports from the user's session otherwise, so neither a reboot nor a
+sign-out takes the worker offline. The agent fails closed:
 a file that is missing, unreadable, incomplete or older than 60 s by its mtime reads
 as "user active, power unknown", which holds new jobs and pauses running ones, and
 `host_status` says which. The thermal check is skipped there, and
@@ -285,7 +292,9 @@ as "user active, power unknown", which holds new jobs and pauses running ones, a
 - Worker must retain ≥2 GB free disk after staging (Pro has ~7 GB: jobs are refused
   otherwise). Worker GC (`agent.py gc [max_age_days] [min_free_gb]`, defaults 14 / 3)
   removes unprotected job dirs and inbox blobs older than max_age_days, or until
-  min_free_gb is restored; running/paused jobs are never touched.
+  min_free_gb is restored; running/paused jobs are never touched, unless their
+  process is gone and their status is older than max_age_days (the machine
+  restarted under them). Nothing schedules it; the WSL contrib adds a cron line.
 - On a Linux worker free disk is the smaller of statvfs and the host's
   `disk_free_gb`: a WSL disk is a file on the host's C: and can't outgrow it.
 - RAM ceiling enforced on the 8 GB Pro via `requires.mem_gb`.
