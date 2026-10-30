@@ -228,6 +228,11 @@ with the reason shown in the queue note. A job that loses contact mid-run for
 worker answers but whose progress (`attempt`, `elapsed_s`) hasn't moved for
 `stall_polls` polls (default 4) is checked for a live agent process; if there is
 none, as after the machine restarted under it, it is requeued on the same worker.
+Every job runs under the agent's `wrap`, which writes `exit.json` when the command
+ends, so a job that ran on to the end after its agent died is settled from that
+record and collected, not run again. A job stopped by a signal its `wrap` also got,
+as in a shutdown, is not settled and runs again. When `settle` gives no clear answer
+the job is left running and asked about after another quiet spell.
 If the
 Air can't run it, the job stays running on its worker, with the reason in its note
 and one `held` event, and stops counting as that worker's busy job so the rest of

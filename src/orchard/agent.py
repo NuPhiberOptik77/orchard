@@ -12,11 +12,14 @@ Usage:
   python3 agent.py pause <job_dir>
   python3 agent.py resume <job_dir>
   python3 agent.py kill <job_dir>
+  python3 agent.py settle <job_dir>
+  python3 agent.py wrap <exit.json> <attempt> -- <cmd...>
   python3 agent.py gc [max_age_days] [min_free_gb]
 """
 
 from __future__ import annotations
 
+import errno
 import json
 import math
 import os
@@ -567,6 +570,7 @@ def cmd_exec(argv):
     log_path = os.path.join(job_dir, "log.txt")
     status_path = os.path.join(job_dir, "status.json")
     pid_path = os.path.join(job_dir, "pid")
+    exit_path = os.path.join(job_dir, "exit.json")
 
     env = dict(os.environ)
     env.update({str(k): str(v) for k, v in (job.get("env") or {}).items()})
@@ -587,7 +591,14 @@ def cmd_exec(argv):
         env["ORCHARD_RESUME"] = "1"
 
     preempt = bool(job.get("preempt"))
-    wrapped = _wrap(cmd, load_policy())
+    # The job records its own exit (see cmd_wrap), so drop an earlier attempt's.
+    try:
+        os.unlink(exit_path)
+    except OSError:
+        pass
+    recorded = [sys.executable, "-I", os.path.abspath(__file__), "wrap", exit_path,
+                "" if attempt is None else str(attempt), "--"] + cmd
+    wrapped = _wrap(recorded, load_policy())
     timeout = job.get("timeout_s")
 
     started = time.time()
@@ -662,10 +673,12 @@ def cmd_exec(argv):
                 policy = load_policy()
                 sample = sample_preemption_state(policy, pgid)
                 action, reason = decide_preemption(sample, policy, paused)
+                # EPERM is macOS's answer for an all-zombie group, as in
+                # _terminate_group: the job has ended, so poll it again.
                 if action == "pause":
                     try:
                         os.killpg(pgid, signal.SIGSTOP)
-                    except ProcessLookupError:
+                    except (ProcessLookupError, PermissionError):
                         time.sleep(0.5)
                         continue
                     paused = True
@@ -675,7 +688,7 @@ def cmd_exec(argv):
                 elif action == "resume":
                     try:
                         os.killpg(pgid, signal.SIGCONT)
-                    except ProcessLookupError:
+                    except (ProcessLookupError, PermissionError):
                         time.sleep(0.5)
                         continue
                     paused = False
@@ -683,7 +696,10 @@ def cmd_exec(argv):
                     status.update(state="running", pause_reason=None, paused_since=None)
                     _log_line(log, "resumed")
             status.update(elapsed_s=round(now - started, 1), active_s=round(active_s, 1))
-            _atomic_write_json(status_path, status)
+            try:
+                _atomic_write_json(status_path, status)
+            except OSError:
+                pass  # a full disk must not kill the agent; the next poll tries again
             last_poll = now
         time.sleep(0.5)
 
@@ -691,7 +707,7 @@ def cmd_exec(argv):
     if paused:
         try:
             os.killpg(pgid, signal.SIGCONT)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
     clear_running_marker(str(job.get("id")))
     status.update(
@@ -705,6 +721,117 @@ def cmd_exec(argv):
     )
     _atomic_write_json(status_path, status)
     return 0 if state == "succeeded" else 1
+
+
+def cmd_wrap(argv):
+    """Run a job's command, then record how it ended in exit.json.
+
+    The agent runs every job through this, so a job that ends after its agent
+    died (a crash, a full disk) still leaves its exit code, and `settle` can
+    finish it instead of the dispatcher running it again. It shrugs off the
+    signals the agent sends the job's process group, so it outlives the
+    command, and then exits the way the command did.
+
+    A signal it shrugged off goes in the record too. A shutdown or a restart
+    signals every process, the agent included, and a command it stopped
+    didn't end by itself, so `settle` leaves that run to be run again.
+    """
+    if len(argv) < 4 or argv[2] != "--":
+        print("usage: agent.py wrap <exit.json> <attempt> -- <cmd...>", file=sys.stderr)
+        return 2
+    exit_path, attempt, cmd = argv[0], argv[1], argv[3:]
+    got = []
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        # A handler, not SIG_IGN, so the command gets the default back on
+        # exec. One ignored already (nohup) stays ignored for the command.
+        if signal.getsignal(sig) != signal.SIG_IGN:
+            signal.signal(sig, lambda signum, frame: got.append(signum))
+    rc = _call_command(cmd)
+    record = {"exit_code": rc, "attempt": int(attempt) if attempt.isdigit() else None, "ended_at": time.time()}
+    if got:
+        record["signal"] = got[0]
+    try:
+        _atomic_write_json(exit_path, record)
+    except OSError:
+        pass
+    if rc < 0:
+        try:
+            signal.signal(-rc, signal.SIG_DFL)
+        except (OSError, ValueError):
+            pass  # SIGKILL can't be handled, and needs no reset
+        os.kill(os.getpid(), -rc)
+        return 128 - rc
+    return rc
+
+
+def _call_command(cmd):
+    """Run cmd and return its exit code, the shell's 127 or 126 if it can't start.
+
+    A file with no #! line runs under /bin/sh, as caffeinate's execvp ran it
+    before every job went through `wrap`.
+    """
+    try:
+        try:
+            return subprocess.call(cmd)
+        except OSError as exc:
+            path = cmd[0] if "/" in cmd[0] else shutil.which(cmd[0])
+            if exc.errno != errno.ENOEXEC or not path:
+                raise
+            return subprocess.call(["/bin/sh", path] + cmd[1:])
+    except OSError as exc:
+        print("orchard: cannot run %s: %s" % (cmd[0], exc), file=sys.stderr)
+        return 127 if exc.errno in (errno.ENOENT, errno.ENOTDIR) else 126
+
+
+def settle_status(job_dir):
+    """The job's status, made final from exit.json when its agent died first.
+
+    status.json says running or paused until the agent writes how the job
+    ended. If the agent died and the job ran on to the end, its process group
+    is gone and cmd_wrap's exit.json holds the exit code, which then becomes
+    the final status. A record from another attempt, one whose command was
+    signalled (a shutdown stopping it), or a group still alive, leaves the
+    status as it is.
+    """
+    status = read_status(job_dir)
+    if not status or status.get("state") not in ("running", "paused"):
+        return status
+    try:
+        with open(os.path.join(job_dir, "exit.json")) as f:
+            ended = json.load(f)
+    except (OSError, ValueError):
+        return status
+    if not isinstance(ended, dict) or ended.get("attempt") != status.get("attempt") or ended.get("signal"):
+        return status
+    if str(status.get("id")) in running_jobs():
+        return status
+    exit_code = ended.get("exit_code")
+    ended_at = ended.get("ended_at") or time.time()
+    status.update(
+        state="succeeded" if exit_code == 0 else "failed",
+        pause_reason=None,
+        paused_since=None,
+        ended_at=ended_at,
+        elapsed_s=round(ended_at - (status.get("started_at") or ended_at), 1),
+        exit_code=exit_code,
+    )
+    try:
+        _atomic_write_json(os.path.join(job_dir, "status.json"), status)
+    except OSError:
+        pass  # the caller still gets the final status
+    return status
+
+
+def cmd_settle(argv):
+    if len(argv) != 1:
+        print("usage: agent.py settle <job_dir>", file=sys.stderr)
+        return 2
+    status = settle_status(argv[0])
+    if status is None:
+        print("no status.json in %s" % argv[0], file=sys.stderr)
+        return 1
+    print(json.dumps(status, indent=2))
+    return 0
 
 
 def _read_pid(job_dir):
@@ -735,7 +862,7 @@ def cmd_signal(argv, sig, label, cont_first=False):
         if cont_first:
             os.killpg(pgid, signal.SIGCONT)
         os.killpg(pgid, sig)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         clear_running_marker(os.path.basename(argv[0].rstrip("/")))
         print("process group not running", file=sys.stderr)
         return 1
@@ -900,6 +1027,10 @@ def main(argv=None):
         return cmd_gc(rest)
     if cmd == "running":
         return cmd_running(rest)
+    if cmd == "settle":
+        return cmd_settle(rest)
+    if cmd == "wrap":
+        return cmd_wrap(rest)
     print("unknown command: %s" % cmd, file=sys.stderr)
     return 2
 

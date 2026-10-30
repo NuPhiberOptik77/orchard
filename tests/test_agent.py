@@ -54,6 +54,178 @@ def test_exec_timeout_stops_group(tmp_path):
     assert status["state"] == "timed_out"
 
 
+def test_exec_records_its_own_exit(tmp_path):
+    status = _exec(tmp_path, ["sh", "-c", "exit 3"], attempt=2)
+    assert (status["state"], status["exit_code"]) == ("failed", 3)
+    ended = json.loads((tmp_path / "job" / "exit.json").read_text())
+    assert (ended["exit_code"], ended["attempt"]) == (3, 2)
+
+
+def test_exec_wrapper_exits_the_way_the_command_did(tmp_path):
+    (tmp_path / "signal").mkdir()
+    status = _exec(tmp_path / "signal", ["sh", "-c", "kill -TERM $$"])
+    assert status["exit_code"] == -signal.SIGTERM
+    assert json.loads((tmp_path / "signal" / "job" / "exit.json").read_text())["exit_code"] == -signal.SIGTERM
+    (tmp_path / "missing").mkdir()
+    status = _exec(tmp_path / "missing", ["orchard-no-such-command"])
+    assert (status["state"], status["exit_code"]) == ("failed", 127)
+
+
+def test_wrap_keeps_ignored_signals_ignored(tmp_path):
+    # A remote agent starts under nohup: its jobs got SIGHUP ignored before
+    # `wrap` existed, and still do. Signals it didn't ignore are the default.
+    probe = "import signal; print(signal.getsignal(signal.SIGHUP) == signal.SIG_IGN, " \
+            "signal.getsignal(signal.SIGTERM) == signal.SIG_DFL)"
+    out = subprocess.run(
+        [sys.executable, str(Path(agent.__file__)), "wrap", str(tmp_path / "exit.json"), "1", "--",
+         sys.executable, "-c", probe],
+        capture_output=True, text=True, timeout=30,
+        preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN),
+    )
+    assert out.stdout.split() == ["True", "True"]
+
+
+def test_exec_runs_commands_the_way_a_shell_does(tmp_path):
+    # A script with no #! line runs under /bin/sh, as it did under caffeinate.
+    (tmp_path / "plain").mkdir()
+    script = tmp_path / "plain" / "run-me"
+    script.write_text("echo ran > ran.txt\n")
+    script.chmod(0o755)
+    status = _exec(tmp_path / "plain", [str(script)])
+    assert (status["state"], status["exit_code"]) == ("succeeded", 0)
+    assert (tmp_path / "plain" / "ran.txt").read_text().strip() == "ran"
+    # A file that isn't executable fails 126, like in a shell.
+    (tmp_path / "noexec").mkdir()
+    script = tmp_path / "noexec" / "run-me"
+    script.write_text("echo ran\n")
+    script.chmod(0o644)
+    status = _exec(tmp_path / "noexec", [str(script)])
+    assert (status["state"], status["exit_code"]) == ("failed", 126)
+
+
+def test_exec_survives_eperm_on_pause(tmp_path, monkeypatch):
+    # macOS answers EPERM when every process in the group is an unreaped
+    # zombie, which used to crash the agent and leave the job running forever.
+    monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(agent, "load_policy", lambda: dict(agent.DEFAULT_POLICY))
+    monkeypatch.setattr(agent, "sample_preemption_state", lambda policy, pgid: {})
+    monkeypatch.setattr(agent, "decide_preemption", lambda sample, policy, paused: ("pause", "test"))
+    real_killpg = os.killpg
+
+    def killpg(pgid, sig):
+        if sig == signal.SIGSTOP:
+            raise PermissionError(1, "Operation not permitted")
+        real_killpg(pgid, sig)
+
+    monkeypatch.setattr(agent.os, "killpg", killpg)
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    job = {"id": "j1", "cmd": ["sh", "-c", "sleep 1"], "venv": None, "workdir": str(tmp_path),
+           "job_dir": str(job_dir), "timeout_s": None, "preempt": True, "env": {}, "attempt": 1}
+    (job_dir / "job.json").write_text(json.dumps(job))
+    assert agent.cmd_exec([str(job_dir / "job.json")]) == 0
+    assert json.loads((job_dir / "status.json").read_text())["state"] == "succeeded"
+
+
+def _settle_case(tmp_path, monkeypatch, status, ended):
+    monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
+    job_dir = tmp_path / "job"
+    job_dir.mkdir(exist_ok=True)
+    (job_dir / "status.json").write_text(json.dumps(status))
+    if ended is not None:
+        (job_dir / "exit.json").write_text(json.dumps(ended))
+    return job_dir
+
+
+def test_settle_finishes_a_run_whose_agent_died(tmp_path, monkeypatch):
+    running = {"id": "j1", "state": "paused", "attempt": 2, "started_at": 100.0, "pause_reason": "user active"}
+    job_dir = _settle_case(tmp_path, monkeypatch, running, {"exit_code": 0, "attempt": 2, "ended_at": 160.0})
+    status = agent.settle_status(str(job_dir))
+    assert (status["state"], status["exit_code"], status["elapsed_s"]) == ("succeeded", 0, 60.0)
+    assert status["pause_reason"] is None
+    assert json.loads((job_dir / "status.json").read_text())["state"] == "succeeded"
+    (job_dir / "status.json").write_text(json.dumps(running))
+    (job_dir / "exit.json").write_text(json.dumps({"exit_code": 4, "attempt": 2, "ended_at": 160.0}))
+    assert agent.settle_status(str(job_dir))["state"] == "failed"
+
+
+def test_settle_leaves_runs_it_cannot_vouch_for(tmp_path, monkeypatch):
+    running = {"id": "j1", "state": "running", "attempt": 2, "started_at": 100.0}
+    # No exit record: the job died with its agent, so it has to run again.
+    job_dir = _settle_case(tmp_path, monkeypatch, running, None)
+    assert agent.settle_status(str(job_dir))["state"] == "running"
+    # A record from an earlier attempt says nothing about this one.
+    _settle_case(tmp_path, monkeypatch, running, {"exit_code": 0, "attempt": 1, "ended_at": 160.0})
+    assert agent.settle_status(str(job_dir))["state"] == "running"
+    # A finished status is already final.
+    done = dict(running, state="timed_out")
+    _settle_case(tmp_path, monkeypatch, done, {"exit_code": 0, "attempt": 2, "ended_at": 160.0})
+    assert agent.settle_status(str(job_dir))["state"] == "timed_out"
+    # While the group is alive, the record can't be this run's last word.
+    _settle_case(tmp_path, monkeypatch, running, {"exit_code": 0, "attempt": 2, "ended_at": 160.0})
+    proc = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
+    try:
+        agent.write_running_marker("j1", proc.pid)
+        assert agent.settle_status(str(job_dir))["state"] == "running"
+    finally:
+        proc.kill()
+        proc.wait()
+    assert agent.settle_status(str(job_dir))["state"] == "succeeded"
+
+
+def _outlive_agent(tmp_path, shell, ready, stop_agent, stop_job=None):
+    """Start shell as a job, stop its agent once `ready` exists, let the job end, then settle."""
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    job = {"id": "j1", "cmd": ["sh", "-c", shell], "venv": None, "workdir": str(tmp_path),
+           "job_dir": str(job_dir), "timeout_s": None, "preempt": False, "env": {}, "attempt": 1}
+    (job_dir / "job.json").write_text(json.dumps(job))
+    env = {**os.environ, "HOME": str(tmp_path)}
+    script = str(Path(agent.__file__))
+    proc = subprocess.Popen([sys.executable, script, "exec", str(job_dir / "job.json")], env=env,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.time() + 10
+    pgid = None
+    while (pgid is None or not ready.exists()) and time.time() < deadline:
+        try:
+            pgid = json.loads((job_dir / "status.json").read_text()).get("pgid")
+        except (OSError, ValueError):
+            pass
+        time.sleep(0.05)
+    assert pgid and ready.exists()
+    # The job runs in its own session, so the agent can die without it.
+    os.kill(proc.pid, stop_agent)
+    proc.wait()
+    if stop_job is not None:
+        os.killpg(pgid, stop_job)
+    while time.time() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except (ProcessLookupError, PermissionError):
+            break
+        time.sleep(0.05)
+    assert json.loads((job_dir / "status.json").read_text())["state"] == "running"
+    out = subprocess.run([sys.executable, script, "settle", str(job_dir)], env=env, capture_output=True,
+                         timeout=30, check=True)
+    return json.loads(out.stdout), json.loads((job_dir / "exit.json").read_text())
+
+
+def test_job_that_outlives_its_agent_settles(tmp_path):
+    shell = "touch ready; sleep 1; echo done > out/result.txt"
+    status, _ = _outlive_agent(tmp_path, shell, tmp_path / "ready", signal.SIGKILL)
+    assert (status["state"], status["exit_code"]) == ("succeeded", 0)
+    assert (tmp_path / "out" / "result.txt").read_text().strip() == "done"
+
+
+def test_job_stopped_by_a_shutdown_is_not_settled(tmp_path):
+    # A shutdown SIGTERMs every process. A job that catches it and exits 0
+    # didn't finish, so its run stays open for the dispatcher to run again.
+    shell = "trap 'exit 0' TERM; touch ready; sleep 5 & wait"
+    status, ended = _outlive_agent(tmp_path, shell, tmp_path / "ready", signal.SIGTERM, signal.SIGTERM)
+    assert (ended["exit_code"], ended["signal"]) == (0, signal.SIGTERM)
+    assert status["state"] == "running"
+
+
 def test_running_marker_roundtrip(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
     proc = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)

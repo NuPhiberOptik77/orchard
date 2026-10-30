@@ -171,6 +171,33 @@ def test_remote_job_alive_tells_gone_from_unknown(monkeypatch):
     assert engine.remote_job_running(worker, "j1") is False
 
 
+def test_remote_settle(monkeypatch):
+    class Proc:
+        def __init__(self, out, code=0, err=b""):
+            self.stdout, self.returncode, self.stderr = out, code, err
+
+    def timeout(*a, **k):
+        raise subprocess.TimeoutExpired("ssh", 30)
+
+    worker = Worker(name="pro", host="10.0.0.9")
+    sent = []
+    settled = Proc(b'{"state": "succeeded"}\n')
+    monkeypatch.setattr(engine.transport, "run", lambda w, cmd, **k: sent.append(cmd) or settled)
+    assert engine.remote_settle(worker, "/Users/x/.orchard/jobs/j1") == {"state": "succeeded"}
+    assert '"/Users/x/.orchard/bin/orchard-agent.py" settle "/Users/x/.orchard/jobs/j1"' in sent[0]
+    # An agent with no `settle` says so: the plain status has to decide.
+    old = Proc(b"", 2, b"unknown command: settle\n")
+    monkeypatch.setattr(engine.transport, "run", lambda *a, **k: old)
+    assert engine.remote_settle(worker, "/Users/x/.orchard/jobs/j1") is False
+    # ssh failing, no status, or anything unreadable is no answer at all.
+    for proc in (Proc(b"", 255, b"Connection refused\n"), Proc(b"", 1, b"no status.json\n"), Proc(b"[1]\n"),
+                 Proc(b"Traceback\n", 1)):
+        monkeypatch.setattr(engine.transport, "run", lambda *a, p=proc, **k: p)
+        assert engine.remote_settle(worker, "/Users/x/.orchard/jobs/j1") is None
+    monkeypatch.setattr(engine.transport, "run", timeout)
+    assert engine.remote_settle(worker, "/Users/x/.orchard/jobs/j1") is None
+
+
 def test_remote_status_missing(monkeypatch):
     class Proc:
         def __init__(self, code, out):

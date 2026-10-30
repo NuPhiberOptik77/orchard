@@ -363,6 +363,26 @@ def _remote_dir_bytes(worker: Worker, rpath: str) -> int:
         return 0
 
 
+def remote_settle(worker: Worker, rjob: str) -> dict | bool | None:
+    """The job's status after the worker's agent settles it from its exit record.
+
+    False when the worker's agent is too old to have a `settle` command, and
+    None when there's no clear answer (a timeout, ssh failing, no status).
+    """
+    rroot = rjob.rsplit("/jobs/", 1)[0]
+    try:
+        proc = transport.run(worker, f'/usr/bin/python3 "{rroot}/bin/orchard-agent.py" settle "{rjob}"', timeout=30)
+    except subprocess.TimeoutExpired:
+        return None
+    if proc.returncode == 2 and b"unknown command" in (proc.stderr or b""):
+        return False
+    try:
+        status = json.loads(proc.stdout.decode("utf-8", "replace"))
+    except json.JSONDecodeError:
+        return None
+    return status if isinstance(status, dict) else None
+
+
 def collect_remote(
     worker: Worker, job_id: str, rjob: str, sdir: Path, cwd: Path, artifacts: Path | None = None
 ) -> dict:

@@ -699,8 +699,16 @@ def _lost_run(entry: dict, status: dict, worker: Worker, rjob: str, cfg: dict) -
         # Alive, or no clear answer: ask again after another quiet spell.
         entry["stalled_polls"] = 0
         return None
-    # It may have finished between the two reads.
-    status = engine.remote_status(worker, rjob)
+    # It may have finished between the two reads, or run on to the end after
+    # its agent died: then the job's own exit record settles its status, and
+    # the next poll collects it instead of running it twice. For an agent too
+    # old to settle, the plain status decides.
+    settled = engine.remote_settle(worker, rjob)
+    if settled is None:
+        # No clear answer, and requeueing would wipe an out/ it may still hold.
+        entry["stalled_polls"] = 0
+        return None
+    status = settled if isinstance(settled, dict) else engine.remote_status(worker, rjob)
     if status is None or status.get("state") not in ("running", "paused"):
         return None
     entry.update(
