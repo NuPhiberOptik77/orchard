@@ -114,6 +114,7 @@ def test_orphan_cancelled_when_worker_reachable(tmp_path, monkeypatch):
     monkeypatch.setattr(dispatcher, "QUEUE_DIR", tmp_path / "queue")
     monkeypatch.setattr(dispatcher.engine, "remote_status", lambda worker, rdir: None)
     monkeypatch.setattr(dispatcher.engine, "remote_settle", lambda worker, rjob: False)
+    monkeypatch.setattr(dispatcher.engine, "remote_status_missing", lambda worker, rjob: True)
     monkeypatch.setattr(dispatcher.engine, "remote_caps", lambda worker: {"machine": "x86_64"})
     monkeypatch.setattr(dispatcher, "_local_fallback", lambda job: (True, ""))
     monkeypatch.setattr(dispatcher.engine, "launch_local", lambda *a, **k: (None, None))
@@ -262,6 +263,8 @@ def test_orphan_that_ran_on_after_its_agent_died_is_adopted(tmp_path, monkeypatc
     assert kills == [] and collected == [(sdir, None)]
     entry = dispatcher.load_entries()[0]
     assert (entry["state"], entry["worker"], entry["orphan"]) == ("done", "pro", None)
+    # The copy collected still says running; the settled status replaces it.
+    assert json.loads((sdir / "status.json").read_text()) == done
 
 
 def test_orphan_left_for_next_pass_when_settle_gives_no_answer(tmp_path, monkeypatch):
@@ -270,7 +273,48 @@ def test_orphan_left_for_next_pass_when_settle_gives_no_answer(tmp_path, monkeyp
     lines = dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
     assert any("no clear answer about the orphan" in line for line in lines)
     assert (kills, collected) == ([], [])
+    assert dispatcher.load_entries()[0]["orphan"] == {**ORPHAN, "asks": 1}
+
+
+def test_orphan_asked_about_a_bounded_number_of_times(tmp_path, monkeypatch):
+    # settle keeps giving no answer, from a new agent (None), or the agent is
+    # too old to settle (False) and the status can't be read. After
+    # ORPHAN_ASKS passes the plain status decides: a readable one that still
+    # says running is cancelled (the agent's fences still apply), and with
+    # none the orphan is let go rather than killed past those fences.
+    monkeypatch.setattr(dispatcher, "ORPHAN_ASKS", 2)
+    running = {"state": "running", "attempt": 1}
+    for i, (settled, remote, want) in enumerate(((None, running, "cancelled orphaned remote job"),
+                                                 (None, None, "left it alone"),
+                                                 (False, None, "left it alone"))):
+        (tmp_path / str(i)).mkdir()
+        _sdir, _cwd, kills, collected = _orphaned(tmp_path / str(i), monkeypatch, remote, "done", settled=settled)
+        monkeypatch.setattr(dispatcher.engine, "remote_status_missing", lambda worker, rjob: False)
+        first = dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
+        assert any("asking again" in line for line in first)
+        assert kills == [] and dispatcher.load_entries()[0]["orphan"]["asks"] == 1
+        second = dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
+        assert any(want in line for line in second), second
+        assert kills == ([ORPHAN["rjob"]] if remote else []) and collected == []
+        assert dispatcher.load_entries()[0]["orphan"] is None
+    outcomes = [r["outcome"] for r in events.load() if r["event"] == "orphan"]
+    assert outcomes[-2:] == ["dropped", "dropped"]
+
+
+def test_orphan_kept_when_its_worker_cant_be_reached_to_cancel_it(tmp_path, monkeypatch):
+    running = {"state": "running", "attempt": 1}
+    _sdir, _cwd, kills, _collected = _orphaned(tmp_path, monkeypatch, running, "done")
+    monkeypatch.setattr(dispatcher.engine, "kill_remote", lambda w, rjob: kills.append(rjob) or None)
+    lines = dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
+    assert any("could not reach pro to cancel the orphan" in line for line in lines)
     assert dispatcher.load_entries()[0]["orphan"] == ORPHAN
+    # An agent that answers the job isn't running clears it.
+    monkeypatch.setattr(dispatcher.engine, "kill_remote", lambda w, rjob: kills.append(rjob) or False)
+    lines = dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
+    assert any("cancelled orphaned remote job" in line for line in lines), lines
+    entry = dispatcher.load_entries()[0]
+    assert entry["orphan"] is None and "orphan cancelled (no-op)" in entry["note"]
+    assert kills == [ORPHAN["rjob"]] * 2
 
 
 def test_orphan_without_status_cancelled_even_without_settle_answer(tmp_path, monkeypatch):
@@ -440,6 +484,15 @@ def test_proc_command_reads_the_real_command_line():
         proc.wait()
 
 
+def test_is_dispatcher_matches_whole_words(monkeypatch):
+    for cmd, want in (("/Users/x/orchard/.venv/bin/python -m orchard dispatch --watch", True),
+                      ("/Users/x/My Project/orchard/bin/orchard dispatch", True),
+                      ("vim /Users/x/orchard/src/orchard/dispatcher.py", False),
+                      ("python -m orchard status", False)):
+        monkeypatch.setattr(dispatcher, "_proc_command", lambda pid, c=cmd: c)
+        assert dispatcher._is_dispatcher(os.getpid()) is want, cmd
+
+
 def test_running_pid_trusts_liveness_when_ps_fails(tmp_path, monkeypatch):
     monkeypatch.setattr(dispatcher, "DISPATCH_PID", tmp_path / "dispatch.pid")
     monkeypatch.setattr(dispatcher, "_proc_command", lambda pid: None)
@@ -504,6 +557,22 @@ def test_idle_hold_reasons():
     assert dispatcher.idle_hold({"idle_seconds": 999, "power": "ac", "thermal_limit": 100}, cfg) is None
     assert "battery" in dispatcher.idle_hold({"idle_seconds": 999, "power": "battery", "thermal_limit": 100}, cfg)
     assert "thermal" in dispatcher.idle_hold({"idle_seconds": 999, "power": "ac", "thermal_limit": 30}, cfg)
+
+
+def test_idle_hold_mirrors_the_agents_pause_thresholds():
+    # A job started here would only be paused at once by the agent.
+    cfg = dispatcher.DISPATCH_DEFAULTS
+    ok = {"idle_seconds": 999, "power": "ac", "thermal_limit": 100}
+    low = {"pause_on_low_battery_pct": 20}
+    assert dispatcher.idle_hold({**ok, **low, "battery_pct": 15}, cfg) == "worker battery low (15%)"
+    assert dispatcher.idle_hold({**ok, **low, "battery_pct": 20}, cfg) == "worker battery low (20%)"
+    assert dispatcher.idle_hold({**ok, **low, "battery_pct": 80}, cfg) is None
+    busy = {"max_other_cpu_pct": 50}
+    assert "CPU 72.5% > 50%" in dispatcher.idle_hold({**ok, **busy, "other_cpu_pct": 72.5}, cfg)
+    assert dispatcher.idle_hold({**ok, **busy, "other_cpu_pct": 50.0}, cfg) is None
+    # Unknown readings, or an agent too old to report them, hold nothing.
+    assert dispatcher.idle_hold({**ok, **low, **busy, "battery_pct": None, "other_cpu_pct": None}, cfg) is None
+    assert dispatcher.idle_hold({**ok, "battery_pct": 5, "other_cpu_pct": 99.0}, cfg) is None
 
 
 def test_idle_hold_host_status_fails_closed():
@@ -772,6 +841,16 @@ def test_stalled_run_kept_when_settle_gives_no_answer(tmp_path, monkeypatch):
     assert not any(e["event"] == "requeued" for e in events.load())
 
 
+def test_stalled_run_kept_when_an_old_agents_status_cant_be_read(tmp_path, monkeypatch):
+    # An agent too old to settle, and the plain status read times out: no
+    # answer, so the job stays running instead of being run a second time.
+    running = {"state": "running", "attempt": 1, "elapsed_s": 40}
+    entry, asked = _stalled(tmp_path, monkeypatch, alive=False, statuses=[running] * 5 + [None], settled=False)
+    _poll(entry, 5)
+    assert asked == ["demo-s"] and entry["state"] == "running"
+    assert not any(e["event"] == "requeued" for e in events.load())
+
+
 def test_changing_status_never_asks_the_agent(tmp_path, monkeypatch):
     ticking = [{"state": "running", "attempt": 1, "elapsed_s": 5 * i} for i in range(10)]
     entry, asked = _stalled(tmp_path, monkeypatch, alive=False, statuses=ticking)
@@ -799,9 +878,15 @@ def test_stalled_run_that_ran_on_after_its_agent_died_is_collected(tmp_path, mon
     done = {"state": "succeeded", "exit_code": 0, "attempt": 1}
     entry, asked = _stalled(tmp_path, monkeypatch, alive=False, settled=done)
     collected = []
-    monkeypatch.setattr(dispatcher.engine, "collect_remote", lambda *a, **k: collected.append(a[1]))
+
+    def collect(worker, job_id, rjob, into, cwd):
+        collected.append(job_id)
+        (into / "status.json").write_text(json.dumps({"state": "running", "attempt": 1, "elapsed_s": 40}))
+
+    monkeypatch.setattr(dispatcher.engine, "collect_remote", collect)
     out = _poll(entry, 5)
     assert asked == ["demo-s"] and collected == ["demo-s"]
+    assert json.loads((tmp_path / "state" / "status.json").read_text()) == done
     assert (entry["state"], entry["stalled_polls"]) == ("done", 0)
     assert out[-1] == ["demo-s: succeeded on pro"]
     assert any(e["event"] == "finished" for e in events.load())

@@ -208,6 +208,30 @@ def test_remote_status_missing(monkeypatch):
         monkeypatch.setattr(engine.transport, "run", lambda *a, c=code, o=out, **k: Proc(c, o))
         assert engine.remote_status_missing(worker, "/Users/x/.orchard/jobs/j1") is want
 
+    def timeout(*a, **k):
+        raise subprocess.TimeoutExpired("ssh", 20)
+
+    monkeypatch.setattr(engine.transport, "run", timeout)
+    assert engine.remote_status_missing(worker, "/Users/x/.orchard/jobs/j1") is False
+
+
+def test_kill_remote_tells_a_failed_ssh_from_a_no(monkeypatch):
+    class Proc:
+        def __init__(self, code):
+            self.returncode, self.stdout, self.stderr = code, b"", b""
+
+    def timeout(*a, **k):
+        raise subprocess.TimeoutExpired("ssh", 30)
+
+    worker = Worker(name="pro", host="10.0.0.9")
+    sent = []
+    for code, want in ((0, True), (1, False), (255, None)):
+        monkeypatch.setattr(engine.transport, "run", lambda w, cmd, c=code, **k: sent.append(cmd) or Proc(c))
+        assert engine.kill_remote(worker, "/Users/x/.orchard/jobs/j1") is want
+    assert sent[0] == '/usr/bin/python3 "/Users/x/.orchard/bin/orchard-agent.py" kill "/Users/x/.orchard/jobs/j1"'
+    monkeypatch.setattr(engine.transport, "run", timeout)
+    assert engine.kill_remote(worker, "/Users/x/.orchard/jobs/j1") is None
+
 
 def test_remote_job_dir():
     assert engine.remote_job_dir("/Users/x", "abc-1") == "/Users/x/.orchard/jobs/abc-1"

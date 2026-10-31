@@ -78,8 +78,8 @@ Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
 # the startup task, which starts WSL first below.
 Write-Host 'Restarting WSL, so the startup task starts it. Open distro windows close,'
 Write-Host 'and running jobs stop until the dispatcher runs them again.'
-Write-Host 'Close other WSL clients first: VS Code Remote-WSL, Docker Desktop, and'
-Write-Host 'Explorer windows on \\wsl.localhost. One could start WSL before the startup task.'
+Write-Host 'Note: WSL clients still open now, such as VS Code Remote-WSL, Docker Desktop'
+Write-Host 'or Explorer windows on \\wsl.localhost, will need a restart.'
 $restart = $false
 # A wsl.exe in a signed-in session may be one of those, and could hand the VM
 # to that session. Only a Windows restart is sure to give it to the task then.

@@ -93,7 +93,9 @@ def _is_dispatcher(pid: int) -> bool:
     cmd = _proc_command(pid)
     if cmd is None:
         return True
-    return "orchard" in cmd and "dispatch" in cmd
+    # Whole words, so an editor open on orchard/dispatcher.py doesn't count.
+    words = cmd.split()
+    return "dispatch" in words and any(w == "orchard" or w.endswith("/orchard") for w in words)
 
 
 def heartbeat() -> None:
@@ -397,9 +399,17 @@ def idle_hold(caps: dict, cfg: dict) -> str | None:
         return f"worker in use (idle {idle:.0f}s < {threshold}s)"
     if cfg.get("hold_on_battery", True) and caps.get("power") == "battery":
         return "worker on battery"
+    # The agent's own pause rules, which an older agent doesn't report: a job
+    # started past them would pause at its first check.
+    low, pct = caps.get("pause_on_low_battery_pct"), caps.get("battery_pct")
+    if low is not None and pct is not None and pct <= low:
+        return f"worker battery low ({pct:.0f}%)"
     thermal = caps.get("thermal_limit")
     if thermal is not None and thermal < engine.THERMAL_PAUSE_BELOW:
         return f"worker thermal throttle (limit {thermal})"
+    max_other, other = caps.get("max_other_cpu_pct"), caps.get("other_cpu_pct")
+    if max_other is not None and other is not None and other > max_other:
+        return f"worker busy with other work (CPU {other:.1f}% > {max_other}%)"
     return None
 
 
@@ -781,6 +791,7 @@ def finish(entry: dict, status: dict, worker_map: dict[str, Worker]) -> list[str
                 Path(entry["sdir"]),
                 Path(entry["cwd"]),
             )
+            _keep_final_status(Path(entry["sdir"]), status)
     entry.update(
         state="done" if state == "succeeded" else "failed",
         note=f"{state} (exit {status.get('exit_code')})",
@@ -799,6 +810,21 @@ def finish(entry: dict, status: dict, worker_map: dict[str, Worker]) -> list[str
     return [f"{job_id}: {state} on {worker_name}"]
 
 
+def _keep_final_status(into: Path, status: dict) -> None:
+    """Write the status a job was finished from over the copy collect_remote pulled.
+
+    The worker's status.json still says running when its agent died and
+    `settle` couldn't rewrite it, and `orchard jobs` reads the copy.
+    """
+    try:
+        (into / "status.json").write_text(json.dumps(status, indent=2) + "\n")
+    except OSError:
+        pass
+
+
+ORPHAN_ASKS = 20  # passes (5 min at the default poll) an orphan with no clear status is asked about
+
+
 def settle_orphan(entry: dict, worker: Worker) -> list[str]:
     """Resolve the remote job a lost-contact fallback left behind, once its worker answers.
 
@@ -813,27 +839,39 @@ def settle_orphan(entry: dict, worker: Worker) -> list[str]:
     job_id = entry["id"]
     orphan = entry["orphan"]
     rjob = orphan["rjob"]
+    expected = orphan.get("attempt")
+    note = entry.get("note") or ""
     # A run that went on to the end after its agent died still reads "running";
     # its own exit record settles it, so it is adopted instead of cancelled and
     # run twice. An agent too old to settle answers False and the plain status
-    # decides. No clear answer leaves the orphan for the next pass, unless the
-    # job has no status at all, which no later pass will change.
+    # decides. No clear answer (a timeout, a status.json that won't parse) is
+    # asked about again for ORPHAN_ASKS passes, unless the job has no status at
+    # all, which no later pass will change. The last pass reads the plain status.
     settled = engine.remote_settle(worker, rjob)
-    if settled is None and not engine.remote_status_missing(worker, rjob):
-        return [f"{job_id}: no clear answer about the orphan on {worker.name}; asking again"]
-    if isinstance(settled, dict):
-        status = settled
-    elif settled is False:
-        status = engine.remote_status(worker, rjob) or {}
-    else:
+    asks = orphan.get("asks", 0) + 1
+    status = settled if isinstance(settled, dict) else None
+    if settled is False or (settled is None and asks >= ORPHAN_ASKS):
+        status = engine.remote_status(worker, rjob)
+    if status is None:
+        if not engine.remote_status_missing(worker, rjob):
+            if asks < ORPHAN_ASKS:
+                orphan["asks"] = asks
+                save_entry(entry)
+                return [f"{job_id}: no clear answer about the orphan on {worker.name}; asking again"]
+            # The agent's `kill` skips its boot and pid fences when it can't
+            # read the status, so an orphan nothing vouches for is let go.
+            entry.update(orphan=None, note=f"{note}; orphan left alone (no readable status on {worker.name})")
+            save_entry(entry)
+            events.append("orphan", job=job_id, worker=worker.name, outcome="dropped", attempt=expected)
+            return [f"{job_id}: no readable status for the orphan on {worker.name}; left it alone"]
         status = {}
     state = status.get("state")
-    expected = orphan.get("attempt")
     attempt = status.get("attempt", expected)
-    note = entry.get("note") or ""
 
     if state not in agent.TERMINAL_STATES:
         ok = engine.kill_remote(worker, rjob)
+        if ok is None:
+            return [f"{job_id}: could not reach {worker.name} to cancel the orphan; trying again"]
         entry.update(orphan=None, note=f"{note}; orphan cancelled ({'ok' if ok else 'no-op'})")
         save_entry(entry)
         events.append("orphan", job=job_id, worker=worker.name, outcome="cancelled", attempt=expected)
@@ -858,7 +896,8 @@ def settle_orphan(entry: dict, worker: Worker) -> list[str]:
         if rerun == "running":
             _stop_local_rerun(entry, sdir)
         engine.collect_remote(worker, job_id, rjob, sdir, cwd)
-        stopped = "local rerun stopped" if rerun == "running" else "local rerun not started"
+        _keep_final_status(sdir, status)
+        stopped ="local rerun stopped" if rerun == "running" else "local rerun not started"
         entry.update(
             state="done",
             worker=worker.name,
@@ -893,6 +932,7 @@ def settle_orphan(entry: dict, worker: Worker) -> list[str]:
     side = sdir / "orphan"
     side.mkdir(parents=True, exist_ok=True)
     engine.collect_remote(worker, job_id, rjob, side, cwd, artifacts=cwd / ".orchard-out" / job_id / "orphan")
+    _keep_final_status(side, status)
     entry.update(orphan=None, note=f"{note}; orphan {state} on {worker.name} while out of contact (kept in {side})")
     save_entry(entry)
     events.append(

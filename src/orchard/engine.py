@@ -438,14 +438,18 @@ def collect_remote(
     return status or {}
 
 
-def kill_remote(worker: Worker, rjob: str) -> bool:
+def kill_remote(worker: Worker, rjob: str) -> bool | None:
+    """True once the agent has signalled the job, False when it answers that the
+    job isn't running, and None when ssh itself fails (a timeout, exit 255)."""
     rroot = rjob.rsplit("/jobs/", 1)[0]
     try:
         proc = transport.run(
             worker, f'/usr/bin/python3 "{rroot}/bin/orchard-agent.py" kill "{rjob}"', timeout=30
         )
     except subprocess.TimeoutExpired:
-        return False
+        return None
+    if proc.returncode == 255:
+        return None
     return proc.returncode == 0
 
 

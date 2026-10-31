@@ -132,16 +132,23 @@ def test_exec_survives_eperm_on_pause(tmp_path, monkeypatch):
 def _preempted(tmp_path, monkeypatch, shell, actions, killpg_errors):
     """Run shell as a preemptible job in-process.
 
-    `actions` answers each preemption decision in turn (the last one repeats).
+    `actions` answers each preemption decision in turn (the last one repeats),
+    or is a function of whether the job is paused that answers it.
     `killpg_errors` maps a signal to how many killpg calls with it raise EPERM.
     Returns cmd_exec's code, the final status and the signals killpg was sent.
     """
     monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(agent, "POLL_S", 0.2)
     monkeypatch.setattr(agent, "load_policy", lambda: dict(agent.DEFAULT_POLICY))
     monkeypatch.setattr(agent, "sample_preemption_state", lambda policy, pgid: {})
-    answers = list(actions)
-    monkeypatch.setattr(agent, "decide_preemption",
-                        lambda sample, policy, paused: answers.pop(0) if len(answers) > 1 else answers[0])
+    answers = list(actions) if not callable(actions) else None
+
+    def decide(sample, policy, paused):
+        if answers is None:
+            return actions(paused)
+        return answers.pop(0) if len(answers) > 1 else answers[0]
+
+    monkeypatch.setattr(agent, "decide_preemption", decide)
     real_killpg = os.killpg
     sent = []
 
@@ -168,30 +175,115 @@ def test_exec_survives_eperm_on_resume(tmp_path, monkeypatch):
     assert sent.count(signal.SIGCONT) >= 2
 
 
+def _wait_for_state(job_dir, state, limit=10):
+    deadline = time.time() + limit
+    while time.time() < deadline:
+        try:
+            if json.loads((job_dir / "status.json").read_text()).get("state") == state:
+                return True
+        except (OSError, ValueError):
+            pass
+        time.sleep(0.05)
+    return False
+
+
+def _wait_for_text(path, limit=10):
+    deadline = time.time() + limit
+    while time.time() < deadline:
+        try:
+            text = path.read_text().strip()
+            if text:
+                return text
+        except OSError:
+            pass
+        time.sleep(0.05)
+    raise AssertionError("%s never written" % path)
+
+
+def _ended(pid):
+    """True once pid is gone or a zombie (a container's init may never reap it)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    try:
+        return Path("/proc/%d/stat" % pid).read_text().rsplit(")", 1)[1].split()[0] == "Z"
+    except OSError:
+        return False
+
+
+def _command_line(pid):
+    if sys.platform.startswith("linux"):
+        return Path("/proc/%d/cmdline" % pid).read_bytes().replace(b"\0", b" ").decode()
+    return subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True).stdout
+
+
 def test_job_killed_while_paused_ends_at_once(tmp_path, monkeypatch):
-    # The pause leaves `wrap` running, so a command SIGKILLed while paused is
-    # recorded at once instead of reading as paused until the job resumes.
-    # Then the agent continues what is left of the group, which may answer EPERM.
-    pid_file = tmp_path / "cmd.pid"
+    # Once the command runs, the pause leaves `wrap` running, so a command
+    # SIGKILLed while paused is recorded at once instead of reading as paused
+    # until the job resumes.
+    job_dir = tmp_path / "job"
 
     def kill_command():
-        deadline = time.time() + 10
-        while not pid_file.exists() and time.time() < deadline:
-            time.sleep(0.05)
-        time.sleep(0.3)
-        os.kill(int(pid_file.read_text()), signal.SIGKILL)
+        _wait_for_state(job_dir, "paused")
+        os.kill(int(_wait_for_text(job_dir / "command.pid")), signal.SIGKILL)
+
+    def decide(paused):
+        started = (job_dir / "command.pid").exists()
+        return ("pause", "test") if started and not paused else (None, None)
 
     killer = threading.Thread(target=kill_command, daemon=True)
     killer.start()
     started = time.time()
-    rc, status, sent = _preempted(tmp_path, monkeypatch, "echo $$ > cmd.pid; exec sleep 30",
-                                  [("pause", "test")], {signal.SIGCONT: 1})
+    rc, status, sent = _preempted(tmp_path, monkeypatch, "exec sleep 30", decide, {})
     killer.join()
     assert time.time() - started < 5
     assert (rc, status["state"], status["exit_code"]) == (1, "failed", -signal.SIGKILL)
-    assert sent == [signal.SIGSTOP, signal.SIGCONT]
+    # One stop, then the agent's check that nothing of the group is left.
+    assert sent == [signal.SIGSTOP, 0]
     ended = json.loads((tmp_path / "job" / "exit.json").read_text())
     assert ended["exit_code"] == -signal.SIGKILL
+
+
+def test_pause_before_the_command_starts_holds(tmp_path, monkeypatch):
+    # The first check comes right after the agent starts `wrap`, which may not
+    # have started the command yet. wrap then stays stopped with the rest of
+    # the group: let go, it would start the command unpaused.
+    lines = tmp_path / "lines"
+    action = [("pause", "test")]
+    seen = {}
+
+    def count():
+        try:
+            return len(lines.read_text().splitlines())
+        except OSError:
+            return 0
+
+    def drive():
+        try:
+            _wait_for_state(tmp_path / "job", "paused")
+            before = count()
+            time.sleep(2)
+            seen["paused"] = (before, count())
+            action[0] = ("resume", "test")
+            deadline = time.time() + 10
+            while count() < before + 3 and time.time() < deadline:
+                time.sleep(0.1)
+            seen["resumed"] = count()
+        finally:
+            action[0] = ("resume", "test")
+            (tmp_path / "stop").write_text("")
+
+    driver = threading.Thread(target=drive, daemon=True)
+    driver.start()
+    rc, status, sent = _preempted(tmp_path, monkeypatch, "while [ ! -f stop ]; do echo x >> lines; sleep 0.2; done",
+                                  lambda paused: action[0], {})
+    driver.join()
+    assert sent[0] == signal.SIGSTOP
+    before, after = seen["paused"]
+    assert after == before
+    assert seen["resumed"] >= before + 3
+    assert (rc, status["state"]) == (0, "succeeded")
 
 
 def test_exec_survives_a_failed_status_write(tmp_path, monkeypatch):
@@ -221,15 +313,173 @@ def test_exec_survives_a_failed_status_write(tmp_path, monkeypatch):
 
 def test_call_command_passes_on_an_early_signal(tmp_path):
     # A signal that reached `wrap` before the command started is sent on to
-    # it, so a stop request between the two is not lost.
-    started = time.time()
-    assert agent._call_command(["sleep", "30"], [signal.SIGTERM]) == -signal.SIGTERM
+    # its process group once the command has, so a stop request between the
+    # two is not lost. It runs in a session of its own, since the group gets it.
     script = tmp_path / "run-me"
     script.write_text("exec sleep 30\n")
     script.chmod(0o755)
-    assert agent._call_command([str(script)], [signal.SIGTERM]) == -signal.SIGTERM
-    assert time.time() - started < 10
+    code = (
+        "import signal, sys, time\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "import agent\n"
+        "signal.signal(signal.SIGTERM, lambda signum, frame: None)\n"
+        "started = time.time()\n"
+        "print(agent._call_command(['sleep', '30'], [signal.SIGTERM]),\n"
+        "      agent._call_command([sys.argv[2]], [signal.SIGTERM]), time.time() - started < 10)\n"
+    )
+    out = subprocess.run([sys.executable, "-I", "-c", code, os.path.dirname(agent.__file__), str(script)],
+                         capture_output=True, text=True, timeout=30, start_new_session=True)
+    assert out.stdout.split() == [str(-signal.SIGTERM)] * 2 + ["True"], out.stderr
     assert agent._call_command(["sh", "-c", "exit 3"], []) == 3
+
+
+def test_wrap_passes_on_a_signal_that_came_before_the_command(tmp_path):
+    # SIGTERM reaching wrap before the command starts is sent on once it has,
+    # and wrap then records it and ends the way the command did.
+    code = (
+        "import os, signal, subprocess, sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "import agent\n"
+        "real = subprocess.Popen\n"
+        "def popen(*args, **kwargs):\n"
+        "    os.kill(os.getpid(), signal.SIGTERM)\n"
+        "    return real(*args, **kwargs)\n"
+        "subprocess.Popen = popen\n"
+        "sys.exit(agent.cmd_wrap([sys.argv[2], '1', '--', 'sleep', '30']))\n"
+    )
+    exit_path = tmp_path / "exit.json"
+    started = time.time()
+    proc = subprocess.run([sys.executable, "-I", "-c", code, os.path.dirname(agent.__file__), str(exit_path)],
+                          timeout=10, start_new_session=True)
+    assert time.time() - started < 10
+    assert proc.returncode == -signal.SIGTERM
+    ended = json.loads(exit_path.read_text())
+    assert (ended["exit_code"], ended["signal"]) == (-signal.SIGTERM, signal.SIGTERM)
+
+
+def test_kill_ends_a_real_job_through_its_fences(tmp_path, monkeypatch):
+    # The pid file names `wrap`, which leads the job's group, and the status
+    # holds its start time, so `kill` gets past its fences and ends the job.
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    job = {"id": "j1", "cmd": ["sh", "-c", "exec sleep 30"], "venv": None, "workdir": str(tmp_path),
+           "job_dir": str(job_dir), "timeout_s": None, "preempt": False, "env": {}, "attempt": 1}
+    (job_dir / "job.json").write_text(json.dumps(job))
+    proc = subprocess.Popen([sys.executable, str(Path(agent.__file__)), "exec", str(job_dir / "job.json")],
+                            env={**os.environ, "HOME": str(tmp_path)},
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    pid = None
+    try:
+        _wait_for_text(job_dir / "command.pid")
+        deadline = time.time() + 10
+        while not json.loads((job_dir / "status.json").read_text()).get("pgid") and time.time() < deadline:
+            time.sleep(0.05)
+        pid = int((job_dir / "pid").read_text())
+        status = json.loads((job_dir / "status.json").read_text())
+        assert status["pid_start"] == agent.process_start(pid)
+        if sys.platform.startswith("linux"):
+            assert status["pid_start"] is not None
+        assert os.getpgid(pid) == pid == status["pgid"]
+        assert " wrap " in _command_line(pid)
+        monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / ".orchard"))
+        assert agent.cmd_signal([str(job_dir)], signal.SIGTERM, "kill", cont_first=True) == 0
+        assert proc.wait(timeout=15) == 1
+        assert json.loads((job_dir / "status.json").read_text())["exit_code"] == -signal.SIGTERM
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        if pid:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def test_kill_ends_a_command_that_outlived_wrap(tmp_path, monkeypatch):
+    # SIGKILL can't be shrugged off, so wrap can die before its command. The
+    # command keeps wrap's group, which `kill` signals.
+    monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
+    job_dir = tmp_path / "home" / "jobs" / "job-s"
+    job_dir.mkdir(parents=True)
+    wrap = subprocess.Popen([sys.executable, "-I", str(Path(agent.__file__)), "wrap", str(job_dir / "exit.json"),
+                             "1", "--", "sleep", "30"], start_new_session=True)
+    try:
+        command = int(_wait_for_text(job_dir / "command.pid"))
+        (job_dir / "pid").write_text(str(wrap.pid))
+        (job_dir / "status.json").write_text(json.dumps({
+            "state": "running", "pgid": wrap.pid, "boot_id": agent.boot_id(),
+            "pid_start": agent.process_start(wrap.pid)}))
+        agent.write_running_marker("job-s", wrap.pid)
+        wrap.kill()
+        wrap.wait()
+        assert not _ended(command)
+        assert agent.cmd_signal([str(job_dir)], signal.SIGTERM, "kill", cont_first=True) == 0
+        deadline = time.time() + 5
+        while not _ended(command) and time.time() < deadline:
+            time.sleep(0.05)
+        assert _ended(command)
+    finally:
+        try:
+            os.killpg(wrap.pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def test_agent_ends_a_command_that_outlived_wrap(tmp_path):
+    # wrap SIGKILLed mid-job: the agent records the job and ends what is left
+    # of its group instead of leaving the command running unwatched.
+    started = time.time()
+    status = _exec(tmp_path, ["sh", "-c", 'echo $$ > cmd.pid; kill -KILL "$PPID"; exec sleep 30'])
+    assert time.time() - started < 30
+    assert (status["state"], status["exit_code"]) == ("failed", -signal.SIGKILL)
+    assert _ended(int((tmp_path / "cmd.pid").read_text()))
+
+
+def test_pause_lets_wrap_run_only_once_the_command_started(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
+    job_dir = tmp_path / "home" / "jobs" / "job-p"
+    job_dir.mkdir(parents=True)
+    (job_dir / "pid").write_text("4242")
+    (job_dir / "status.json").write_text(json.dumps({"state": "running", "pgid": 4242}))
+    calls = []
+    monkeypatch.setattr(agent.os, "killpg", lambda pgid, sig: calls.append(("group", pgid, sig)))
+    monkeypatch.setattr(agent.os, "kill", lambda pid, sig: calls.append(("leader", pid, sig)))
+    assert agent.cmd_signal([str(job_dir)], signal.SIGSTOP, "pause") == 0
+    assert calls == [("group", 4242, signal.SIGSTOP)]
+    calls.clear()
+    (job_dir / "command.pid").write_text("4243")
+    assert agent.cmd_signal([str(job_dir)], signal.SIGSTOP, "pause") == 0
+    assert calls == [("group", 4242, signal.SIGSTOP), ("leader", 4242, signal.SIGCONT)]
+
+
+def test_keep_awake_watches_wrap(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent.shutil, "which", lambda name: "/usr/bin/caffeinate" if name == "caffeinate" else None)
+    seen = {}
+
+    def popen(argv, **kwargs):
+        seen.update(kwargs, argv=argv)
+        return "proc"
+
+    monkeypatch.setattr(agent.subprocess, "Popen", popen)
+    assert agent._keep_awake(4242) == "proc"
+    assert seen["argv"] == ["/usr/bin/caffeinate", "-is", "-w", "4242"]
+    assert seen["start_new_session"] is True
+    monkeypatch.setattr(agent.shutil, "which", lambda name: None)
+    assert agent._keep_awake(4242) is None
+
+
+def test_exec_keeps_awake_for_wrap(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
+    watched = []
+    monkeypatch.setattr(agent, "_keep_awake", watched.append)
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    job = {"id": "j1", "cmd": ["sh", "-c", "exit 0"], "venv": None, "workdir": str(tmp_path),
+           "job_dir": str(job_dir), "timeout_s": None, "preempt": False, "env": {}, "attempt": 1}
+    (job_dir / "job.json").write_text(json.dumps(job))
+    assert agent.cmd_exec([str(job_dir / "job.json")]) == 0
+    assert watched == [int((job_dir / "pid").read_text())]
 
 
 def _settle_case(tmp_path, monkeypatch, status, ended):
@@ -446,9 +696,11 @@ def test_kill_skips_a_reused_pid(tmp_path, monkeypatch):
     try:
         (job_dir / "pid").write_text(str(proc.pid))
         (job_dir / "status.json").write_text(json.dumps({"state": "running", "pid_start": 111}))
+        agent.write_running_marker("job-r", proc.pid)
         monkeypatch.setattr(agent, "process_start", lambda pid: 222)
         assert agent.cmd_signal([str(job_dir)], signal.SIGTERM, "kill", cont_first=True) == 1
         assert proc.poll() is None
+        assert not os.path.exists(agent._marker_path("job-r"))
         # A start time it can't read (macOS) goes by the pid, as before.
         monkeypatch.setattr(agent, "process_start", lambda pid: None)
         assert agent.cmd_signal([str(job_dir)], signal.SIGTERM, "kill", cont_first=True) == 0
@@ -488,8 +740,16 @@ def test_process_start_unknown_off_linux(monkeypatch):
     assert agent.process_start(os.getpid()) is None
 
 
+def test_process_start_counts_fields_after_the_last_paren(monkeypatch):
+    # A command name may hold ")" and spaces; field n reads n here.
+    fields = " ".join(str(n) for n in range(3, 53))
+    monkeypatch.setattr(agent, "_read_text", lambda path: "42 (a) b) c) %s\n" % fields)
+    assert agent.process_start(42) == 22
+
+
 def test_signal_survives_eperm(tmp_path, monkeypatch):
     # macOS answers EPERM for a group of unreaped zombies: nothing to signal.
+    # Its agent reaps them and clears the marker.
     monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
     job_dir = tmp_path / "home" / "jobs" / "job-e"
     job_dir.mkdir(parents=True)
@@ -502,7 +762,7 @@ def test_signal_survives_eperm(tmp_path, monkeypatch):
 
     monkeypatch.setattr(agent.os, "killpg", killpg)
     assert agent.cmd_signal([str(job_dir)], signal.SIGSTOP, "pause") == 1
-    assert not os.path.exists(agent._marker_path("job-e"))
+    assert os.path.exists(agent._marker_path("job-e"))
 
 
 def test_cmd_running(capsys, tmp_path, monkeypatch):
@@ -736,12 +996,16 @@ def test_wrap_full_speed_by_default():
     joined = " ".join(wrapped)
     assert "nice" not in joined
     assert "taskpolicy" not in joined
+    assert agent._wrap(["x"], {}) == ["x"]
 
 
 def test_wrap_background_qos_opt_in():
     policy = {**agent.DEFAULT_POLICY, "background_qos": True}
     wrapped = agent._wrap(["echo", "hi"], policy=policy)
     assert any("nice" in part for part in wrapped)
+    # caffeinate runs beside the job now (see _keep_awake), never in front.
+    assert wrapped[-2:] == ["echo", "hi"]
+    assert not any("caffeinate" in part for part in wrapped)
 
 
 def sample(**over):

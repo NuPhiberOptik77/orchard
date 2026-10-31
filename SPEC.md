@@ -212,7 +212,13 @@ id and reuses its pids. A group whose leader has exited can't be dated, so it go
 by liveness alone.
 `orchard cancel <id|prefix>` stops a queued or running job: remote kills go through
 the agent (with orphan-retry if the worker is unreachable), local kills signal the
-job's process group. Only one dispatcher processes the queue at a time: `--watch`
+job's process group. The agent's `kill` checks the pid file against the job's boot
+id and start time, then signals the job's whole process group, so a command that
+outlived its `wrap` (SIGKILLed, say) ends too. The running marker stays until
+nothing of the group is left. A pause stops the group and lets `wrap` go on only
+once it has started the command (`command.pid` beside `exit.json`), so a pause
+that lands before that holds. When `wrap` ends with some of its group still alive,
+the agent ends the rest. Only one dispatcher processes the queue at a time: `--watch`
 holds a pidfile, and the one-shot form takes an O_EXCL tick lock, so a manual tick
 can't double-start jobs alongside the watcher. Fencing: before launching, the
 dispatcher asks the worker whether the job's process group is already alive (agent
@@ -235,7 +241,8 @@ worker answers but whose progress (`attempt`, `elapsed_s`) hasn't moved for
 none, as after the machine restarted under it, it is requeued on the same worker.
 Every job runs under the agent's `wrap`, which writes `exit.json` when the command
 ends, so a job that ran on to the end after its agent died is settled from that
-record and collected, not run again. A job stopped by a signal its `wrap` also got,
+record and collected, not run again; the settled status replaces the stale copy
+collected with it. A job stopped by a signal its `wrap` also got,
 as in a shutdown, is not settled and runs again. So is a job that signals its own
 group, such as a shell with `trap 'kill 0' EXIT`: `wrap` records that signal too,
 so if the agent also died the job runs again. A signal that reaches `wrap` before
@@ -260,6 +267,13 @@ again, the dispatcher reads the orphan's status before acting:
 - any other finish (a failure, or a success after the rerun already ended):
   collected beside the rerun into `<state dir>/orphan` and
   `.orchard-out/<id>/orphan`.
+
+When neither `settle` nor the plain status gives a clear answer, the orphan is
+asked about again on later passes, up to `ORPHAN_ASKS` (20, five minutes at the
+default poll). After that a readable status that still says running is killed,
+through the agent's fences, and an orphan with no readable status is let go. A
+kill that fails because ssh did (exit 255 or a timeout) keeps the orphan for the
+next pass.
 
 Each case logs an `orphan` event with the outcome and `duplicate: true` when the
 job was launched again after the orphan's attempt. Contact loss can't be told apart from a dead worker in time to avoid

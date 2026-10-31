@@ -36,6 +36,7 @@ ORCHARD_HOME = os.path.expanduser("~/.orchard")
 HOST_STATUS_PATH = os.path.join(ORCHARD_HOME, "host-status.json")
 HOST_STATUS_MAX_AGE_S = 60
 HOST_POWER_STATES = ("ac", "battery", "unknown")
+POLL_S = 5  # how often a running job checks for preemption and rewrites status.json
 
 
 def _running_dir():
@@ -405,12 +406,14 @@ def cached_bench(python_path, cache_dir=None, ttl=BENCH_TTL_S):
 def collect_caps(bench_python=None):
     family = os_family()
     home = os.path.expanduser("~")
+    policy = load_policy()
     if family == "macos":
         os_version = _run(["sw_vers", "-productVersion"]).strip()
         cores = int(_sysctl("hw.ncpu") or 0)
         ram_gb = round(int(_sysctl("hw.memsize") or 0) / 1e9, 2)
         disk = disk_free_gb(home)
         idle, power, thermal, host_status = hid_idle_seconds(), battery_state(), thermal_limit(), None
+        pct = battery_pct()
     else:
         host = read_host_status()
         os_version = parse_os_release(_read_text("/etc/os-release"))
@@ -418,6 +421,10 @@ def collect_caps(bench_python=None):
         ram_gb = parse_meminfo_total_gb(_read_text("/proc/meminfo"))
         disk = worker_disk_free_gb(home, host)
         idle, power, thermal, host_status = host["idle_seconds"], host["power"], None, host["host_status"]
+        pct = host["battery_pct"]
+    # The dispatcher holds a worker that a job would pause on at once, so it
+    # gets what decide_preemption reads too.
+    max_other = policy.get("max_other_cpu_pct")
     busy = running_jobs()
     return {
         "hostname": os.uname().nodename,
@@ -430,12 +437,16 @@ def collect_caps(bench_python=None):
         "disk_free_gb": disk,
         "idle_seconds": idle,
         "power": power,
+        "battery_pct": pct,
+        "pause_on_low_battery_pct": policy.get("pause_on_low_battery_pct"),
+        "other_cpu_pct": other_cpu_pct(None) if max_other is not None else None,
+        "max_other_cpu_pct": max_other,
         "thermal_limit": thermal,
         "host_status": host_status,
         "has_taskpolicy": bool(shutil.which("taskpolicy")),
         "bench": cached_bench(bench_python),
         "bench_python": bench_python or sys.executable,
-        "policy_paused": bool(load_policy().get("paused")),
+        "policy_paused": bool(policy.get("paused")),
         "busy_jobs": busy,
         "busy_job": busy[0] if busy else None,
     }
@@ -566,15 +577,28 @@ def _keep_awake(pid):
         return None
 
 
-def _stop_group(pgid, leader):
-    """Pause a job's process group, except its leader, `wrap`.
+def _started_path(job_dir):
+    """Where `wrap` writes its command's pid once the command has started."""
+    return os.path.join(job_dir, "command.pid")
+
+
+def _stop_group(pgid, leader, started):
+    """Pause a job's process group, except its leader, `wrap`, once the command runs.
 
     wrap only waits for the command, so letting it run costs nothing. A
     command killed while paused (SIGKILL, the OOM killer) is then reaped and
     recorded at once, and the job ends instead of reading as paused until it
-    resumes. Raises what killpg raises.
+    resumes.
+
+    Until wrap has started the command it stays stopped with the rest:
+    let go, it would start the command after the stop and the job would run
+    on unpaused. wrap writes `started` right after the command starts, and a
+    stopped wrap can't write it, so checking for it after the stop is safe.
+    Raises what killpg raises.
     """
     os.killpg(pgid, signal.SIGSTOP)
+    if not os.path.exists(started):
+        return
     try:
         os.kill(leader, signal.SIGCONT)
     except OSError:
@@ -587,6 +611,7 @@ def _terminate_group(pgid, grace=10.0):
     gone = (ProcessLookupError, PermissionError)
     try:
         os.killpg(pgid, signal.SIGTERM)
+        os.killpg(pgid, signal.SIGCONT)  # a paused member gets SIGTERM only once it runs
     except gone:
         return
     deadline = time.time() + grace
@@ -623,6 +648,7 @@ def cmd_exec(argv):
     status_path = os.path.join(job_dir, "status.json")
     pid_path = os.path.join(job_dir, "pid")
     exit_path = os.path.join(job_dir, "exit.json")
+    started_path = _started_path(job_dir)
 
     env = dict(os.environ)
     env.update({str(k): str(v) for k, v in (job.get("env") or {}).items()})
@@ -643,11 +669,13 @@ def cmd_exec(argv):
         env["ORCHARD_RESUME"] = "1"
 
     preempt = bool(job.get("preempt"))
-    # The job records its own exit (see cmd_wrap), so drop an earlier attempt's.
-    try:
-        os.unlink(exit_path)
-    except OSError:
-        pass
+    # The job records its own start and exit (see cmd_wrap), so drop an
+    # earlier attempt's.
+    for path in (exit_path, started_path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
     recorded = [sys.executable, "-I", os.path.abspath(__file__), "wrap", exit_path,
                 "" if attempt is None else str(attempt), "--"] + cmd
     wrapped = _wrap(recorded, load_policy())
@@ -722,7 +750,7 @@ def cmd_exec(argv):
             exit_code = proc.wait()
             state = "timed_out"
             break
-        if now - last_poll > 5:
+        if now - last_poll > POLL_S:
             if preempt:
                 policy = load_policy()
                 sample = sample_preemption_state(policy, pgid)
@@ -731,7 +759,7 @@ def cmd_exec(argv):
                 # _terminate_group: the job has ended, so poll it again.
                 if action == "pause":
                     try:
-                        _stop_group(pgid, proc.pid)
+                        _stop_group(pgid, proc.pid, started_path)
                     except (ProcessLookupError, PermissionError):
                         time.sleep(0.5)
                         continue
@@ -758,11 +786,10 @@ def cmd_exec(argv):
         time.sleep(0.5)
 
     log.close()
-    if paused:
-        try:
-            os.killpg(pgid, signal.SIGCONT)
-        except (ProcessLookupError, PermissionError):
-            pass
+    # What's left of the group is ended, not left behind: a command that
+    # outlived wrap (wrap SIGKILLed), or members still stopped by a pause.
+    if _group_alive(pgid):
+        _terminate_group(pgid)
     clear_running_marker(str(job.get("id")))
     status.update(
         state=state,
@@ -800,7 +827,7 @@ def cmd_wrap(argv):
         # exec. One ignored already (nohup) stays ignored for the command.
         if signal.getsignal(sig) != signal.SIG_IGN:
             signal.signal(sig, lambda signum, frame: got.append(signum))
-    rc = _call_command(cmd, got)
+    rc = _call_command(cmd, got, _started_path(os.path.dirname(exit_path)))
     record = {"exit_code": rc, "attempt": int(attempt) if attempt.isdigit() else None, "ended_at": time.time()}
     if got:
         record["signal"] = got[0]
@@ -818,12 +845,13 @@ def cmd_wrap(argv):
     return rc
 
 
-def _call_command(cmd, got=()):
+def _call_command(cmd, got=(), started=None):
     """Run cmd and return its exit code, the shell's 127 or 126 if it can't start.
 
     A file with no #! line runs under /bin/sh, as caffeinate's execvp ran it
-    before every job went through `wrap`. A signal in `got` came before the
-    command could get it, so the command is sent the first one once started.
+    before every job went through `wrap`. Once it starts, its pid goes in
+    `started` (see _stop_group). A signal in `got` came before the command
+    could get it, so the process group is sent the first one then.
     """
     try:
         try:
@@ -836,9 +864,18 @@ def _call_command(cmd, got=()):
     except OSError as exc:
         print("orchard: cannot run %s: %s" % (cmd[0], exc), file=sys.stderr)
         return 127 if exc.errno in (errno.ENOENT, errno.ENOTDIR) else 126
+    except subprocess.SubprocessError as exc:
+        print("orchard: cannot run %s: %s" % (cmd[0], exc), file=sys.stderr)
+        return -got[0] if got else 126
+    if started:
+        try:
+            with open(started, "w") as f:
+                f.write(str(child.pid))
+        except OSError:
+            pass
     if got:
         try:
-            child.send_signal(got[0])
+            os.killpg(os.getpgrp(), got[0])
         except OSError:
             pass
     return child.wait()
@@ -923,20 +960,27 @@ def cmd_signal(argv, sig, label, cont_first=False):
         clear_running_marker(os.path.basename(argv[0].rstrip("/")))
         print("process group not running (its pid now belongs to another process)", file=sys.stderr)
         return 1
+    # The group, not the pid: a command can outlive a SIGKILLed wrap, and its
+    # group keeps wrap's number, which no new process can take meanwhile. The
+    # marker stays until the group is gone (running_jobs prunes it then), so
+    # the worker doesn't read as free while a command shrugs off SIGTERM.
+    pgid = status.get("pgid") or pid
     try:
-        pgid = os.getpgid(pid)
         if cont_first:
             os.killpg(pgid, signal.SIGCONT)
         if sig == signal.SIGSTOP:
-            _stop_group(pgid, pid)
+            _stop_group(pgid, pid, _started_path(argv[0]))
         else:
             os.killpg(pgid, sig)
-    except (ProcessLookupError, PermissionError):
+    except ProcessLookupError:
         clear_running_marker(os.path.basename(argv[0].rstrip("/")))
         print("process group not running", file=sys.stderr)
         return 1
-    if sig in (signal.SIGTERM, signal.SIGKILL):
-        clear_running_marker(os.path.basename(argv[0].rstrip("/")))
+    except PermissionError:
+        # macOS, for a group of unreaped zombies: its agent reaps them and
+        # clears the marker.
+        print("process group not running", file=sys.stderr)
+        return 1
     return 0
 
 

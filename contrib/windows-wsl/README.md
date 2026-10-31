@@ -50,7 +50,7 @@ Two tasks run it, and both run as you:
 
 While nobody is signed in, the startup task counts the PC as idle from the
 moment it saw that, so jobs start about three minutes after a restart or after
-the last person signs out. Those samples say `"source": "windows-signed-out"`.
+the last person signs out. Those samples say `"source":"windows-signed-out"`.
 When someone signs in, it marks the PC in use once, then passes on what the
 sign-in task reports. If that is missing or more than 30 s old, it writes
 nothing and the file goes stale. If it can't tell whether anyone is signed in,
@@ -123,7 +123,7 @@ harmlessly.
    Get-NetFirewallHyperVRule -Name OrchardSSH | Format-List Name,Profiles,Enabled,PortStatuses
    ```
 
-   It should show `Profiles : Private` and `Enabled : True`. A Hyper-V rule
+   Profiles should show Private, and Enabled should show True. A Hyper-V rule
    made without `-Profiles` applies everywhere; fix it with
    `Set-NetFirewallHyperVRule -Name OrchardSSH -Profiles Private`.
 7. **Keep it awake on the charger**, lid closed included:
@@ -140,7 +140,9 @@ harmlessly.
 8. **Register the status tasks.** Close other WSL clients first: VS Code
    Remote-WSL, Docker Desktop, and Explorer windows on `\\wsl.localhost`. One
    of them could start WSL before the startup task does, and the VM would be
-   its session's; the script asks for a restart if it finds one running. Put
+   its session's. The script only sees `wsl.exe` running in a signed-in
+   session, and asks for a restart then; it can't tell whether those other
+   clients are open. Put
    both `.ps1` files in one folder and run, from an admin PowerShell:
 
    ```powershell
@@ -166,7 +168,7 @@ harmlessly.
    Get-CimInstance Win32_Process -Filter "Name='wsl.exe'" | Format-List ProcessId,SessionId,CommandLine
    ```
 
-   One entry must show `SessionId : 0` with `--exec sh -c` in its command
+   In one entry SessionId must show 0, with `--exec sh -c` in its command
    line: that is the startup task's writer. If none does, restart Windows and
    check again; `Get-ScheduledTaskInfo 'Orchard WSL worker (startup)'` shows
    the task's last result. A minute later `cat ~/.orchard/host-status.json`
@@ -180,7 +182,7 @@ harmlessly.
    distro:
 
    ```sh
-   ( crontab -l 2>/dev/null; echo '17 */6 * * * test -f "$HOME/.orchard/bin/orchard-agent.py" && /usr/bin/python3 "$HOME/.orchard/bin/orchard-agent.py" gc 2 15 >/dev/null 2>&1' ) | crontab -
+   ( crontab -l 2>/dev/null | grep -v 'orchard-agent.py" gc '; echo '17 */6 * * * test -f "$HOME/.orchard/bin/orchard-agent.py" && /usr/bin/python3 "$HOME/.orchard/bin/orchard-agent.py" gc 2 15 >/dev/null 2>&1' ) | crontab -
    ```
 
 ## On the controller
@@ -218,9 +220,11 @@ and, before signing in, run on the controller:
 ssh <alias> 'cat ~/.orchard/host-status.json; echo; date +%s'
 ```
 
-It should say `"source": "windows-signed-out"`, with a `ts` no more than about
-20 s behind the number on the last line. A missing file or an old `ts` means
-the startup task isn't running: sign in and go back over step 8.
+It should say `"source":"windows-signed-out"`, with a `ts` no more than about
+20 s behind the number on the last line. If ssh can't connect after a restart
+with nobody signed in, the startup task didn't start WSL: sign in and go back
+over step 8. ssh working with a missing file or an old `ts` means the writer
+stopped.
 
 ## Limits
 
