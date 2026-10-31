@@ -1515,3 +1515,97 @@ def test_terminate_ends_a_run_at_once_and_records_the_kill(tmp_path):
             proc.kill()
             proc.wait()
         _leftovers(job_dir)
+
+
+def test_kill_sends_nothing_when_its_request_cannot_be_recorded(tmp_path, monkeypatch):
+    # A run this ends with no request on record would read as having ended by
+    # itself and be finished rather than rerun, so no signal goes out.
+    monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
+    job_dir = tmp_path / "home" / "jobs" / "job-k"
+    job_dir.mkdir(parents=True)
+    (job_dir / "pid").write_text("4242")
+    (job_dir / "status.json").write_text(json.dumps({"state": "running", "pgid": 4242}))
+    monkeypatch.setattr(agent, "_kill_request_path", lambda d: str(tmp_path / "missing" / "kill-requested"))
+    sent = []
+    monkeypatch.setattr(agent.os, "killpg", lambda pgid, sig: sent.append(sig))
+    assert agent.main(["kill", str(job_dir)]) == 3
+    assert agent.main(["terminate", str(job_dir)]) == 3
+    assert sent == []
+
+
+def test_settle_says_whether_a_kill_reached_the_run_only_when_its_agent_kept_track(tmp_path, monkeypatch):
+    # An older agent's kill left no file, so its run's settle says nothing and
+    # the dispatcher takes the kill to have reached it.
+    assert _exec(tmp_path, ["true"])["kill_marker"] is True
+    ended = {"exit_code": 0, "attempt": 1, "ended_at": 160.0}
+    for marker, requested, want in ((True, True, True), (True, False, False), (False, True, None),
+                                    (False, False, None)):
+        running = {"id": "j1", "state": "running", "attempt": 1, "started_at": 100.0}
+        if marker:
+            running["kill_marker"] = True
+        job_dir = _settle_case(tmp_path, monkeypatch, running, ended)
+        kill_path = job_dir / "kill-requested"
+        if requested:
+            kill_path.write_text("1")
+        elif kill_path.exists():
+            kill_path.unlink()
+        status = agent.settle_status(str(job_dir))
+        assert status["state"] == "succeeded"
+        assert status.get("kill_requested") is want, (marker, requested)
+        assert ("kill_requested" in status) is (want is not None)
+
+
+class _FailingClose:
+    def __init__(self, f):
+        self._f = f
+
+    def fileno(self):
+        return self._f.fileno()
+
+    def write(self, text):
+        return self._f.write(text)
+
+    def flush(self):
+        self._f.flush()
+
+    def close(self):
+        self._f.close()
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+
+def test_exec_records_the_job_and_sweeps_its_group_when_the_log_wont_close(tmp_path, monkeypatch):
+    # Closing flushes, which a full disk can fail; the job is still recorded,
+    # what is left of its group ended and the worker marked free.
+    monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(agent, "_keep_awake", lambda pid: None)
+    real_open = open
+
+    def fake_open(path, *a, **k):
+        f = real_open(path, *a, **k)
+        return _FailingClose(f) if str(path).endswith("log.txt") else f
+
+    monkeypatch.setattr(agent, "open", fake_open, raising=False)
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    job = {"id": "j1", "cmd": ["sh", "-c", 'echo $$ > cmd.pid; kill -KILL "$PPID"; exec sleep 30'],
+           "venv": None, "workdir": str(tmp_path), "job_dir": str(job_dir), "timeout_s": None,
+           "preempt": False, "env": {}, "attempt": 1}
+    (job_dir / "job.json").write_text(json.dumps(job))
+    try:
+        assert agent.cmd_exec([str(job_dir / "job.json")]) == 1
+        status = json.loads((job_dir / "status.json").read_text())
+        assert (status["state"], status["exit_code"]) == ("failed", -signal.SIGKILL)
+        assert _ended(int((tmp_path / "cmd.pid").read_text()))
+        assert not os.path.exists(agent._marker_path("j1"))
+    finally:
+        try:
+            os.killpg(int((tmp_path / "cmd.pid").read_text()), signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
+
+    def no_start(*a, **k):
+        raise OSError(errno.ENOENT, "No such file or directory")
+
+    monkeypatch.setattr(agent.subprocess, "Popen", no_start)
+    assert agent.cmd_exec([str(job_dir / "job.json")]) == 1
+    assert json.loads((job_dir / "status.json").read_text())["state"] == "failed"

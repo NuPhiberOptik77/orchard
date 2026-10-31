@@ -226,7 +226,8 @@ def test_kill_remote_tells_a_failed_ssh_from_a_no(monkeypatch):
 
     worker = Worker(name="pro", host="10.0.0.9")
     sent = []
-    for code, want in ((0, True), (1, False), (255, None)):
+    # 3 is the agent unable to record the kill, so it sent nothing.
+    for code, want in ((0, True), (1, False), (255, None), (3, None)):
         monkeypatch.setattr(engine.transport, "run", lambda w, cmd, c=code, **k: sent.append(cmd) or Proc(c))
         assert engine.kill_remote(worker, "/Users/x/.orchard/jobs/j1") is want
     assert sent[0] == '/usr/bin/python3 "/Users/x/.orchard/bin/orchard-agent.py" kill "/Users/x/.orchard/jobs/j1"'

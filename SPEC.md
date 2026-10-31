@@ -272,6 +272,9 @@ When neither `settle` nor the plain status gives a clear answer, the orphan is
 asked about again on later passes, up to `ORPHAN_ASKS` (20, five minutes at the
 default poll). After that a readable status that still says running is killed,
 through the agent's fences, and an orphan with no readable status is let go. A
+running orphan with no pid yet (its agent may still be starting) whose kill finds
+nothing is asked about again the same way, and after `ORPHAN_ASKS` passes it is let
+go as a no-op. A
 kill that fails because ssh did (exit 255 or a timeout) keeps the orphan for the
 next pass.
 
@@ -281,7 +284,12 @@ the rerun, so a job whose side effects must not repeat should key them on
 `ORCHARD_JOB_ID` and check `ORCHARD_ATTEMPT`.
 
 Preempted runs: a run paused past `kill_paused_after_s` is sent `kill`, which
-sends SIGTERM and leaves `kill-requested` in the job folder. From then on its agent
+sends SIGTERM and leaves `kill-requested` in the job folder. An agent that can't
+write that file sends nothing and exits 3, which the dispatcher treats like a failed
+ssh and asks again. The run's final status says whether the file was there
+(`kill_requested`), so a run that ended by itself can be told from one the kill
+ended; a run started by an agent too old to keep track (no `kill_marker` in its
+status) says nothing and is taken to have been reached. From then on its agent
 doesn't pause it again, and SIGKILLs it if it is still running `KILL_GRACE_S` (60 s)
 later. The entry is requeued with `preempted_attempt`, and before starting it again
 the dispatcher asks whether that run is still alive. While it is, the job waits on
@@ -289,9 +297,12 @@ that worker instead of starting a second copy, and once `kill_grace_s` (default 
 has passed the dispatcher sends `terminate` (SIGKILL at once). A worker that can't
 be reached is a hold like any other, so after `fallback_after_s` the job reruns on
 the Air and the old run becomes an orphan marked `preempted`: it is killed once the
-worker answers, and its output is collected beside the rerun, never adopted. A kill
-whose reply was lost shows up as the run's final status under the attempt being
-preempted; the job is requeued, not settled from it. A status from any other
+worker answers, and its output is collected beside the rerun. Its exit is the
+preemption, so it isn't adopted, unless its final status says the kill never reached
+it: that run ended by itself and is settled like any other orphan, so a success is
+adopted. A kill whose reply was lost shows up as the run's final status under the
+attempt being preempted. The job is requeued from it, unless that status says the
+kill never reached the run; then the job is finished as the run ended. A status from any other
 attempt is fenced off: an earlier attempt's counts as a missed poll, a later one's
 is recorded. Preemptions don't count toward `max_attempts`. Each launch deletes the
 last attempt's `status.json` first, so an early poll finds no status instead of how
@@ -302,7 +313,10 @@ adopting a job, the dispatcher stops what it started, locally or on the worker
 (leaving an orphan if the kill can't be sent yet). `orchard cancel` re-reads the
 entry after acting and acts again if a tick started the job meanwhile, and it also
 kills a requeued preempted run that may still be going. Any other orphan outcome
-leaves the cancel in place.
+leaves the cancel in place. A run that ended by itself while the cancel was acting
+(the agent found nothing to signal, or a local group was already gone) keeps the
+state the tick records for it, and a local run whose status already says it ended is
+reported as "already <state>" and left for the tick.
 
 Local liveness: local jobs record the agent's pid; if the status file still says
 running but the process is gone (e.g. the Air shut down mid-job), the dispatcher
@@ -389,7 +403,8 @@ as "user active, power unknown", which holds new jobs and pauses running ones, a
   events. This answers "has the worker actually done work / why is the Air holding".
 - `orchard doctor`: control plane (dispatch pid, stale locks), workers (reachability,
   agent sha freshness, disk, paused-by-owner, idle), local disk/blob-cache/bench-cache,
-  queue anomalies (queued while dispatch stopped, held > 1 h). Exit 1 on failures.
+  queue anomalies (queued while dispatch stopped, held > 1 h; a job waiting out a
+preempted run is timed from the preempt). Exit 1 on failures.
 - The menu-bar app pipes `dispatch --watch` output to /dev/null, so the event log —
   not that output — is the historical record.
 

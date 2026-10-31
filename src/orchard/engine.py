@@ -443,7 +443,8 @@ def collect_remote(
 
 def kill_remote(worker: Worker, rjob: str) -> bool | None:
     """True once the agent has signalled the job, False when it answers that the
-    job isn't running, and None when ssh itself fails (a timeout, exit 255).
+    job isn't running, and None when ssh itself fails (a timeout, exit 255) or
+    the agent couldn't record the kill and sent nothing (exit 3).
 
     The job gets SIGTERM, and its agent sends SIGKILL if it is still running a
     minute later."""
@@ -470,7 +471,7 @@ def _signal_remote(worker: Worker, rjob: str, verb: str) -> bool | None:
         )
     except subprocess.TimeoutExpired:
         return None
-    if proc.returncode == 255:
+    if proc.returncode in (255, 3):
         return None
     return proc.returncode == 0
 

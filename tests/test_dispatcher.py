@@ -1463,3 +1463,50 @@ def test_save_orphan_without_an_entry_file_saves(tmp_path, monkeypatch):
     assert dispatcher._save_orphan(entry, "orphan cancelled (ok)", orphan=None) is True
     saved = json.loads(dispatcher.entry_path("demo-z").read_text())
     assert (saved["note"], saved["orphan"]) == ("running locally; orphan cancelled (ok)", None)
+
+
+@pytest.mark.parametrize("reached", [True, False])
+def test_a_lost_kill_still_decides_after_the_run_is_seen_running(reached, tmp_path, monkeypatch):
+    # The kill's reply was lost, and a later poll finds the run still going.
+    # The preempt stays on record, so how the run then ends still decides:
+    # reached by the kill, it is the preemption; otherwise it is the job's end.
+    kills, launches = _long_paused(tmp_path, monkeypatch, kill=None, alive=[True] * 5)
+    workers = [Worker(name="pro", host="10.0.0.9")]
+    dispatcher.tick(workers=workers)
+    running = {"state": "running", "attempt": 1}
+    monkeypatch.setattr(dispatcher.engine, "remote_status", lambda worker, rjob: running)
+    dispatcher.tick(workers=workers)
+    entry = dispatcher.load_entries()[0]
+    assert (entry["state"], entry["preempting_attempt"]) == ("running", 1)
+    status = {"state": "succeeded", "exit_code": 0, "attempt": 1, "kill_requested": reached}
+    monkeypatch.setattr(dispatcher.engine, "remote_status", lambda worker, rjob: status)
+    collected = []
+    monkeypatch.setattr(dispatcher.engine, "collect_remote", lambda *a, **k: collected.append(a) or status)
+    monkeypatch.setattr(dispatcher.engine, "remote_job_running", lambda w, job_id: False)
+    lines = dispatcher.tick(workers=workers)
+    entry = dispatcher.load_entries()[0]
+    if reached:
+        assert (entry["state"], entry["preempted_attempt"], entry["attempts"]) == ("queued", 1, 1), lines
+        assert collected == [] and launches == []
+    else:
+        assert entry["state"] == "done", lines
+        assert collected and launches == []
+
+
+def test_orphan_with_no_pid_is_let_go_after_orphan_asks(tmp_path, monkeypatch):
+    # A run that never gets a pid (its agent died starting it) is not asked
+    # about forever: after ORPHAN_ASKS passes the kill's no-op stands.
+    monkeypatch.setattr(dispatcher, "ORPHAN_ASKS", 2)
+    remote = {"state": "running", "attempt": 1}
+    _orphaned(tmp_path, monkeypatch, remote, "queued", settled=remote)
+    kills = []
+    monkeypatch.setattr(dispatcher.engine, "kill_remote", lambda w, rjob: kills.append(rjob) or False)
+    monkeypatch.setattr(dispatcher, "start_queued", lambda *a, **k: [])
+    workers = [Worker(name="pro", host="10.0.0.9")]
+    first = dispatcher.tick(workers=workers)
+    assert any("has no pid yet; asking again" in line for line in first), first
+    second = dispatcher.tick(workers=workers)
+    assert any("cancelled orphaned remote job on pro" in line for line in second), second
+    entry = dispatcher.load_entries()[0]
+    assert entry["orphan"] is None and "no-op" in entry["note"]
+    assert kills == [ORPHAN["rjob"]] * 2

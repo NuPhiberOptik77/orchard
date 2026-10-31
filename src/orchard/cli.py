@@ -475,6 +475,10 @@ def cancel(job: str = typer.Argument(..., help="job id or unique prefix")) -> No
     # and act again on whatever the tick started.
     orphan = None
     for _ in range(3):
+        ended = _local_run_ended(entry, state)
+        if ended and not orphan:
+            print(f"{entry['id']} is already {ended}; dispatch will record it")
+            raise typer.Exit(0)
         stopped, sent = _stop_for_cancel(entry, state)
         orphan = stopped or orphan
         try:
@@ -512,13 +516,30 @@ def cancel(job: str = typer.Argument(..., help="job id or unique prefix")) -> No
     print(f"cancelled: {entry['id']} (was {state})")
 
 
+def _local_run_ended(entry: dict, state: str | None) -> str | None:
+    """How a local run the queue still calls running ended, if its status says it has."""
+    if state != "running" or entry.get("worker") != "local":
+        return None
+    ended = (engine.local_status(Path(entry["sdir"])) or {}).get("state")
+    return ended if ended in agent.TERMINAL_STATES else None
+
+
 def _stop_for_cancel(entry: dict, state: str | None) -> tuple[dict | None, bool]:
     """Stop the entry's run. Return an orphan record if a remote run could not be
     stopped now, so the dispatcher retries the kill, and whether a run was signalled."""
     if state == "running" and entry.get("worker") == "local":
         status = engine.local_status(Path(entry["sdir"])) or {}
+        if status.get("state") in agent.TERMINAL_STATES:
+            return None, False  # it ended by itself; its pgid may be another group's by now
         pgid = status.get("pgid")
         if pgid:
+            # Only a group that was there counts as stopped by this cancel.
+            try:
+                os.killpg(pgid, 0)
+            except (ProcessLookupError, PermissionError):
+                return None, False
+            except OSError:
+                pass
             try:
                 agent._terminate_group(pgid, grace=5.0)
                 return None, True
@@ -762,6 +783,10 @@ def doctor() -> None:
     now = time.time()
     for e in queued:
         held = e.get("held_since")
+        # Waiting out a preempted run restarts held_since at each answer (it
+        # times the fallback), so that wait is timed from the preempt.
+        if e.get("preempted_attempt") is not None and e.get("preempt_sent_at"):
+            held = min(held or now, e["preempt_sent_at"])
         if held and now - held > 3600:
             print(f"  warn  {e['id']} held {_fmt_dur(now - held)}: {e.get('note')}")
 

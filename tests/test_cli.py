@@ -1,5 +1,7 @@
 import os
 import signal
+import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -216,7 +218,8 @@ def test_cancel_stands_when_the_tick_records_the_end_of_the_run_it_stopped(monke
                                worker="local")
     entry.update(state="running", attempts=1)
     dispatcher.save_entry(entry)
-    monkeypatch.setattr(cli.engine, "local_status", lambda sdir: {"pgid": 4242})
+    run = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    monkeypatch.setattr(cli.engine, "local_status", lambda sdir: {"pgid": run.pid})
 
     def terminate(pgid, grace):
         disk = dispatcher.load_entries()[0]
@@ -224,7 +227,11 @@ def test_cancel_stands_when_the_tick_records_the_end_of_the_run_it_stopped(monke
         dispatcher.save_entry(disk)
 
     monkeypatch.setattr(cli.agent, "_terminate_group", terminate)
-    result = CliRunner().invoke(cli.app, ["cancel", "demo-l"])
+    try:
+        result = CliRunner().invoke(cli.app, ["cancel", "demo-l"])
+    finally:
+        run.kill()
+        run.wait()
     assert result.exit_code == 0, result.output
     assert "cancelled: demo-l (was running)" in result.output
     assert dispatcher.load_entries()[0]["state"] == "cancelled"
@@ -253,3 +260,97 @@ def test_cancel_stops_a_run_started_while_it_acts(monkeypatch, tmp_path):
     entry = dispatcher.load_entries()[0]
     assert entry["state"] == "cancelled"
     assert entry["note"] == "cancelled by user (was running)"
+
+
+def _cancel_remote_run_that_ends(monkeypatch, tmp_path, kill):
+    """A remote running job; the tick records it done during cancel's kill, which answers `kill`."""
+    monkeypatch.setattr(dispatcher, "QUEUE_DIR", tmp_path / "queue")
+    monkeypatch.setattr(cli, "load_workers", lambda: [Worker(name="pro", host="10.0.0.9")])
+    entry = dispatcher.enqueue(JobSpec(name="demo", cmd=["true"]), "demo-r", Path("/tmp/p"), tmp_path / "s",
+                               worker="pro")
+    entry.update(state="running", rhome="/Users/x", attempts=1)
+    dispatcher.save_entry(entry)
+
+    def kill_remote(w, rjob):
+        disk = dispatcher.load_entries()[0]
+        disk.update(state="done", note="succeeded (exit 0)")
+        dispatcher.save_entry(disk)
+        return kill
+
+    monkeypatch.setattr(cli.engine, "kill_remote", kill_remote)
+
+
+@pytest.mark.parametrize("kill, want", [(True, "cancelled"), (False, "done")])
+def test_cancel_counts_a_remote_run_as_stopped_only_if_it_signalled_one(monkeypatch, tmp_path, kill, want):
+    # The agent finding no run (False) means it ended by itself: the tick's
+    # record of it stands. A run the kill ended was cancelled.
+    _cancel_remote_run_that_ends(monkeypatch, tmp_path, kill)
+    result = CliRunner().invoke(cli.app, ["cancel", "demo-r"])
+    assert result.exit_code == 0, result.output
+    assert dispatcher.load_entries()[0]["state"] == want, result.output
+
+
+def _dead_pgid():
+    proc = subprocess.Popen(["true"], start_new_session=True)
+    proc.wait()
+    return proc.pid
+
+
+def _local_running(monkeypatch, tmp_path, status, record_done):
+    monkeypatch.setattr(dispatcher, "QUEUE_DIR", tmp_path / "queue")
+    entry = dispatcher.enqueue(JobSpec(name="demo", cmd=["true"]), "demo-l", Path("/tmp/p"), tmp_path / "s",
+                               worker="local")
+    entry.update(state="running", attempts=1)
+    dispatcher.save_entry(entry)
+
+    def local_status(sdir):
+        if record_done:
+            disk = dispatcher.load_entries()[0]
+            disk.update(state="done", note="succeeded (exit 0)")
+            dispatcher.save_entry(disk)
+        return status
+
+    monkeypatch.setattr(cli.engine, "local_status", local_status)
+    stopped = []
+    monkeypatch.setattr(cli.agent, "_terminate_group", lambda pgid, grace: stopped.append(pgid))
+    return stopped
+
+
+def test_cancel_leaves_a_local_run_that_already_ended(monkeypatch, tmp_path):
+    # Its status says it ended (its pgid may be another group's by now), and
+    # the tick has yet to record it: nothing is signalled or cancelled.
+    pgid = _dead_pgid()
+    stopped = _local_running(monkeypatch, tmp_path, {"state": "succeeded", "exit_code": 0, "pgid": pgid}, False)
+    result = CliRunner().invoke(cli.app, ["cancel", "demo-l"])
+    assert result.exit_code == 0, result.output
+    assert "demo-l is already succeeded" in result.output
+    assert stopped == [] and dispatcher.load_entries()[0]["state"] == "running"
+
+
+def test_cancel_counts_a_local_group_as_stopped_only_if_it_was_there(monkeypatch, tmp_path):
+    # The group was gone before cancel signalled it, so the tick's "done" stands.
+    pgid = _dead_pgid()
+    _local_running(monkeypatch, tmp_path, {"state": "running", "pgid": pgid}, True)
+    result = CliRunner().invoke(cli.app, ["cancel", "demo-l"])
+    assert result.exit_code == 0, result.output
+    assert dispatcher.load_entries()[0]["state"] == "done", result.output
+
+
+def test_doctor_flags_a_job_held_long_behind_a_preempted_run(tmp_path, monkeypatch):
+    # Waiting out a preempted run restarts held_since at each answer; the
+    # warning times the wait from the preempt instead.
+    from test_dispatcher import _age, _long_paused
+
+    _long_paused(tmp_path, monkeypatch, kill=True, alive=[True] * 10)
+    workers = [Worker(name="pro", host="10.0.0.9")]
+    dispatcher.tick(workers=workers)
+    _age("demo-p", preempt_sent_at=4200)
+    dispatcher.tick(workers=workers)
+    entry = dispatcher.load_entries()[0]
+    assert entry["state"] == "queued" and time.time() - entry["held_since"] < 60
+    _isolate_control_plane(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "load_workers", lambda: [])
+    monkeypatch.setattr(cli, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(cli.store, "BLOB_DIR", tmp_path / "blobs")
+    result = CliRunner().invoke(cli.app, ["doctor"])
+    assert "warn  demo-p held " in result.output, result.output

@@ -724,6 +724,14 @@ def _terminate_group(pgid, grace=10.0):
         pass
 
 
+def _close_log(log):
+    # Closing flushes, which a full disk can fail; the job is recorded anyway.
+    try:
+        log.close()
+    except OSError:
+        pass
+
+
 def _log_line(log, text):
     # A full disk must not kill the agent before it signals or records the job.
     try:
@@ -803,6 +811,9 @@ def cmd_exec(argv):
         "elapsed_s": 0,
         "active_s": 0,
         "exit_code": None,
+        # This agent clears and reads the kill-requested file, so settle can
+        # say whether a kill reached the run. Older agents' runs lack it.
+        "kill_marker": True,
     }
     _atomic_write_json(status_path, status)
 
@@ -814,7 +825,7 @@ def cmd_exec(argv):
             start_new_session=True,
         )
     except OSError as exc:
-        log.close()
+        _close_log(log)
         status.update(state="failed", ended_at=time.time(), exit_code=-1, error=str(exc))
         _atomic_write_json(status_path, status)
         return 1
@@ -912,7 +923,7 @@ def cmd_exec(argv):
             last_poll = now
         time.sleep(0.5)
 
-    log.close()
+    _close_log(log)
     # What's left of the group is ended, not left behind: a command that
     # outlived wrap (wrap SIGKILLed), or members still stopped by a pause.
     if _group_alive(pgid):
@@ -1047,8 +1058,11 @@ def settle_status(job_dir):
         ended_at=ended_at,
         elapsed_s=round(ended_at - (status.get("started_at") or ended_at), 1),
         exit_code=exit_code,
-        kill_requested=os.path.exists(_kill_request_path(job_dir)),
     )
+    # A run started by an older agent may have had a kill that left no file,
+    # so nothing is said and the dispatcher takes the kill to have reached it.
+    if status.get("kill_marker"):
+        status["kill_requested"] = os.path.exists(_kill_request_path(job_dir))
     try:
         _atomic_write_json(os.path.join(job_dir, "status.json"), status)
     except OSError:
@@ -1109,11 +1123,15 @@ def cmd_signal(argv, sig, label, cont_first=False):
     pgid = status.get("pgid") or pid
     if sig in (signal.SIGTERM, signal.SIGKILL):
         # Read by the job's agent (cmd_exec) and by a pause in flight (_stop_group).
+        # Without it, a run this ends would read as having ended by itself and
+        # be finished rather than rerun, so no signal goes out: exit 3 tells
+        # the dispatcher nothing happened and to ask again.
         try:
             with open(_kill_request_path(argv[0]), "w") as f:
                 f.write(str(time.time()))
-        except OSError:
-            pass
+        except OSError as exc:
+            print("could not record the kill request (%s); not signalled" % exc, file=sys.stderr)
+            return 3
     try:
         if cont_first:
             os.killpg(pgid, signal.SIGCONT)

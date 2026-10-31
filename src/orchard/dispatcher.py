@@ -470,7 +470,8 @@ def _hold_or_fallback(entry: dict, job: JobSpec, cfg: dict, reason: str) -> list
             if preempted is not None and rhome and not entry.get("orphan"):
                 # The preempted run may still be alive on a worker that can't be
                 # asked now. It is settled as an orphan once the worker answers:
-                # stopped if it still runs, and never adopted.
+                # stopped if it still runs, and adopted only if the kill never
+                # reached it.
                 entry["orphan"] = {
                     "worker": entry["worker"],
                     "rjob": engine.remote_job_dir(rhome, entry["id"]),
@@ -1040,8 +1041,8 @@ def settle_orphan(entry: dict, worker: Worker) -> list[str]:
             if asks < ORPHAN_ASKS:
                 _save_orphan(entry, None, orphan={**orphan, "asks": asks})
                 return [f"{job_id}: no clear answer about the orphan on {worker.name}; asking again"]
-            # The agent's `kill` skips its boot and pid fences when it can't
-            # read the status, so an orphan nothing vouches for is let go.
+            # The agent's `kill` signals nothing without a readable status (its
+            # boot and pid fences need one), so the orphan is let go.
             _save_orphan(entry, f"orphan left alone (no readable status on {worker.name})", orphan=None)
             events.append("orphan", job=job_id, worker=worker.name, outcome="dropped", attempt=expected)
             return [f"{job_id}: no readable status for the orphan on {worker.name}; left it alone"]
