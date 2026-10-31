@@ -12,6 +12,7 @@ Usage:
   python3 agent.py pause <job_dir>
   python3 agent.py resume <job_dir>
   python3 agent.py kill <job_dir>
+  python3 agent.py terminate <job_dir>
   python3 agent.py settle <job_dir>
   python3 agent.py wrap <exit.json> <attempt> -- <cmd...>
   python3 agent.py gc [max_age_days] [min_free_gb]
@@ -37,6 +38,7 @@ HOST_STATUS_PATH = os.path.join(ORCHARD_HOME, "host-status.json")
 HOST_STATUS_MAX_AGE_S = 60
 HOST_POWER_STATES = ("ac", "battery", "unknown")
 POLL_S = 5  # how often a running job checks for preemption and rewrites status.json
+KILL_GRACE_S = 60  # how long a job asked to end may ignore SIGTERM before it gets SIGKILL
 
 
 def _running_dir():
@@ -84,9 +86,29 @@ def _group_has_live_member(pgid):
         except (IndexError, ValueError):
             continue
         seen = True
-        if fields[0] not in ("Z", "X"):
+        if fields[0] not in ("Z", "X") or _has_live_thread(name):
             return True
     return False if seen else None
+
+
+def _has_live_thread(pid):
+    """Whether a process listed as a zombie still runs other threads.
+
+    /proc/<pid>/stat describes the main thread, which reads Z once it has
+    exited (pthread_exit) even while the process's other threads run on.
+    """
+    try:
+        tids = os.listdir("/proc/%s/task" % pid)
+    except OSError:
+        return False
+    for tid in tids:
+        try:
+            state = _read_text("/proc/%s/task/%s/stat" % (pid, tid)).rsplit(")", 1)[1].split()[0]
+        except IndexError:
+            continue
+        if state not in ("Z", "X"):
+            return True
+    return False
 
 
 def _group_has_own_process(pgid):
@@ -640,6 +662,11 @@ def _started_path(job_dir):
     return os.path.join(job_dir, "command.pid")
 
 
+def _kill_request_path(job_dir):
+    """Where `kill` and `terminate` note that the job was asked to end."""
+    return os.path.join(job_dir, "kill-requested")
+
+
 def _stop_group(pgid, leader, started):
     """Pause a job's process group, except its leader, `wrap`, once the command runs.
 
@@ -655,11 +682,16 @@ def _stop_group(pgid, leader, started):
 
     macOS can miss a process that is forking or execing when the group is
     stopped, and it then runs on unpaused, so the group is stopped twice.
+    A kill that lands between the two stops would leave the job frozen in
+    its SIGTERM handler, so a job asked to end is let go again.
     Raises what killpg raises.
     """
     os.killpg(pgid, signal.SIGSTOP)
     time.sleep(0.05)
     os.killpg(pgid, signal.SIGSTOP)
+    if os.path.exists(_kill_request_path(os.path.dirname(started))):
+        os.killpg(pgid, signal.SIGCONT)
+        return
     if not os.path.exists(started):
         return
     try:
@@ -714,6 +746,7 @@ def cmd_exec(argv):
     pid_path = os.path.join(job_dir, "pid")
     exit_path = os.path.join(job_dir, "exit.json")
     started_path = _started_path(job_dir)
+    kill_path = _kill_request_path(job_dir)
 
     env = dict(os.environ)
     env.update({str(k): str(v) for k, v in (job.get("env") or {}).items()})
@@ -737,7 +770,8 @@ def cmd_exec(argv):
     # The job records its own start and exit (see cmd_wrap), so drop an
     # earlier attempt's. Its pid goes too: until this attempt's is written,
     # a kill or pause must find no process rather than the last attempt's.
-    for path in (exit_path, started_path, pid_path):
+    # So does a request to end the last attempt.
+    for path in (exit_path, started_path, pid_path, kill_path):
         try:
             os.unlink(path)
         except OSError:
@@ -799,6 +833,8 @@ def cmd_exec(argv):
     active_s = 0.0
     last_tick = time.time()
     last_poll = 0.0
+    kill_requested = None
+    hard_killed = False
     while True:
         now = time.time()
         dt = now - last_tick
@@ -816,8 +852,29 @@ def cmd_exec(argv):
             exit_code = proc.wait()
             state = "timed_out"
             break
+        # `kill` sends SIGCONT, which ends a pause behind this loop's back. A
+        # job asked to end isn't paused again, and gets SIGKILL if it is
+        # still running KILL_GRACE_S later.
+        if kill_requested is None and os.path.exists(kill_path):
+            kill_requested = now
+            _log_line(log, "asked to end")
+            if paused:
+                try:
+                    os.killpg(pgid, signal.SIGCONT)
+                except OSError:
+                    pass
+                paused = False
+                paused_since = None
+                status.update(state="running", pause_reason=None, paused_since=None)
+        if kill_requested is not None and not hard_killed and now - kill_requested > KILL_GRACE_S:
+            _log_line(log, "still running %.0fs after it was asked to end; killing" % (now - kill_requested))
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except OSError:
+                pass
+            hard_killed = True
         if now - last_poll > POLL_S:
-            if preempt:
+            if preempt and kill_requested is None:
                 policy = load_policy()
                 sample = sample_preemption_state(policy, pgid)
                 action, reason = decide_preemption(sample, policy, paused)
@@ -856,7 +913,6 @@ def cmd_exec(argv):
     # outlived wrap (wrap SIGKILLed), or members still stopped by a pause.
     if _group_alive(pgid):
         _terminate_group(pgid)
-    clear_running_marker(str(job.get("id")))
     status.update(
         state=state,
         pause_reason=None,
@@ -866,7 +922,12 @@ def cmd_exec(argv):
         active_s=round(active_s, 1),
         exit_code=exit_code,
     )
-    _atomic_write_json(status_path, status)
+    # The final status goes first: once the marker is gone the dispatcher
+    # can start the next attempt, which must not find this one still running.
+    try:
+        _atomic_write_json(status_path, status)
+    finally:
+        clear_running_marker(str(job.get("id")))
     return 0 if state == "succeeded" else 1
 
 
@@ -1031,6 +1092,13 @@ def cmd_signal(argv, sig, label, cont_first=False):
     # marker stays until the group is gone (running_jobs prunes it then), so
     # the worker doesn't read as free while a command shrugs off SIGTERM.
     pgid = status.get("pgid") or pid
+    if sig in (signal.SIGTERM, signal.SIGKILL):
+        # Read by the job's agent (cmd_exec) and by a pause in flight (_stop_group).
+        try:
+            with open(_kill_request_path(argv[0]), "w") as f:
+                f.write(str(time.time()))
+        except OSError:
+            pass
     try:
         if cont_first:
             os.killpg(pgid, signal.SIGCONT)
@@ -1205,6 +1273,8 @@ def main(argv=None):
         return cmd_signal(rest, signal.SIGCONT, "resume")
     if cmd == "kill":
         return cmd_signal(rest, signal.SIGTERM, "kill", cont_first=True)
+    if cmd == "terminate":
+        return cmd_signal(rest, signal.SIGKILL, "terminate")
     if cmd == "gc":
         return cmd_gc(rest)
     if cmd == "running":

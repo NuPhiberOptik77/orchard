@@ -1,9 +1,11 @@
 import os
 import signal
+from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
-from orchard import cli
+from orchard import cli, dispatcher
 from orchard.cli import _redact_entries, _stats_summary
 from orchard.config import Worker
 from orchard.job import JobSpec
@@ -171,3 +173,59 @@ def test_main_adds_homebrew_to_a_gui_path(monkeypatch):
     dirs = seen["path"].split(":")
     assert dirs[:4] == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
     assert "/opt/homebrew/bin" in dirs
+
+
+def _queued_preempted(monkeypatch, tmp_path, kill):
+    monkeypatch.setattr(dispatcher, "QUEUE_DIR", tmp_path / "queue")
+    monkeypatch.setattr(cli, "load_workers", lambda: [Worker(name="pro", host="10.0.0.9")])
+    kills = []
+    monkeypatch.setattr(cli.engine, "kill_remote", lambda w, rjob: kills.append(rjob) or kill)
+    entry = dispatcher.enqueue(JobSpec(name="demo", cmd=["true"]), "demo-q", Path("/tmp/p"), Path("/tmp/s"),
+                               worker="pro")
+    entry.update(state="queued", rhome="/Users/x", attempts=1, preempted_attempt=1)
+    dispatcher.save_entry(entry)
+    return kills
+
+
+@pytest.mark.parametrize("kill", [True, None])
+def test_cancel_kills_a_preempted_run_that_may_still_be_going(monkeypatch, tmp_path, kill):
+    # Requeued after a preempt whose kill reply was lost: the run can still be
+    # going on the worker, so cancel stops it or leaves it to the dispatcher.
+    kills = _queued_preempted(monkeypatch, tmp_path, kill)
+    result = CliRunner().invoke(cli.app, ["cancel", "demo-q"])
+    assert result.exit_code == 0, result.output
+    rjob = "/Users/x/.orchard/jobs/demo-q"
+    assert kills == [rjob]
+    entry = dispatcher.load_entries()[0]
+    assert entry["state"] == "cancelled"
+    if kill:
+        assert not entry.get("orphan")
+    else:
+        assert entry["orphan"] == {"worker": "pro", "rjob": rjob, "rhome": "/Users/x", "attempt": 1,
+                                   "preempted": True}
+        assert "dispatcher will retry" in result.output
+
+
+def test_cancel_stops_a_run_started_while_it_acts(monkeypatch, tmp_path):
+    # A dispatch tick can start the job between cancel's read and its save.
+    kills = _queued_preempted(monkeypatch, tmp_path, True)
+    entry = dispatcher.load_entries()[0]
+    entry.update(preempted_attempt=None)
+    dispatcher.save_entry(entry)
+    states, real = [], cli._stop_for_cancel
+
+    def stop(entry, state):
+        states.append(state)
+        if len(states) == 1:
+            fresh = dict(entry, state="running", worker="pro", rhome="/Users/x", attempts=2)
+            dispatcher.save_entry(fresh)
+        return real(entry, state)
+
+    monkeypatch.setattr(cli, "_stop_for_cancel", stop)
+    result = CliRunner().invoke(cli.app, ["cancel", "demo-q"])
+    assert result.exit_code == 0, result.output
+    assert states == ["queued", "running"]
+    assert kills == ["/Users/x/.orchard/jobs/demo-q"]
+    entry = dispatcher.load_entries()[0]
+    assert entry["state"] == "cancelled"
+    assert entry["note"] == "cancelled by user (was running)"

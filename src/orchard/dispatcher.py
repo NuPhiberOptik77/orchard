@@ -26,6 +26,7 @@ DISPATCH_DEFAULTS = {
     "poll_interval_s": 15,
     "idle_threshold_s": engine.IDLE_THRESHOLD_S,
     "kill_paused_after_s": 1800,
+    "kill_grace_s": 120,
     "max_misses": 40,
     "hold_on_battery": True,
     "fallback_after_s": 900,
@@ -237,6 +238,30 @@ def save_entry(entry: dict) -> None:
     tmp.replace(path)
 
 
+def _save(entry: dict) -> bool:
+    """Save a tick's change unless `orchard cancel` cancelled the job meanwhile.
+
+    dispatch --watch holds the tick lock for life, so cancel writes the entry
+    directly, often while a tick waits on ssh. The cancel stands: the entry is
+    reloaded from disk, keeping only an orphan this tick recorded, and this
+    returns False so the caller can stop what it started.
+    """
+    try:
+        disk = json.loads(entry_path(entry["id"]).read_text())
+    except (OSError, json.JSONDecodeError):
+        disk = None
+    if disk is None or disk.get("state") != "cancelled" or entry.get("state") == "cancelled":
+        save_entry(entry)
+        return True
+    orphan = entry.get("orphan")
+    entry.clear()
+    entry.update(disk)
+    if orphan and not entry.get("orphan"):
+        entry["orphan"] = orphan
+        save_entry(entry)
+    return False
+
+
 def enqueue(job: JobSpec, job_id: str, cwd: Path, sdir: Path, worker: str) -> dict:
     entry = {
         "id": job_id,
@@ -338,7 +363,7 @@ def tick(workers: list[Worker] | None = None) -> list[str]:
             lines += poll_running(entry, worker_map, cfg)
         except Exception as exc:
             entry["note"] = f"dispatch error: {exc}"
-            save_entry(entry)
+            _save(entry)
             lines.append(f"{entry['id']}: dispatch error: {exc}")
         # A job stranded on a worker that stopped answering doesn't hold that
         # worker's queue, or its other jobs could never reach their fallback.
@@ -352,7 +377,7 @@ def tick(workers: list[Worker] | None = None) -> list[str]:
             continue
         if entry.get("worker") in busy:
             entry["note"] = f"waiting for {entry['worker']} (busy)"
-            save_entry(entry)
+            _save(entry)
             lines.append(f"{entry['id']}: held (worker busy)")
             continue
         try:
@@ -373,7 +398,7 @@ def tick(workers: list[Worker] | None = None) -> list[str]:
         worker = worker_map.get(orphan["worker"])
         if worker is None:
             entry["orphan"] = None
-            save_entry(entry)
+            _save(entry)
             continue
         if caps_of(worker) is None:
             continue
@@ -436,13 +461,26 @@ def _hold_or_fallback(entry: dict, job: JobSpec, cfg: dict, reason: str) -> list
     if fallback_after is not None and waited >= fallback_after:
         ok, why = _local_fallback(job)
         if ok:
+            preempted, rhome = entry.get("preempted_attempt"), entry.get("rhome")
+            if preempted is not None and rhome and not entry.get("orphan"):
+                # The preempted run may still be alive on a worker that can't be
+                # asked now. It is settled as an orphan once the worker answers:
+                # stopped if it still runs, and never adopted.
+                entry["orphan"] = {
+                    "worker": entry["worker"],
+                    "rjob": engine.remote_job_dir(rhome, entry["id"]),
+                    "rhome": rhome,
+                    "attempt": preempted,
+                    "preempted": True,
+                }
             entry.update(
                 worker="local",
                 held_since=None,
                 preempted_attempt=None,
                 note=f"{reason}; falling back to local after {waited / 60:.0f}m",
             )
-            save_entry(entry)
+            if not _save(entry):
+                return [f"{entry['id']}: cancelled meanwhile; left cancelled"]
             events.append(
                 "fallback",
                 job=entry["id"],
@@ -453,7 +491,7 @@ def _hold_or_fallback(entry: dict, job: JobSpec, cfg: dict, reason: str) -> list
         entry["note"] = f"{reason}; not runnable locally ({why})"
     else:
         entry["note"] = reason
-    save_entry(entry)
+    _save(entry)
     return [f"{entry['id']}: held ({entry['note']})"]
 
 
@@ -514,11 +552,12 @@ def _note_launch_error(entry: dict, cfg: dict, exc: Exception) -> list[str]:
     entry["launch_errors"] = count
     if count >= cap:
         entry.update(state="failed", note=f"failed after {count} launch errors: {exc}")
-        save_entry(entry)
+        if not _save(entry):
+            return [f"{entry['id']}: cancelled meanwhile; left cancelled"]
         events.append("failed", job=entry["id"], worker=entry.get("worker"), detail=str(exc))
         return [f"{entry['id']}: FAILED ({count} launch errors: {exc})"]
     entry["note"] = f"launch error ({count}/{cap}): {exc}"
-    save_entry(entry)
+    _save(entry)
     return [f"{entry['id']}: launch error ({count}/{cap}): {exc}"]
 
 
@@ -530,14 +569,10 @@ def start_queued(
     sdir = Path(entry["sdir"])
     cwd = Path(entry["cwd"])
 
-    attempts = entry.get("attempts", 0)
-    if attempts >= cfg.get("max_attempts", 20):
-        entry.update(state="failed", note=f"failed after {attempts} attempts")
-        save_entry(entry)
-        events.append("failed", job=entry["id"], worker=entry.get("worker"), detail=f"{attempts} attempts")
-        return [f"{entry['id']}: FAILED after {attempts} attempts"]
-
     if worker_name == "local":
+        failed = _out_of_attempts(entry, cfg)
+        if failed:
+            return failed
         note = entry.get("note") or ""
         exempt = "falling back" in note or "lost contact" in note
         if cfg.get("hold_on_air_busy", True) and not exempt:
@@ -549,24 +584,27 @@ def start_queued(
                 if entry.get("held_since") is None:
                     entry["held_since"] = now
                 entry["note"] = f"air busy (load {engine.air_load():.1f})"
-                save_entry(entry)
+                _save(entry)
                 return [f"{entry['id']}: held ({entry['note']})"]
-        venv, pid = engine.launch_local(job, entry["id"], sdir, cwd, attempt=entry.get("attempts", 0) + 1)
+        attempt = entry.get("attempts", 0) + 1
+        venv, pid = engine.launch_local(job, entry["id"], sdir, cwd, attempt=attempt)
         entry.update(
             state="running",
-            attempts=entry.get("attempts", 0) + 1,
+            attempts=attempt,
             misses=0,
             local_pid=pid,
             held_since=None,
             note="running locally",
         )
-        save_entry(entry)
+        if not _save(entry):
+            _stop_local(pid, sdir)
+            return [f"{entry['id']}: cancelled while starting; stopped the local run"]
         return [f"{entry['id']}: started locally"]
 
     worker = worker_map.get(worker_name)
     if worker is None:
         entry["note"] = f"worker {worker_name!r} not configured"
-        save_entry(entry)
+        _save(entry)
         return [f"{entry['id']}: held ({entry['note']})"]
 
     caps = caps_of(worker)
@@ -578,49 +616,138 @@ def start_queued(
         # group is gone, and a job that traps SIGTERM can take the agent's grace
         # to exit, so adopting it would collect the dying run. Wait for it to
         # end, then launch the next attempt, which resumes from its checkpoint.
-        if engine.remote_job_alive(worker, entry["id"]) is not False:
+        # While the worker says it is alive the job never falls back, or the
+        # command would run twice at once.
+        alive = engine.remote_job_alive(worker, entry["id"])
+        if alive is None:
             return _hold_or_fallback(entry, job, cfg, f"waiting for the preempted run on {worker.name} to end")
+        if alive:
+            return _wait_preempted(entry, worker, cfg)
         entry["preempted_attempt"] = None
     elif engine.remote_job_running(worker, entry["id"]):
+        rhome = engine.remote_home(worker)
         entry.update(
             state="running",
             misses=0,
-            rhome=engine.remote_home(worker),
+            rhome=rhome,
             held_since=None,
             launch_errors=0,
             note=f"adopted running job on {worker.name} after dispatcher restart",
         )
-        save_entry(entry)
+        if not _save(entry):
+            return _stop_cancelled_start(entry, worker, rhome, entry.get("attempts", 0))
         events.append("adopted", job=entry["id"], worker=worker.name)
         return [f"{entry['id']}: adopted running job on {worker.name}"]
+
+    # Checked after the wait above, so a job is never failed while its
+    # preempted run is still alive on the worker.
+    failed = _out_of_attempts(entry, cfg)
+    if failed:
+        return failed
 
     probs = placement.problems(job, {**caps, "platform_ok": True})
     if probs:
         entry["note"] = "; ".join(probs)
-        save_entry(entry)
+        _save(entry)
         return [f"{entry['id']}: held ({entry['note']})"]
 
     hold = idle_hold(caps, cfg)
     if hold:
         return _hold_or_fallback(entry, job, cfg, hold)
 
+    attempt = entry.get("attempts", 0) + 1
     try:
-        rhome, _rjob = engine.launch_remote(
-            worker, job, entry["id"], sdir, cwd, attempt=entry.get("attempts", 0) + 1
-        )
+        rhome, _rjob = engine.launch_remote(worker, job, entry["id"], sdir, cwd, attempt=attempt)
     except Exception as exc:
         return _note_launch_error(entry, cfg, exc)
     entry.update(
         state="running",
-        attempts=entry.get("attempts", 0) + 1,
+        attempts=attempt,
         misses=0,
         rhome=rhome,
         held_since=None,
         launch_errors=0,
         note=f"running on {worker.name}",
     )
-    save_entry(entry)
+    if not _save(entry):
+        return _stop_cancelled_start(entry, worker, rhome, attempt)
     return [f"{entry['id']}: launched on {worker.name}"]
+
+
+def _out_of_attempts(entry: dict, cfg: dict) -> list[str] | None:
+    """Fail a job that has used up max_attempts; None while it has some left.
+
+    Preemptions don't count: they are the worker's owner taking it back, not
+    the job failing.
+    """
+    attempts = entry.get("attempts", 0)
+    if attempts - entry.get("preemptions", 0) < cfg.get("max_attempts", 20):
+        return None
+    entry.update(state="failed", note=f"failed after {attempts} attempts")
+    if not _save(entry):
+        return [f"{entry['id']}: cancelled meanwhile; left cancelled"]
+    events.append("failed", job=entry["id"], worker=entry.get("worker"), detail=f"{attempts} attempts")
+    return [f"{entry['id']}: FAILED after {attempts} attempts"]
+
+
+def _wait_preempted(entry: dict, worker: Worker, cfg: dict) -> list[str]:
+    """One tick of a job whose preempted run is still alive on its worker.
+
+    track_paused sent it SIGTERM. Once the run outlives kill_grace_s, the
+    agent's `terminate` SIGKILLs its group, again each grace while it lingers.
+    """
+    now = time.time()
+    entry["launch_errors"] = 0
+    if entry.get("held_since") is None:
+        entry["held_since"] = now
+    if entry.get("preempt_sent_at") is None:
+        entry["preempt_sent_at"] = now
+    last = entry.get("terminate_sent_at") or entry["preempt_sent_at"]
+    if entry.get("rhome") and now - last >= cfg.get("kill_grace_s", 120):
+        rjob = engine.remote_job_dir(entry["rhome"], entry["id"])
+        if engine.terminate_remote(worker, rjob) is not None:
+            entry["terminate_sent_at"] = now
+    entry["note"] = f"waiting for the preempted run on {worker.name} to end"
+    if entry.get("terminate_sent_at"):
+        entry["note"] += "; SIGKILL sent"
+    if not _save(entry):
+        return [f"{entry['id']}: cancelled meanwhile; left cancelled"]
+    return [f"{entry['id']}: held ({entry['note']})"]
+
+
+def _stop_cancelled_start(entry: dict, worker: Worker, rhome: str | None, attempt: int) -> list[str]:
+    """Stop a run that started on `worker` while `orchard cancel` cancelled its job.
+
+    One that can't be stopped now (no answer, or its agent hasn't written a pid
+    yet) is recorded as an orphan and stopped once the worker answers.
+    """
+    job_id = entry["id"]
+    rjob = engine.remote_job_dir(rhome, job_id) if rhome else None
+    if rjob and engine.kill_remote(worker, rjob):
+        return [f"{job_id}: cancelled while starting; stopped the run on {worker.name}"]
+    if rjob and not entry.get("orphan"):
+        entry["orphan"] = {"worker": worker.name, "rjob": rjob, "rhome": rhome, "attempt": attempt}
+        save_entry(entry)
+    return [f"{job_id}: cancelled while starting; will stop the run on {worker.name} once it can"]
+
+
+def _fenced(entry: dict, status: dict | None) -> dict | None:
+    """A job's status, or None when an earlier attempt wrote it.
+
+    Each launch clears status.json first, but the previous attempt's agent can
+    still write one as it exits. Read as "no status yet", it is never taken for
+    the new attempt finishing. A later attempt than the entry records is
+    believed (its launch was not saved, then adopted), and recorded.
+    """
+    if status is None:
+        return None
+    attempt, expected = status.get("attempt"), entry.get("attempts", 0)
+    if attempt is None or attempt == expected:
+        return status
+    if attempt < expected:
+        return None
+    entry["attempts"] = attempt
+    return status
 
 
 def poll_running(entry: dict, worker_map: dict[str, Worker], cfg: dict) -> list[str]:
@@ -628,7 +755,7 @@ def poll_running(entry: dict, worker_map: dict[str, Worker], cfg: dict) -> list[
     job_id = entry["id"]
 
     if worker_name == "local":
-        status = engine.local_status(Path(entry["sdir"]))
+        status = _fenced(entry, engine.local_status(Path(entry["sdir"])))
         pid = entry.get("local_pid")
         if (
             pid
@@ -641,7 +768,8 @@ def poll_running(entry: dict, worker_map: dict[str, Worker], cfg: dict) -> list[
                 local_pid=None,
                 note="local job process gone (status stuck running)",
             )
-            save_entry(entry)
+            if not _save(entry):
+                return [f"{entry['id']}: cancelled meanwhile; left cancelled"]
             events.append("failed", job=job_id, worker="local", detail="process gone (status stuck running)")
             return [f"{job_id}: FAILED (local job process gone)"]
         return finish_or_track(entry, status, worker_map, cfg)
@@ -649,11 +777,11 @@ def poll_running(entry: dict, worker_map: dict[str, Worker], cfg: dict) -> list[
     worker = worker_map.get(worker_name)
     if worker is None:
         entry["note"] = f"worker {worker_name!r} not configured"
-        save_entry(entry)
+        _save(entry)
         return [f"{job_id}: held (worker not configured)"]
 
     rjob = engine.remote_job_dir(entry["rhome"], job_id)
-    status = engine.remote_status(worker, rjob)
+    status = _fenced(entry, engine.remote_status(worker, rjob))
     if status is None:
         entry["misses"] = entry.get("misses", 0) + 1
         if entry["misses"] > cfg["max_misses"]:
@@ -677,18 +805,20 @@ def poll_running(entry: dict, worker_map: dict[str, Worker], cfg: dict) -> list[
                     misses=0,
                     rhome=None,
                     orphan=orphan,
+                    preempting_attempt=None,
                     note="lost contact with worker; falling back to local",
                 )
-                save_entry(entry)
+                if not _save(entry):
+                    return [f"{entry['id']}: cancelled meanwhile; left cancelled"]
                 events.append("requeued", job=job_id, worker="local", detail=f"lost contact with {worker_name}")
                 return [f"{job_id}: lost contact with {worker_name}; requeued locally"]
             # Only this worker can run it, and it may still be running or have
             # finished there: keep the job running and wait for the worker.
             entry["note"] = f"{waiting} (not runnable locally: {why})"
-            save_entry(entry)
+            _save(entry)
             events.append("held", job=job_id, worker=worker_name, reason=entry["note"])
             return [f"{job_id}: lost contact with {worker_name}; waiting for it (not runnable locally)"]
-        save_entry(entry)
+        _save(entry)
         return [f"{job_id}: no status from {worker_name} ({entry['misses']}/{cfg['max_misses']})"]
 
     entry["misses"] = 0
@@ -746,9 +876,11 @@ def _lost_run(
         paused_since=None,
         last_progress=None,
         stalled_polls=0,
+        preempting_attempt=None,
         note=f"{worker.name} lost the job mid-run; resumes from checkpoint",
     )
-    save_entry(entry)
+    if not _save(entry):
+        return [f"{entry['id']}: cancelled meanwhile; left cancelled"]
     events.append("requeued", job=job_id, worker=worker.name, detail="agent gone mid-run")
     return [f"{job_id}: {worker.name} lost the job mid-run; requeued"]
 
@@ -763,10 +895,11 @@ def _wait_stranded(entry: dict, worker: Worker, rjob: str) -> list[str]:
     job_id = entry["id"]
     if engine.remote_status_missing(worker, rjob):
         entry.update(state="failed", note=f"{worker.name} answers again but has no status for the job")
-        save_entry(entry)
+        if not _save(entry):
+            return [f"{entry['id']}: cancelled meanwhile; left cancelled"]
         events.append("failed", job=job_id, worker=worker.name, detail="lost contact; no status after it came back")
         return [f"{job_id}: FAILED ({worker.name} has no status for the job)"]
-    save_entry(entry)
+    _save(entry)
     return [f"{job_id}: waiting for {worker.name} (lost contact; not runnable locally)"]
 
 
@@ -776,17 +909,23 @@ def finish_or_track(
     job_id = entry["id"]
     if status is None:
         entry["misses"] = entry.get("misses", 0) + 1
-        save_entry(entry)
+        _save(entry)
         return [f"{job_id}: waiting for status"]
     state = status.get("state", "unknown")
     if state in agent.TERMINAL_STATES:
+        preempting = entry.get("preempting_attempt")
+        if preempting is not None and status.get("attempt", preempting) == preempting:
+            # track_paused's kill reached the run but its reply was lost: the
+            # run ending (killed, or exiting cleanly from a SIGTERM trap) is
+            # the preemption, not the job finishing.
+            return _requeue_preempted(entry, "preempted run ended (its kill reply was lost)")
         return finish(entry, status, worker_map)
     if state == "paused":
         return track_paused(entry, status, worker_map, cfg)
     elapsed = status.get("elapsed_s") or 0
     active = status.get("active_s") or 0
     entry["note"] = f"{state} on {entry['worker']} (elapsed {elapsed:.0f}s, active {active:.0f}s)"
-    save_entry(entry)
+    _save(entry)
     return [f"{job_id}: {entry['note']}"]
 
 
@@ -810,7 +949,8 @@ def finish(entry: dict, status: dict, worker_map: dict[str, Worker]) -> list[str
         note=f"{state} (exit {status.get('exit_code')})",
         paused_since=None,
     )
-    save_entry(entry)
+    if not _save(entry):
+        return [f"{job_id}: {state} on {worker_name}, but it was cancelled meanwhile; left cancelled"]
     events.append(
         "finished",
         job=job_id,
@@ -891,6 +1031,15 @@ def settle_orphan(entry: dict, worker: Worker) -> list[str]:
         events.append("orphan", job=job_id, worker=worker.name, outcome="stale", state=state, attempt=attempt)
         return [f"{job_id}: ignored stale orphan result on {worker.name}"]
 
+    # The ssh calls above give `orchard cancel` time to change the job, so
+    # adopt-or-keep is decided against what is on disk now.
+    try:
+        disk = json.loads(entry_path(job_id).read_text())
+    except (OSError, json.JSONDecodeError):
+        disk = None
+    if disk is not None:
+        entry.clear()
+        entry.update(disk)
     sdir, cwd = Path(entry["sdir"]), Path(entry["cwd"])
     rerun = entry.get("state")
     local_rerun = entry.get("worker") == "local" and rerun in ("queued", "running")
@@ -900,7 +1049,8 @@ def settle_orphan(entry: dict, worker: Worker) -> list[str]:
         ran_again = rerun not in ("queued", "cancelled")
     else:
         ran_again = entry.get("attempts", 0) > expected
-    if state == "succeeded" and local_rerun:
+    # A preempted run's exit is the preemption ending, even a clean one.
+    if state == "succeeded" and local_rerun and not orphan.get("preempted"):
         if rerun == "running":
             _stop_local_rerun(entry, sdir)
         engine.collect_remote(worker, job_id, rjob, sdir, cwd)
@@ -917,6 +1067,16 @@ def settle_orphan(entry: dict, worker: Worker) -> list[str]:
             paused_since=None,
             note=f"succeeded on {worker.name} while out of contact (exit {status.get('exit_code')}); {stopped}",
         ):
+            events.append(
+                "orphan",
+                job=job_id,
+                worker=worker.name,
+                outcome="collected",
+                state=state,
+                attempt=attempt,
+                rerun=rerun,
+                duplicate=ran_again,
+            )
             return [f"{job_id}: orphan succeeded on {worker.name}; collected, job left {entry.get('state')}"]
         events.append(
             "finished",
@@ -982,9 +1142,18 @@ def _save_orphan(entry: dict, suffix: str | None, **changes) -> bool:
 
 def _stop_local_rerun(entry: dict, sdir: Path) -> None:
     """Stop a running local rerun and move its log and status to sdir/rerun."""
-    pid = entry.get("local_pid")
+    _stop_local(entry.get("local_pid"), sdir)
+    keep = sdir / "rerun"
+    keep.mkdir(parents=True, exist_ok=True)
+    for name in ("log.txt", "status.json"):
+        if (sdir / name).exists():
+            (sdir / name).replace(keep / name)
+
+
+def _stop_local(pid: int | None, sdir: Path) -> None:
+    """Stop the local run started from sdir: its process group, then its agent."""
     deadline = time.time() + 10
-    # A rerun launched this tick may not have written its pgid yet.
+    # A run launched this tick may not have written its pgid yet.
     while True:
         pgid = (engine.local_status(sdir) or {}).get("pgid")
         if pgid:
@@ -1000,11 +1169,6 @@ def _stop_local_rerun(entry: dict, sdir: Path) -> None:
             os.kill(int(pid), signal.SIGKILL)
         except OSError:
             pass
-    keep = sdir / "rerun"
-    keep.mkdir(parents=True, exist_ok=True)
-    for name in ("log.txt", "status.json"):
-        if (sdir / name).exists():
-            (sdir / name).replace(keep / name)
 
 
 def track_paused(entry: dict, status: dict, worker_map: dict[str, Worker], cfg: dict) -> list[str]:
@@ -1014,24 +1178,44 @@ def track_paused(entry: dict, status: dict, worker_map: dict[str, Worker], cfg: 
     reason = status.get("pause_reason") or "unknown"
     if time.time() - paused_since > cfg["kill_paused_after_s"]:
         worker_name = entry["worker"]
-        if worker_name != "local":
-            worker = worker_map.get(worker_name)
-            if worker is not None and engine.kill_remote(worker, engine.remote_job_dir(entry["rhome"], job_id)) is None:
+        worker = worker_map.get(worker_name) if worker_name != "local" else None
+        if worker is not None:
+            # Recorded before the kill, so that if its reply is lost, the run's
+            # final status still reads as this preemption (finish_or_track).
+            entry["preempting_attempt"] = entry.get("attempts", 0)
+            if not _save(entry):
+                return [f"{job_id}: cancelled meanwhile; left cancelled"]
+            if engine.kill_remote(worker, engine.remote_job_dir(entry["rhome"], job_id)) is None:
                 # Requeued now, the job could fall back to local while the paused
                 # run waits on the worker, untracked, to resume. Ask again next poll.
                 entry["note"] = f"paused: {reason}; could not reach {worker_name} to preempt; retrying"
-                save_entry(entry)
+                _save(entry)
                 return [f"{job_id}: could not reach {worker_name} to preempt; retrying"]
-        entry.update(
-            state="queued",
-            paused_since=None,
-            misses=0,
-            preempted_attempt=entry.get("attempts", 0),
-            note="preempted after long pause; resumes from checkpoint",
-        )
-        save_entry(entry)
-        events.append("requeued", job=job_id, worker=worker_name, detail="preempted after long pause")
-        return [f"{job_id}: preempted after {cfg['kill_paused_after_s']}s paused; requeued"]
+        return _requeue_preempted(entry, f"preempted after {cfg['kill_paused_after_s']}s paused")
     entry["note"] = f"paused: {reason}"
-    save_entry(entry)
+    _save(entry)
     return [f"{job_id}: paused ({reason})"]
+
+
+def _requeue_preempted(entry: dict, line: str) -> list[str]:
+    """Requeue a job whose run was preempted; the next attempt resumes from its checkpoint.
+
+    start_queued waits for the stopped run to end before launching it, and
+    preemptions don't count toward max_attempts.
+    """
+    job_id = entry["id"]
+    entry.update(
+        state="queued",
+        paused_since=None,
+        misses=0,
+        preempting_attempt=None,
+        preempted_attempt=entry.get("attempts", 0),
+        preempt_sent_at=time.time(),
+        terminate_sent_at=None,
+        preemptions=entry.get("preemptions", 0) + 1,
+        note="preempted after long pause; resumes from checkpoint",
+    )
+    if not _save(entry):
+        return [f"{job_id}: cancelled meanwhile; left cancelled"]
+    events.append("requeued", job=job_id, worker=entry["worker"], detail="preempted after long pause")
+    return [f"{job_id}: {line}; requeued"]

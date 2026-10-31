@@ -278,8 +278,10 @@ def launch_remote(
     payload = agent_job_payload(job, job_id, rjob, rwork, venv, preempt=True, attempt=attempt)
     transport.push_bytes(worker, f"{rjob}/job.json", json.dumps(payload, indent=2).encode())
 
+    # An earlier attempt's status.json goes first, so a poll before the new
+    # agent writes its own finds nothing rather than how the last one ended.
     start = (
-        f'cd "{rroot}" && nohup /usr/bin/python3 "{rroot}/bin/orchard-agent.py" exec "{rjob}/job.json" '
+        f'cd "{rroot}" && rm -f "{rjob}/status.json" && nohup /usr/bin/python3 "{rroot}/bin/orchard-agent.py" exec "{rjob}/job.json" '
         f'> "{rjob}/agent.out" 2>&1 & echo started'
     )
     transport.run_checked(worker, start, timeout=30)
@@ -440,11 +442,23 @@ def collect_remote(
 
 def kill_remote(worker: Worker, rjob: str) -> bool | None:
     """True once the agent has signalled the job, False when it answers that the
-    job isn't running, and None when ssh itself fails (a timeout, exit 255)."""
+    job isn't running, and None when ssh itself fails (a timeout, exit 255).
+
+    The job gets SIGTERM, and its agent sends SIGKILL if it is still running a
+    minute later."""
+    return _signal_remote(worker, rjob, "kill")
+
+
+def terminate_remote(worker: Worker, rjob: str) -> bool | None:
+    """Like kill_remote, with SIGKILL at once: for a job that outlived its kill."""
+    return _signal_remote(worker, rjob, "terminate")
+
+
+def _signal_remote(worker: Worker, rjob: str, verb: str) -> bool | None:
     rroot = rjob.rsplit("/jobs/", 1)[0]
     try:
         proc = transport.run(
-            worker, f'/usr/bin/python3 "{rroot}/bin/orchard-agent.py" kill "{rjob}"', timeout=30
+            worker, f'/usr/bin/python3 "{rroot}/bin/orchard-agent.py" {verb} "{rjob}"', timeout=30
         )
     except subprocess.TimeoutExpired:
         return None
@@ -472,6 +486,8 @@ def launch_local(
     job: JobSpec, job_id: str, sdir: Path, cwd: Path, attempt: int = 1
 ) -> tuple[Path | None, int]:
     venv, job_json = prepare_local_job(job, job_id, sdir, cwd, attempt)
+    # A rerun in the same folder must not be judged by the last run's status.
+    (sdir / "status.json").unlink(missing_ok=True)
     proc = subprocess.Popen(
         [sys.executable, str(Path(agent.__file__)), "exec", str(job_json)],
         stdout=subprocess.DEVNULL,

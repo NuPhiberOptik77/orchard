@@ -470,31 +470,30 @@ def cancel(job: str = typer.Argument(..., help="job id or unique prefix")) -> No
         print(f"{entry['id']} is already {state}")
         raise typer.Exit(0)
 
-    if state == "running" and entry.get("worker") == "local":
-        status = engine.local_status(Path(entry["sdir"])) or {}
-        pgid = status.get("pgid")
-        if pgid:
-            try:
-                agent._terminate_group(pgid, grace=5.0)
-            except Exception as exc:
-                print(f"warning: could not kill local process group: {exc}", file=sys.stderr)
-    elif state == "running":
-        worker = next((w for w in load_workers() if w.name == entry.get("worker")), None)
-        rjob = engine.remote_job_dir(entry["rhome"], entry["id"]) if entry.get("rhome") else None
-        killed = False
-        if worker is not None and rjob:
-            try:
-                killed = engine.kill_remote(worker, rjob)
-            except Exception:
-                killed = False
-        if not killed and worker is not None and rjob:
-            entry["orphan"] = {
-                "worker": worker.name,
-                "rjob": rjob,
-                "rhome": entry.get("rhome"),
-                "attempt": entry.get("attempts"),
-            }
-            print("warning: could not kill remote job now; dispatcher will retry")
+    # A dispatch tick can start the job while this runs (dispatch --watch holds
+    # the tick lock for life, so cancel cannot take it). Re-read after acting
+    # and act again on whatever the tick started.
+    orphan = None
+    for _ in range(3):
+        orphan = _stop_for_cancel(entry, state) or orphan
+        try:
+            fresh = json.loads(dispatcher.entry_path(entry["id"]).read_text())
+        except (OSError, json.JSONDecodeError):
+            break
+        seen = (state, entry.get("worker"), entry.get("attempts"))
+        if (fresh.get("state"), fresh.get("worker"), fresh.get("attempts")) == seen:
+            break
+        entry, state = fresh, fresh.get("state")
+        if state in ("done", "failed", "cancelled"):
+            if orphan and not entry.get("orphan"):
+                entry["orphan"] = orphan
+                dispatcher.save_entry(entry)
+                print("warning: could not kill remote job now; dispatcher will retry")
+            print(f"{entry['id']} is already {state}")
+            raise typer.Exit(0)
+    if orphan and not entry.get("orphan"):
+        entry["orphan"] = orphan
+        print("warning: could not kill remote job now; dispatcher will retry")
 
     entry.update(
         state="cancelled",
@@ -506,6 +505,46 @@ def cancel(job: str = typer.Argument(..., help="job id or unique prefix")) -> No
     dispatcher.save_entry(entry)
     events.append("cancelled", job=entry["id"], worker=entry.get("worker"), detail=f"was {state}")
     print(f"cancelled: {entry['id']} (was {state})")
+
+
+def _stop_for_cancel(entry: dict, state: str | None) -> dict | None:
+    """Stop the entry's run; return an orphan record if a remote run could not be
+    stopped now, so the dispatcher retries the kill."""
+    if state == "running" and entry.get("worker") == "local":
+        status = engine.local_status(Path(entry["sdir"])) or {}
+        pgid = status.get("pgid")
+        if pgid:
+            try:
+                agent._terminate_group(pgid, grace=5.0)
+            except Exception as exc:
+                print(f"warning: could not kill local process group: {exc}", file=sys.stderr)
+        return None
+    if state == "running":
+        attempt, preempted = entry.get("attempts"), False
+    elif (
+        state == "queued"
+        and entry.get("preempted_attempt") is not None
+        and entry.get("worker") != "local"
+    ):
+        # Requeued after a preempt whose kill may not have landed: that run can
+        # still be going on the worker.
+        attempt, preempted = entry["preempted_attempt"], True
+    else:
+        return None
+    worker = next((w for w in load_workers() if w.name == entry.get("worker")), None)
+    rjob = engine.remote_job_dir(entry["rhome"], entry["id"]) if entry.get("rhome") else None
+    if worker is None or not rjob:
+        return None
+    try:
+        killed = engine.kill_remote(worker, rjob)
+    except Exception:
+        killed = False
+    if killed:
+        return None
+    orphan = {"worker": worker.name, "rjob": rjob, "rhome": entry.get("rhome"), "attempt": attempt}
+    if preempted:
+        orphan["preempted"] = True
+    return orphan
 
 
 def _fmt_dur(seconds: float) -> str:

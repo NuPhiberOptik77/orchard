@@ -51,13 +51,18 @@ Two tasks run it, and both run as you:
 While nobody is signed in, the startup task counts the PC as idle from the
 moment it saw that, so jobs start about three minutes after a restart or after
 the last person signs out. Those samples say `"source":"windows-signed-out"`.
+Windows 11 usually signs you back in by itself after any restart and locks
+the screen, while "Use my sign-in info to automatically finish setting up"
+is on in Sign-in options. You'll then see `"source":"windows"` instead, which
+is fine. The signed-out path only runs with that setting off, and it hasn't
+been tested on real hardware yet.
 When someone signs in, it marks the PC in use once, then passes on what the
 sign-in task reports. If that is missing or more than 30 s old, it writes
 nothing and the file goes stale. If it can't tell whether anyone is signed in,
 it assumes someone is.
 
-So a restart, such as a Windows update overnight, doesn't take the worker
-offline until you next sign in.
+Either way, a restart, such as a Windows update overnight, doesn't take the
+worker offline until you next sign in.
 
 ## Setup
 
@@ -222,9 +227,9 @@ and, before signing in, run on the controller:
 ssh <alias> 'cat ~/.orchard/host-status.json; echo; date +%s'
 ```
 
-It should say `"source":"windows-signed-out"`, with a `ts` no more than about
-20 s behind the number on the last line. `"source":"windows"` before you've
-signed in means Windows signed you in by itself (it can after an update):
+It should show a `ts` no more than about 20 s behind the number on the last
+line. The source is `"windows"` if Windows signed you back in by itself (see
+above), or `"windows-signed-out"` if it didn't. To try the signed-out path,
 sign out from the Start menu and check again. If ssh can't connect after a restart
 with nobody signed in, the startup task didn't start WSL: sign in and go back
 over step 8. ssh working with a missing file or an old `ts` means the writer

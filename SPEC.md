@@ -280,6 +280,30 @@ job was launched again after the orphan's attempt. Contact loss can't be told ap
 the rerun, so a job whose side effects must not repeat should key them on
 `ORCHARD_JOB_ID` and check `ORCHARD_ATTEMPT`.
 
+Preempted runs: a run paused past `kill_paused_after_s` is sent `kill`, which
+sends SIGTERM and leaves `kill-requested` in the job folder. From then on its agent
+doesn't pause it again, and SIGKILLs it if it is still running `KILL_GRACE_S` (60 s)
+later. The entry is requeued with `preempted_attempt`, and before starting it again
+the dispatcher asks whether that run is still alive. While it is, the job waits on
+that worker instead of starting a second copy, and once `kill_grace_s` (default 120)
+has passed the dispatcher sends `terminate` (SIGKILL at once). A worker that can't
+be reached is a hold like any other, so after `fallback_after_s` the job reruns on
+the Air and the old run becomes an orphan marked `preempted`: it is killed once the
+worker answers, and its output is collected beside the rerun, never adopted. A kill
+whose reply was lost shows up as the run's final status under the attempt being
+preempted; the job is requeued, not settled from it. A status from any other
+attempt is fenced off: an earlier attempt's counts as a missed poll, a later one's
+is recorded. Preemptions don't count toward `max_attempts`. Each launch deletes the
+last attempt's `status.json` first, so an early poll finds no status instead of how
+that attempt ended.
+
+Cancel during a start: when a cancel lands while the dispatcher is starting or
+adopting a job, the dispatcher stops what it started, locally or on the worker
+(leaving an orphan if the kill can't be sent yet). `orchard cancel` re-reads the
+entry after acting and acts again if a tick started the job meanwhile, and it also
+kills a requeued preempted run that may still be going. Any other orphan outcome
+leaves the cancel in place.
+
 Local liveness: local jobs record the agent's pid; if the status file still says
 running but the process is gone (e.g. the Air shut down mid-job), the dispatcher
 marks the entry failed instead of tracking it forever.
@@ -290,10 +314,10 @@ marks the entry failed instead of tracking it forever.
 |---|---|---|
 | Suspend when user active | yes; "in use" = input in last 3 min | BOINC default |
 | Suspend on battery | yes | BOINC default |
-| Suspend when non-orchard CPU > 25% | **off by default** (opt-in: `policy.json` → `max_other_cpu_pct`) | BOINC default available but noisy: `ps` CPU is a lifetime average, so young processes read high on macOS and Linux. The agent's own process group and the job's don't count; with no `ps` the reading is unknown and the limit is ignored |
+| Suspend when non-orchard CPU > 25% | **off by default** (opt-in: `policy.json` → `max_other_cpu_pct`) | BOINC default available but noisy: macOS `ps` CPU is a decaying recent average and Linux's is each process's lifetime average, so a young process reads high on Linux. The dispatcher's own polls (`sshd`, `sshd-session`) add a few percent on any worker. The agent's own process group and the job's don't count; with no `ps` the reading is unknown and the limit is ignored |
 | Thermal preemption | pause below limit 50, resume at 60 (hysteresis); macOS only | `pmset -g therm` |
 | Short suspends | SIGSTOP in place (instant resume) | BOINC "leave tasks in memory" |
-| Long suspends (>30 min) | dispatcher kills and requeues; resumes from checkpoint | BOINC unload model |
+| Long suspends (>30 min) | dispatcher kills (SIGTERM, then SIGKILL after 60 s) and requeues; resumes from checkpoint; doesn't count toward `max_attempts` | BOINC unload model |
 | Job process class | full speed; `caffeinate -is -w <pid>` beside the job (outside its group, so a job's `kill 0` can't end it). `background_qos: true` opts into nice 10 + `taskpolicy -b` | measured 2.4x slower wrapped on the Pro; preemption already protects the user |
 | Low battery | pause below 20% even on (weak) AC | 2026-10-19 incident: 8 W charger drained the Pro under load |
 
@@ -333,7 +357,10 @@ as "user active, power unknown", which holds new jobs and pauses running ones, a
 ### Service level objectives (what "works" means)
 
 - **No duplicate execution**: a job's process group is never run twice — fencing check
-  before every launch + adoption on restart (v0.6.2).
+  before every launch + adoption on restart (v0.6.2). A preempted run that may still be alive holds
+  its job on that worker. The exceptions are fallbacks from a worker that stopped
+  answering (§5): the old run is killed once the worker answers again, and its output
+  is kept apart from the rerun's.
 - **No job loss**: every submitted job reaches a terminal state (done/failed/cancelled)
   with a note, even across dispatcher restarts.
 - **Fallback bound**: when the worker is unavailable/reserved, an eligible queued job
@@ -426,6 +453,25 @@ Resolved in M3.5: worker app = read-only status + pause/resume toggle, no policy
 editor; it builds fine with CLT-only Swift 6.0.3 (~2 min first build). Launch-at-login
 = `SMAppService.mainApp` toggles in both apps + an auto-dispatch toggle in the
 controller app (no launchd LaunchAgent needed).
+
+### Known gaps
+
+- `kill_remote` reads every agent exit code other than 0 and 255 as "not running",
+  including a missing `python3` (127). Only 1 means that.
+- A process that leaves the job's group (`setsid`) counts as other CPU, and the
+  job's kill doesn't reach it.
+- macOS has no process start time to check, so the pid fence there rests on
+  `boot_id` alone.
+- The two SIGSTOPs of a pause are 50 ms apart. A process forked in that gap on macOS
+  can run on unpaused.
+- A run that no signal ends (uninterruptible sleep) holds its job on that worker
+  with no fallback; the dispatcher keeps sending `terminate`.
+- A preempted run that resumes by itself after its kill reply was lost, and then
+  finishes, is still requeued and reruns from its checkpoint.
+- A cancel saved in the instant between a tick's last re-read of the entry and its
+  write can still be overwritten.
+- A worker that keeps returning another attempt's status counts those polls as
+  misses, so the job ends in a lost-contact fallback after `max_misses`.
 
 ## 12. Dev notes
 

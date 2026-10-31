@@ -7,6 +7,7 @@ import pytest
 
 from orchard import engine
 from orchard.config import Worker
+from orchard.job import JobSpec
 
 
 def git_available():
@@ -235,3 +236,58 @@ def test_kill_remote_tells_a_failed_ssh_from_a_no(monkeypatch):
 
 def test_remote_job_dir():
     assert engine.remote_job_dir("/Users/x", "abc-1") == "/Users/x/.orchard/jobs/abc-1"
+
+
+def test_terminate_remote_sends_terminate(monkeypatch):
+    class Proc:
+        def __init__(self, code):
+            self.returncode, self.stdout, self.stderr = code, b"", b""
+
+    def timeout(*a, **k):
+        raise subprocess.TimeoutExpired("ssh", 30)
+
+    worker = Worker(name="pro", host="10.0.0.9")
+    sent = []
+    for code, want in ((0, True), (1, False), (255, None)):
+        monkeypatch.setattr(engine.transport, "run", lambda w, cmd, c=code, **k: sent.append(cmd) or Proc(c))
+        assert engine.terminate_remote(worker, "/Users/x/.orchard/jobs/j1") is want
+    assert sent[0] == '/usr/bin/python3 "/Users/x/.orchard/bin/orchard-agent.py" terminate "/Users/x/.orchard/jobs/j1"'
+    monkeypatch.setattr(engine.transport, "run", timeout)
+    assert engine.terminate_remote(worker, "/Users/x/.orchard/jobs/j1") is None
+
+
+def test_launch_remote_drops_the_last_attempts_status_first(monkeypatch, tmp_path):
+    # A poll before the new agent writes its own status must find none, not
+    # how the earlier attempt ended.
+    class Proc:
+        returncode, stdout, stderr = 0, b"", b""
+
+    cmds = []
+    monkeypatch.setattr(engine, "check_shipping_size", lambda cwd, kind: None)
+    monkeypatch.setattr(engine, "_tar_into", lambda fh, cwd, tracked_only: 0)
+    monkeypatch.setattr(engine.store, "add_blob_file", lambda path: "ab" * 32)
+    monkeypatch.setattr(engine.env, "ensure_agent_uploaded", lambda w: None)
+    monkeypatch.setattr(engine.transport, "run", lambda w, cmd, **k: Proc())
+    monkeypatch.setattr(engine.transport, "run_checked", lambda w, cmd, **k: cmds.append(cmd))
+    monkeypatch.setattr(engine.transport, "push_bytes", lambda *a, **k: None)
+    job = JobSpec(name="demo", cmd=["true"], kind="build")
+    engine.launch_remote(Worker(name="pro", host="10.0.0.9"), job, "j1", tmp_path, tmp_path,
+                         rhome="/Users/x", attempt=2)
+    start = cmds[-1]
+    drop = 'rm -f "/Users/x/.orchard/jobs/j1/status.json"'
+    assert drop in start
+    assert start.index(drop) < start.index("nohup")
+
+
+def test_launch_local_drops_the_last_runs_status_first(monkeypatch, tmp_path):
+    class Proc:
+        pid = 4321
+
+    (tmp_path / "status.json").write_text('{"state": "failed"}')
+    seen = []
+    monkeypatch.setattr(engine, "prepare_local_job",
+                        lambda job, job_id, sdir, cwd, attempt: (None, sdir / "job.json"))
+    monkeypatch.setattr(engine.subprocess, "Popen",
+                        lambda *a, **k: seen.append((tmp_path / "status.json").exists()) or Proc())
+    assert engine.launch_local(JobSpec(name="demo", cmd=["true"]), "j1", tmp_path, tmp_path) == (None, 4321)
+    assert seen == [False]

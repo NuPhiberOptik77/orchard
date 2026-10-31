@@ -884,7 +884,10 @@ def test_terminate_wakes_a_paused_group(tmp_path):
             "def bye(*a):\n    pathlib.Path(%r).write_text('x'); sys.exit(0)\n"
             "signal.signal(signal.SIGTERM, bye)\n"
             "print('ready', flush=True)\n"
-            "time.sleep(30)\n" % str(flag))
+            "for _ in range(600):\n    time.sleep(0.05)\n" % str(flag))
+    # Short sleeps: a signal caught just before a sleep starts only reaches the
+    # Python handler when that sleep ends, and stopping the child right after
+    # "ready" can land in that window (seen under x86_64 emulation).
     proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, start_new_session=True)
     try:
         assert proc.stdout.readline().strip() == b"ready"
@@ -1307,3 +1310,151 @@ def test_select_garbage_protects_running_jobs():
 def test_select_garbage_nothing_when_plenty_free():
     entries = [garbage("recent", 1, 0.1)]
     assert agent.select_garbage(entries, 1e9, 14, 3, 50) == []
+
+
+def test_zombie_main_thread_with_live_threads_is_live(monkeypatch):
+    # After pthread_exit in the main thread, /proc/<pid>/stat reads Z while
+    # the process's other threads run on.
+    tasks = {10: {"10": "Z", "13": "S"}, 11: {"11": "Z"}}
+    groups = {10: 10, 11: 20}
+    monkeypatch.setattr(agent, "os_family", lambda: "linux")
+
+    def listdir(path):
+        parts = path.split("/")
+        if path == "/proc":
+            return ["10", "11", "self"]
+        if len(parts) == 4 and parts[3] == "task":
+            return list(tasks[int(parts[2])])
+        raise OSError(path)
+
+    def read_text(path):
+        parts = path.split("/")
+        pid = int(parts[2])
+        state = tasks[pid][parts[4] if len(parts) > 4 else parts[2]]
+        return "%s (a) b) %s 1 %s 0 0" % (pid, state, groups[pid])
+
+    monkeypatch.setattr(agent.os, "listdir", listdir)
+    monkeypatch.setattr(agent, "_read_text", read_text)
+    assert agent._group_has_live_member(10) is True
+    assert agent._group_has_live_member(20) is False
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux lists a thread group's threads in /proc")
+def test_terminate_kills_a_group_whose_main_thread_has_exited():
+    code = ("import ctypes, signal, threading, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "threading.Thread(target=lambda: [time.sleep(0.1) for _ in iter(int, 1)]).start()\n"
+            "ctypes.CDLL(None).pthread_exit(None)\n")
+    proc = subprocess.Popen([sys.executable, "-c", code], start_new_session=True)
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            stat = Path("/proc/%d/stat" % proc.pid).read_text()
+            if stat.rsplit(")", 1)[1].split()[0] == "Z":
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("main thread never exited")
+        assert agent._group_has_live_member(proc.pid) is True
+        agent._terminate_group(proc.pid, grace=1)
+        assert proc.wait(timeout=10) == -signal.SIGKILL
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+
+
+def test_terminate_kills_a_group_that_ignores_sigterm():
+    code = ("import signal, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "print('ready', flush=True)\n"
+            "time.sleep(30)\n")
+    proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, start_new_session=True)
+    try:
+        assert proc.stdout.readline().strip() == b"ready"
+        agent._terminate_group(proc.pid, grace=0.5)
+        assert proc.wait(timeout=10) == -signal.SIGKILL
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_pause_lets_a_job_asked_to_end_run_again(monkeypatch, tmp_path):
+    # A kill landing between the two SIGSTOPs would leave the job frozen in
+    # its SIGTERM handler.
+    (tmp_path / "kill-requested").write_text("1")
+    sent = []
+    monkeypatch.setattr(agent.os, "killpg", lambda pgid, sig: sent.append(sig))
+    agent._stop_group(10, 10, str(tmp_path / "command.pid"))
+    assert sent == [signal.SIGSTOP, signal.SIGSTOP, signal.SIGCONT]
+
+
+TERM_IGNORING = ("import signal, time\n"
+                 "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                 "print('ready', flush=True)\n"
+                 "while True: time.sleep(0.1)\n")
+
+
+def _exec_job(tmp_path, timeout_s, kill_grace=None):
+    job_dir = tmp_path / "job"
+    work = tmp_path / "work"
+    job_dir.mkdir()
+    work.mkdir()
+    job = {"id": "k", "attempt": 1, "cmd": [sys.executable, "-c", TERM_IGNORING], "venv": None,
+           "workdir": str(work), "job_dir": str(job_dir), "timeout_s": timeout_s, "preempt": False, "env": {}}
+    (job_dir / "job.json").write_text(json.dumps(job))
+    env = dict(os.environ, HOME=str(tmp_path))
+    if kill_grace is None:
+        argv = [sys.executable, agent.__file__, "exec", str(job_dir / "job.json")]
+    else:
+        boot = ("import importlib.util, sys\n"
+                "spec = importlib.util.spec_from_file_location('orchard_agent', %r)\n"
+                "mod = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(mod)\n"
+                "mod.KILL_GRACE_S = %r\n"
+                "sys.exit(mod.main(['exec', %r]))\n" % (agent.__file__, kill_grace, str(job_dir / "job.json")))
+        argv = [sys.executable, "-c", boot]
+    return job_dir, env, subprocess.Popen(argv, env=env, start_new_session=True)
+
+
+def _leftovers(job_dir):
+    status = json.loads((job_dir / "status.json").read_text()) if (job_dir / "status.json").exists() else {}
+    if status.get("pgid"):
+        try:
+            os.killpg(status["pgid"], signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def test_timeout_kills_a_job_that_ignores_sigterm(tmp_path):
+    job_dir, env, proc = _exec_job(tmp_path, timeout_s=2)
+    try:
+        proc.wait(timeout=40)
+        assert json.loads((job_dir / "status.json").read_text())["state"] == "timed_out"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        _leftovers(job_dir)
+
+
+def test_kill_ends_a_job_that_ignores_sigterm(tmp_path):
+    job_dir, env, proc = _exec_job(tmp_path, timeout_s=60, kill_grace=1)
+    try:
+        log = job_dir / "log.txt"
+        deadline = time.time() + 20
+        while time.time() < deadline and not (log.exists() and "ready" in log.read_text()):
+            time.sleep(0.1)
+        assert "ready" in log.read_text()
+        subprocess.run([sys.executable, agent.__file__, "kill", str(job_dir)], env=env, check=True)
+        proc.wait(timeout=15)
+        text = log.read_text()
+        assert "asked to end" in text
+        assert "after it was asked to end; killing" in text
+        assert json.loads((job_dir / "status.json").read_text())["state"] != "running"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        _leftovers(job_dir)
