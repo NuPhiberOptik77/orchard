@@ -1122,8 +1122,9 @@ def cmd_signal(argv, sig, label, cont_first=False):
     # the worker doesn't read as free while a command shrugs off SIGTERM.
     pgid = status.get("pgid") or pid
     if sig in (signal.SIGTERM, signal.SIGKILL):
-        # A group that is gone needs no request (its run ended by itself), and
-        # a request that can't be written must not keep the dispatcher asking.
+        # A group that is gone needs no new request (a kill already on record
+        # stays), and an unwritable folder must not keep the dispatcher asking
+        # about a run that is over.
         if not _group_alive(pgid):
             clear_running_marker(os.path.basename(argv[0].rstrip("/")))
             print("process group not running", file=sys.stderr)

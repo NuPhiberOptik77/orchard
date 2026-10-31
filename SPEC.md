@@ -285,9 +285,10 @@ the rerun, so a job whose side effects must not repeat should key them on
 Preempted runs: a run paused past `kill_paused_after_s` is sent `kill`, which
 sends SIGTERM and leaves an empty `kill-requested` file in the job folder (one
 already there is kept). A group that is already gone gets neither, and the agent
-exits 1 as for any run that isn't running. An agent that can't create the file
-sends nothing and exits 3, which the dispatcher treats like a failed ssh and asks
-again. The run's final status says whether the file was there
+exits 1 as for any run that isn't running. On macOS a group isn't gone until its
+agent has reaped the wrap (under a second). An agent that can't create the file
+sends nothing and exits 3, which the dispatcher treats like a failed ssh
+and asks again. The run's final status says whether the file was there
 (`kill_requested`), so a run that ended by itself can be told from one the kill
 ended; a run started by an agent too old to keep track (no `kill_marker` in its
 status) says nothing and is taken to have been reached. From then on its agent
@@ -477,8 +478,8 @@ controller app (no launchd LaunchAgent needed).
 
 ### Known gaps
 
-- `kill_remote` reads every agent exit code other than 0 and 255 as "not running",
-  including a missing `python3` (127). Only 1 means that.
+- `kill_remote` reads every agent exit code other than 0, 3 and 255 as "not
+  running", including a missing `python3` (127). Only 1 means that.
 - A process that leaves the job's group (`setsid`) counts as other CPU, and the
   job's kill doesn't reach it.
 - macOS has no process start time to check, so the pid fence there rests on
