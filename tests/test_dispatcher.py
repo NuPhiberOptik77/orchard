@@ -1,9 +1,12 @@
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+import pytest
 
 from orchard import dispatcher, events
 from orchard.config import Worker
@@ -110,6 +113,7 @@ def test_lost_contact_requeues_locally(tmp_path, monkeypatch):
 def test_orphan_cancelled_when_worker_reachable(tmp_path, monkeypatch):
     monkeypatch.setattr(dispatcher, "QUEUE_DIR", tmp_path / "queue")
     monkeypatch.setattr(dispatcher.engine, "remote_status", lambda worker, rdir: None)
+    monkeypatch.setattr(dispatcher.engine, "remote_settle", lambda worker, rjob: False)
     monkeypatch.setattr(dispatcher.engine, "remote_caps", lambda worker: {"machine": "x86_64"})
     monkeypatch.setattr(dispatcher, "_local_fallback", lambda job: (True, ""))
     monkeypatch.setattr(dispatcher.engine, "launch_local", lambda *a, **k: (None, None))
@@ -129,11 +133,16 @@ def test_orphan_cancelled_when_worker_reachable(tmp_path, monkeypatch):
 ORPHAN = {"worker": "pro", "rjob": "/Users/x/.orchard/jobs/demo-o", "rhome": "/Users/x", "attempt": 1}
 
 
-def _orphaned(tmp_path, monkeypatch, remote, state, **fields):
-    """A job requeued locally after lost contact, whose worker now answers with `remote`."""
+def _orphaned(tmp_path, monkeypatch, remote, state, settled=False, **fields):
+    """A job requeued locally after lost contact, whose worker now answers with `remote`.
+
+    `settled` answers remote_settle: False is an agent too old to settle.
+    """
     monkeypatch.setattr(dispatcher, "QUEUE_DIR", tmp_path / "queue")
     monkeypatch.setattr(dispatcher.engine, "remote_caps", lambda worker: {"machine": "x86_64"})
     monkeypatch.setattr(dispatcher.engine, "remote_status", lambda worker, rjob: remote)
+    monkeypatch.setattr(dispatcher.engine, "remote_settle", lambda worker, rjob: settled)
+    monkeypatch.setattr(dispatcher.engine, "remote_status_missing", lambda worker, rjob: remote is None)
     kills = []
     monkeypatch.setattr(dispatcher.engine, "kill_remote", lambda w, rjob: kills.append(rjob) or True)
     collected = []
@@ -240,6 +249,37 @@ def test_orphan_from_other_attempt_ignored(tmp_path, monkeypatch):
     entry = dispatcher.load_entries()[0]
     assert entry["orphan"] is None
     assert "attempt 3, expected 1" in entry["note"]
+
+
+def test_orphan_that_ran_on_after_its_agent_died_is_adopted(tmp_path, monkeypatch):
+    # status.json still says running, but the job's exit record settles it:
+    # adopt the result instead of cancelling a finished run and running it twice.
+    running = {"state": "running", "attempt": 1}
+    done = {"state": "succeeded", "exit_code": 0, "attempt": 1}
+    sdir, _cwd, kills, collected = _orphaned(tmp_path, monkeypatch, running, "queued", settled=done, attempts=1)
+    monkeypatch.setattr(dispatcher, "start_queued", lambda *a, **k: [])
+    dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
+    assert kills == [] and collected == [(sdir, None)]
+    entry = dispatcher.load_entries()[0]
+    assert (entry["state"], entry["worker"], entry["orphan"]) == ("done", "pro", None)
+
+
+def test_orphan_left_for_next_pass_when_settle_gives_no_answer(tmp_path, monkeypatch):
+    running = {"state": "running", "attempt": 1}
+    _sdir, _cwd, kills, collected = _orphaned(tmp_path, monkeypatch, running, "done", settled=None)
+    lines = dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
+    assert any("no clear answer about the orphan" in line for line in lines)
+    assert (kills, collected) == ([], [])
+    assert dispatcher.load_entries()[0]["orphan"] == ORPHAN
+
+
+def test_orphan_without_status_cancelled_even_without_settle_answer(tmp_path, monkeypatch):
+    # No status.json will ever appear, so asking again would never end.
+    _sdir, _cwd, kills, _collected = _orphaned(tmp_path, monkeypatch, None, "done", settled=None)
+    lines = dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
+    assert any("cancelled orphaned remote job" in line for line in lines)
+    assert kills == [ORPHAN["rjob"]]
+    assert dispatcher.load_entries()[0]["orphan"] is None
 
 
 def test_orphan_of_cancelled_job_not_duplicate(tmp_path, monkeypatch):
@@ -380,10 +420,23 @@ def test_running_pid_reads_own_process(tmp_path, monkeypatch):
 
 def test_running_pid_rejects_reused_pid(tmp_path, monkeypatch):
     monkeypatch.setattr(dispatcher, "DISPATCH_PID", tmp_path / "dispatch.pid")
+    # A mocked line: the real one names a dispatcher whenever pytest is run
+    # on tests/test_dispatcher.py from a folder whose path says "orchard".
+    monkeypatch.setattr(dispatcher, "_proc_command", lambda pid: "python -m pytest -q")
     dispatcher.DISPATCH_PID.write_text(str(os.getpid()))
-    # the real command line of this pytest process is not a dispatcher
     assert dispatcher.running_pid() is None
     assert dispatcher.recorded_pid() == os.getpid()
+
+
+@pytest.mark.skipif(shutil.which("ps") is None, reason="needs ps")
+def test_proc_command_reads_the_real_command_line():
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        assert dispatcher._proc_command(proc.pid).split() == ["sleep", "30"]
+        assert not dispatcher._is_dispatcher(proc.pid)
+    finally:
+        proc.kill()
+        proc.wait()
 
 
 def test_running_pid_trusts_liveness_when_ps_fails(tmp_path, monkeypatch):
@@ -729,23 +782,26 @@ def test_stalled_run_that_just_finished_is_not_requeued(tmp_path, monkeypatch):
     running = {"state": "running", "attempt": 1, "elapsed_s": 40}
     done = {"state": "succeeded", "exit_code": 0, "attempt": 1}
     entry, asked = _stalled(tmp_path, monkeypatch, alive=False, statuses=[running] * 5 + [done])
-    monkeypatch.setattr(dispatcher, "finish_or_track", lambda entry, status, *a: [])
+    finished = []
+    monkeypatch.setattr(dispatcher, "finish_or_track", lambda entry, status, *a: finished.append(status) or [])
     _poll(entry, 5)
     assert asked == ["demo-s"] and entry["state"] == "running"
+    assert finished == [running] * 4 + [done]
+    assert not any(e["event"] == "requeued" for e in events.load())
 
 
 def test_stalled_run_that_ran_on_after_its_agent_died_is_collected(tmp_path, monkeypatch):
     # The agent died but the job ran to the end: its exit record settles the
     # status, so the job is collected, not run again over its out/.
+    # status.json keeps saying running, as when the agent could not rewrite
+    # it, so the settled status itself is collected.
     done = {"state": "succeeded", "exit_code": 0, "attempt": 1}
-    entry, asked = _stalled(tmp_path, monkeypatch, alive=False)
-    # status.json says running until settle rewrites it.
-    remote = {"status": {"state": "running", "attempt": 1, "elapsed_s": 40}}
-    monkeypatch.setattr(dispatcher.engine, "remote_status", lambda worker, rjob: remote["status"])
-    monkeypatch.setattr(dispatcher.engine, "remote_settle", lambda worker, rjob: remote.update(status=done) or done)
-    finished = []
-    monkeypatch.setattr(dispatcher, "finish_or_track", lambda entry, status, *a: finished.append(status) or [])
-    _poll(entry, 6)
-    assert asked == ["demo-s"] and entry["state"] == "running"
-    assert finished[-1] == done
+    entry, asked = _stalled(tmp_path, monkeypatch, alive=False, settled=done)
+    collected = []
+    monkeypatch.setattr(dispatcher.engine, "collect_remote", lambda *a, **k: collected.append(a[1]))
+    out = _poll(entry, 5)
+    assert asked == ["demo-s"] and collected == ["demo-s"]
+    assert (entry["state"], entry["stalled_polls"]) == ("done", 0)
+    assert out[-1] == ["demo-s: succeeded on pro"]
+    assert any(e["event"] == "finished" for e in events.load())
     assert not any(e["event"] == "requeued" for e in events.load())

@@ -670,13 +670,15 @@ def poll_running(entry: dict, worker_map: dict[str, Worker], cfg: dict) -> list[
 
     entry["misses"] = 0
     if status.get("state") in ("running", "paused"):
-        lost = _lost_run(entry, status, worker, rjob, cfg)
-        if lost:
+        lost = _lost_run(entry, status, worker, rjob, worker_map, cfg)
+        if lost is not None:
             return lost
     return finish_or_track(entry, status, worker_map, cfg)
 
 
-def _lost_run(entry: dict, status: dict, worker: Worker, rjob: str, cfg: dict) -> list[str] | None:
+def _lost_run(
+    entry: dict, status: dict, worker: Worker, rjob: str, worker_map: dict[str, Worker], cfg: dict
+) -> list[str] | None:
     """Requeue a job whose worker answers but whose agent died mid-run.
 
     The agent rewrites status.json every few seconds while a job runs, paused
@@ -701,16 +703,20 @@ def _lost_run(entry: dict, status: dict, worker: Worker, rjob: str, cfg: dict) -
         return None
     # It may have finished between the two reads, or run on to the end after
     # its agent died: then the job's own exit record settles its status, and
-    # the next poll collects it instead of running it twice. For an agent too
-    # old to settle, the plain status decides.
+    # it is collected now instead of running twice. The settled status is used
+    # as it comes back, because the agent may have failed to write it. For an
+    # agent too old to settle, the plain status decides.
     settled = engine.remote_settle(worker, rjob)
     if settled is None:
         # No clear answer, and requeueing would wipe an out/ it may still hold.
         entry["stalled_polls"] = 0
         return None
     status = settled if isinstance(settled, dict) else engine.remote_status(worker, rjob)
-    if status is None or status.get("state") not in ("running", "paused"):
+    if status is None:
         return None
+    if status.get("state") not in ("running", "paused"):
+        entry["stalled_polls"] = 0
+        return finish_or_track(entry, status, worker_map, cfg)
     entry.update(
         state="queued",
         misses=0,
@@ -807,7 +813,20 @@ def settle_orphan(entry: dict, worker: Worker) -> list[str]:
     job_id = entry["id"]
     orphan = entry["orphan"]
     rjob = orphan["rjob"]
-    status = engine.remote_status(worker, rjob) or {}
+    # A run that went on to the end after its agent died still reads "running";
+    # its own exit record settles it, so it is adopted instead of cancelled and
+    # run twice. An agent too old to settle answers False and the plain status
+    # decides. No clear answer leaves the orphan for the next pass, unless the
+    # job has no status at all, which no later pass will change.
+    settled = engine.remote_settle(worker, rjob)
+    if settled is None and not engine.remote_status_missing(worker, rjob):
+        return [f"{job_id}: no clear answer about the orphan on {worker.name}; asking again"]
+    if isinstance(settled, dict):
+        status = settled
+    elif settled is False:
+        status = engine.remote_status(worker, rjob) or {}
+    else:
+        status = {}
     state = status.get("state")
     expected = orphan.get("attempt")
     attempt = status.get("attempt", expected)

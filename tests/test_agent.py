@@ -1,8 +1,10 @@
+import errno
 import json
 import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -127,6 +129,109 @@ def test_exec_survives_eperm_on_pause(tmp_path, monkeypatch):
     assert json.loads((job_dir / "status.json").read_text())["state"] == "succeeded"
 
 
+def _preempted(tmp_path, monkeypatch, shell, actions, killpg_errors):
+    """Run shell as a preemptible job in-process.
+
+    `actions` answers each preemption decision in turn (the last one repeats).
+    `killpg_errors` maps a signal to how many killpg calls with it raise EPERM.
+    Returns cmd_exec's code, the final status and the signals killpg was sent.
+    """
+    monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(agent, "load_policy", lambda: dict(agent.DEFAULT_POLICY))
+    monkeypatch.setattr(agent, "sample_preemption_state", lambda policy, pgid: {})
+    answers = list(actions)
+    monkeypatch.setattr(agent, "decide_preemption",
+                        lambda sample, policy, paused: answers.pop(0) if len(answers) > 1 else answers[0])
+    real_killpg = os.killpg
+    sent = []
+
+    def killpg(pgid, sig):
+        sent.append(sig)
+        if killpg_errors.get(sig):
+            killpg_errors[sig] -= 1
+            raise PermissionError(1, "Operation not permitted")
+        real_killpg(pgid, sig)
+
+    monkeypatch.setattr(agent.os, "killpg", killpg)
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    job = {"id": "j1", "cmd": ["sh", "-c", shell], "venv": None, "workdir": str(tmp_path),
+           "job_dir": str(job_dir), "timeout_s": None, "preempt": True, "env": {}, "attempt": 1}
+    (job_dir / "job.json").write_text(json.dumps(job))
+    rc = agent.cmd_exec([str(job_dir / "job.json")])
+    return rc, json.loads((job_dir / "status.json").read_text()), sent
+
+
+def test_exec_survives_eperm_on_resume(tmp_path, monkeypatch):
+    rc, status, sent = _preempted(tmp_path, monkeypatch, "sleep 1", [("resume", "test")], {signal.SIGCONT: 1})
+    assert (rc, status["state"]) == (0, "succeeded")
+    assert sent.count(signal.SIGCONT) >= 2
+
+
+def test_job_killed_while_paused_ends_at_once(tmp_path, monkeypatch):
+    # The pause leaves `wrap` running, so a command SIGKILLed while paused is
+    # recorded at once instead of reading as paused until the job resumes.
+    # Then the agent continues what is left of the group, which may answer EPERM.
+    pid_file = tmp_path / "cmd.pid"
+
+    def kill_command():
+        deadline = time.time() + 10
+        while not pid_file.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        time.sleep(0.3)
+        os.kill(int(pid_file.read_text()), signal.SIGKILL)
+
+    killer = threading.Thread(target=kill_command, daemon=True)
+    killer.start()
+    started = time.time()
+    rc, status, sent = _preempted(tmp_path, monkeypatch, "echo $$ > cmd.pid; exec sleep 30",
+                                  [("pause", "test")], {signal.SIGCONT: 1})
+    killer.join()
+    assert time.time() - started < 5
+    assert (rc, status["state"], status["exit_code"]) == (1, "failed", -signal.SIGKILL)
+    assert sent == [signal.SIGSTOP, signal.SIGCONT]
+    ended = json.loads((tmp_path / "job" / "exit.json").read_text())
+    assert ended["exit_code"] == -signal.SIGKILL
+
+
+def test_exec_survives_a_failed_status_write(tmp_path, monkeypatch):
+    # A full disk while the job runs must not kill the agent: it would leave
+    # the job reading "running" forever.
+    monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
+    real_write = agent._atomic_write_json
+    writes = []
+
+    def write(path, data):
+        writes.append(data.get("state"))
+        # The first two writes (before and after the start) are not the loop's.
+        if len(writes) > 2 and data.get("state") == "running":
+            raise OSError(errno.ENOSPC, "No space left on device")
+        real_write(path, data)
+
+    monkeypatch.setattr(agent, "_atomic_write_json", write)
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    job = {"id": "j1", "cmd": ["sh", "-c", "sleep 1"], "venv": None, "workdir": str(tmp_path),
+           "job_dir": str(job_dir), "timeout_s": None, "preempt": False, "env": {}, "attempt": 1}
+    (job_dir / "job.json").write_text(json.dumps(job))
+    assert agent.cmd_exec([str(job_dir / "job.json")]) == 0
+    assert writes[2] == "running" and writes[-1] == "succeeded"
+    assert json.loads((job_dir / "status.json").read_text())["state"] == "succeeded"
+
+
+def test_call_command_passes_on_an_early_signal(tmp_path):
+    # A signal that reached `wrap` before the command started is sent on to
+    # it, so a stop request between the two is not lost.
+    started = time.time()
+    assert agent._call_command(["sleep", "30"], [signal.SIGTERM]) == -signal.SIGTERM
+    script = tmp_path / "run-me"
+    script.write_text("exec sleep 30\n")
+    script.chmod(0o755)
+    assert agent._call_command([str(script)], [signal.SIGTERM]) == -signal.SIGTERM
+    assert time.time() - started < 10
+    assert agent._call_command(["sh", "-c", "exit 3"], []) == 3
+
+
 def _settle_case(tmp_path, monkeypatch, status, ended):
     monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
     job_dir = tmp_path / "job"
@@ -163,7 +268,7 @@ def test_settle_leaves_runs_it_cannot_vouch_for(tmp_path, monkeypatch):
     assert agent.settle_status(str(job_dir))["state"] == "timed_out"
     # While the group is alive, the record can't be this run's last word.
     _settle_case(tmp_path, monkeypatch, running, {"exit_code": 0, "attempt": 2, "ended_at": 160.0})
-    proc = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
+    proc = subprocess.Popen(["/bin/sh", "-c", "exec sleep 30"], start_new_session=True)
     try:
         agent.write_running_marker("j1", proc.pid)
         assert agent.settle_status(str(job_dir))["state"] == "running"
@@ -228,7 +333,7 @@ def test_job_stopped_by_a_shutdown_is_not_settled(tmp_path):
 
 def test_running_marker_roundtrip(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
-    proc = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
+    proc = subprocess.Popen(["/bin/sh", "-c", "exec sleep 30"], start_new_session=True)
     try:
         agent.write_running_marker("job-1", proc.pid)
         assert agent.running_jobs() == ["job-1"]
@@ -258,7 +363,7 @@ def test_running_marker_ignores_garbage(tmp_path, monkeypatch):
 
 def test_running_marker_from_earlier_boot_is_stale(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
-    proc = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
+    proc = subprocess.Popen(["/bin/sh", "-c", "exec sleep 30"], start_new_session=True)
     try:
         monkeypatch.setattr(agent, "boot_id", lambda: "boot-a")
         agent.write_running_marker("job-3", proc.pid)
@@ -301,7 +406,7 @@ def test_gc_frees_runs_that_died_with_their_machine(tmp_path, monkeypatch):
     _job_with_status(home, "recent", "running", 3600)
     _job_with_status(home, "fresh", "running", 5)
     _job_with_status(home, "live", "paused", 3 * 86400)
-    proc = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
+    proc = subprocess.Popen(["/bin/sh", "-c", "exec sleep 30"], start_new_session=True)
     try:
         agent.write_running_marker("live", proc.pid)
         protected = {os.path.basename(e["path"]): e["protected"] for e in agent._gc_entries(time.time(), 2)}
@@ -315,7 +420,7 @@ def test_kill_skips_a_pid_from_an_earlier_boot(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
     job_dir = tmp_path / "home" / "jobs" / "job-k"
     job_dir.mkdir(parents=True)
-    proc = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
+    proc = subprocess.Popen(["/bin/sh", "-c", "exec sleep 30"], start_new_session=True)
     try:
         (job_dir / "pid").write_text(str(proc.pid))
         (job_dir / "status.json").write_text(json.dumps({"state": "running", "boot_id": "boot-a"}))
@@ -332,9 +437,77 @@ def test_kill_skips_a_pid_from_an_earlier_boot(tmp_path, monkeypatch):
             proc.wait()
 
 
+def test_kill_skips_a_reused_pid(tmp_path, monkeypatch):
+    # `wsl --terminate` keeps the boot id but hands pids out again.
+    monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
+    job_dir = tmp_path / "home" / "jobs" / "job-r"
+    job_dir.mkdir(parents=True)
+    proc = subprocess.Popen(["/bin/sh", "-c", "exec sleep 30"], start_new_session=True)
+    try:
+        (job_dir / "pid").write_text(str(proc.pid))
+        (job_dir / "status.json").write_text(json.dumps({"state": "running", "pid_start": 111}))
+        monkeypatch.setattr(agent, "process_start", lambda pid: 222)
+        assert agent.cmd_signal([str(job_dir)], signal.SIGTERM, "kill", cont_first=True) == 1
+        assert proc.poll() is None
+        # A start time it can't read (macOS) goes by the pid, as before.
+        monkeypatch.setattr(agent, "process_start", lambda pid: None)
+        assert agent.cmd_signal([str(job_dir)], signal.SIGTERM, "kill", cont_first=True) == 0
+        assert proc.wait(timeout=5) is not None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_running_marker_from_a_restarted_distro_is_stale(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
+    proc = subprocess.Popen(["/bin/sh", "-c", "exec sleep 30"], start_new_session=True)
+    try:
+        monkeypatch.setattr(agent, "process_start", lambda pid: 111)
+        agent.write_running_marker("job-5", proc.pid)
+        assert agent.running_jobs() == ["job-5"]
+        monkeypatch.setattr(agent, "process_start", lambda pid: None)
+        assert agent.running_jobs() == ["job-5"]
+        monkeypatch.setattr(agent, "process_start", lambda pid: 222)
+        assert agent.running_jobs() == []
+        assert not os.path.exists(agent._marker_path("job-5"))
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc")
+def test_process_start_reads_proc():
+    start = agent.process_start(os.getpid())
+    assert isinstance(start, int) and start == agent.process_start(os.getpid())
+    assert agent.process_start(1) != start
+
+
+def test_process_start_unknown_off_linux(monkeypatch):
+    monkeypatch.setattr(agent, "_read_text", lambda path: "")
+    assert agent.process_start(os.getpid()) is None
+
+
+def test_signal_survives_eperm(tmp_path, monkeypatch):
+    # macOS answers EPERM for a group of unreaped zombies: nothing to signal.
+    monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
+    job_dir = tmp_path / "home" / "jobs" / "job-e"
+    job_dir.mkdir(parents=True)
+    (job_dir / "pid").write_text(str(os.getpid()))
+    (job_dir / "status.json").write_text(json.dumps({"state": "running"}))
+    agent.write_running_marker("job-e", os.getpid())
+
+    def killpg(pgid, sig):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(agent.os, "killpg", killpg)
+    assert agent.cmd_signal([str(job_dir)], signal.SIGSTOP, "pause") == 1
+    assert not os.path.exists(agent._marker_path("job-e"))
+
+
 def test_cmd_running(capsys, tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
-    proc = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
+    proc = subprocess.Popen(["/bin/sh", "-c", "exec sleep 30"], start_new_session=True)
     try:
         agent.write_running_marker("job-9", proc.pid)
         assert agent.cmd_running([]) == 0
@@ -370,7 +543,7 @@ def test_parse_thermal_limit():
 
 def test_collect_caps_shape():
     caps = agent.collect_caps()
-    assert caps["machine"] in {"arm64", "x86_64"}
+    assert caps["machine"] in {"arm64", "x86_64", "aarch64"}
     assert caps["cores"] > 0
     assert caps["ram_gb"] > 0
     assert caps["disk_free_gb"] > 0
@@ -380,7 +553,7 @@ def test_collect_caps_shape():
 
 
 def test_capability_tags_include_platform():
-    tags = agent.capability_tags("14.5")
+    tags = agent.capability_tags("14.5", family="macos")
     assert agent.os.uname().machine in tags
     assert "macos14" in tags
     assert "os:macos" in tags

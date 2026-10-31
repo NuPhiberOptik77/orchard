@@ -65,13 +65,36 @@ def boot_id():
     return value or None
 
 
+def process_start(pid):
+    """When pid started, in clock ticks since the kernel booted, or None.
+
+    `wsl --terminate` restarts a distro without a new boot_id, and pids are
+    handed out again, so a pid alone can name another process afterwards.
+    Linux only; the field after the command name's last ")" is the 3rd, so
+    starttime, the 22nd, is the 20th after it.
+    """
+    try:
+        return int(_read_text("/proc/%d/stat" % int(pid)).rsplit(")", 1)[1].split()[19])
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+def _same_process(pid, started):
+    """False only when pid is known to have started at another time than `started`."""
+    if started is None:
+        return True
+    now = process_start(pid)
+    return now is None or now == started
+
+
 def write_running_marker(job_id, pgid):
     """Record that a job's process group is alive (best effort, atomic)."""
     try:
         os.makedirs(_running_dir(), exist_ok=True)
         tmp = _marker_path(job_id) + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({"job_id": job_id, "pgid": pgid, "started_at": time.time(), "boot_id": boot_id()}, f)
+            json.dump({"job_id": job_id, "pgid": pgid, "started_at": time.time(), "boot_id": boot_id(),
+                       "pid_start": process_start(pgid)}, f)
         os.replace(tmp, _marker_path(job_id))
     except OSError:
         pass
@@ -88,7 +111,8 @@ def running_jobs():
     """Job ids whose process groups are alive; stale markers are pruned.
 
     A marker from an earlier boot is stale even if its pgid is in use again:
-    after a restart that number can belong to an unrelated process.
+    after a restart that number can belong to an unrelated process. So is one
+    whose group leader started at another time (a WSL distro restarted).
     """
     try:
         names = os.listdir(_running_dir())
@@ -108,7 +132,7 @@ def running_jobs():
         pid = (data or {}).get("pgid")
         marker_boot = (data or {}).get("boot_id")
         same_boot = not (boot and marker_boot) or marker_boot == boot
-        if pid and same_boot and _group_alive(pid):
+        if pid and same_boot and _same_process(pid, data.get("pid_start")) and _group_alive(pid):
             alive.append(data.get("job_id") or name[:-5])
         else:
             try:
@@ -517,9 +541,6 @@ def _wrap(cmd, policy=None):
     if policy is None:
         policy = load_policy()
     parts = []
-    caffeinate = shutil.which("caffeinate")
-    if caffeinate:
-        parts += [caffeinate, "-is"]
     if policy.get("background_qos"):
         nice = shutil.which("nice") or "/usr/bin/nice"
         parts += [nice, "-n", "10"]
@@ -527,6 +548,37 @@ def _wrap(cmd, policy=None):
         if taskpolicy:
             parts += [taskpolicy, "-b"]
     return parts + list(cmd)
+
+
+def _keep_awake(pid):
+    """Keep a Mac from sleeping until pid exits (`caffeinate -is -w`).
+
+    It runs beside the job, not in its process group, so `wrap` leads the
+    group (see _stop_group) and a job's `kill 0` can't end it early.
+    """
+    caffeinate = shutil.which("caffeinate")
+    if not caffeinate:
+        return None
+    try:
+        return subprocess.Popen([caffeinate, "-is", "-w", str(pid)], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        return None
+
+
+def _stop_group(pgid, leader):
+    """Pause a job's process group, except its leader, `wrap`.
+
+    wrap only waits for the command, so letting it run costs nothing. A
+    command killed while paused (SIGKILL, the OOM killer) is then reaped and
+    recorded at once, and the job ends instead of reading as paused until it
+    resumes. Raises what killpg raises.
+    """
+    os.killpg(pgid, signal.SIGSTOP)
+    try:
+        os.kill(leader, signal.SIGCONT)
+    except OSError:
+        pass
 
 
 def _terminate_group(pgid, grace=10.0):
@@ -635,6 +687,7 @@ def cmd_exec(argv):
         _atomic_write_json(status_path, status)
         return 1
 
+    _keep_awake(proc.pid)
     pgid = os.getpgid(proc.pid)
     with open(pid_path, "w") as f:
         f.write(str(proc.pid))
@@ -642,6 +695,7 @@ def cmd_exec(argv):
     status["pid"] = proc.pid
     status["pgid"] = pgid
     status["boot_id"] = boot_id()
+    status["pid_start"] = process_start(proc.pid)
     _atomic_write_json(status_path, status)
 
     state = "succeeded"
@@ -677,7 +731,7 @@ def cmd_exec(argv):
                 # _terminate_group: the job has ended, so poll it again.
                 if action == "pause":
                     try:
-                        os.killpg(pgid, signal.SIGSTOP)
+                        _stop_group(pgid, proc.pid)
                     except (ProcessLookupError, PermissionError):
                         time.sleep(0.5)
                         continue
@@ -746,7 +800,7 @@ def cmd_wrap(argv):
         # exec. One ignored already (nohup) stays ignored for the command.
         if signal.getsignal(sig) != signal.SIG_IGN:
             signal.signal(sig, lambda signum, frame: got.append(signum))
-    rc = _call_command(cmd)
+    rc = _call_command(cmd, got)
     record = {"exit_code": rc, "attempt": int(attempt) if attempt.isdigit() else None, "ended_at": time.time()}
     if got:
         record["signal"] = got[0]
@@ -764,23 +818,30 @@ def cmd_wrap(argv):
     return rc
 
 
-def _call_command(cmd):
+def _call_command(cmd, got=()):
     """Run cmd and return its exit code, the shell's 127 or 126 if it can't start.
 
     A file with no #! line runs under /bin/sh, as caffeinate's execvp ran it
-    before every job went through `wrap`.
+    before every job went through `wrap`. A signal in `got` came before the
+    command could get it, so the command is sent the first one once started.
     """
     try:
         try:
-            return subprocess.call(cmd)
+            child = subprocess.Popen(cmd)
         except OSError as exc:
             path = cmd[0] if "/" in cmd[0] else shutil.which(cmd[0])
             if exc.errno != errno.ENOEXEC or not path:
                 raise
-            return subprocess.call(["/bin/sh", path] + cmd[1:])
+            child = subprocess.Popen(["/bin/sh", path] + cmd[1:])
     except OSError as exc:
         print("orchard: cannot run %s: %s" % (cmd[0], exc), file=sys.stderr)
         return 127 if exc.errno in (errno.ENOENT, errno.ENOTDIR) else 126
+    if got:
+        try:
+            child.send_signal(got[0])
+        except OSError:
+            pass
+    return child.wait()
 
 
 def settle_status(job_dir):
@@ -851,17 +912,25 @@ def cmd_signal(argv, sig, label, cont_first=False):
         print("no pid file in %s" % argv[0], file=sys.stderr)
         return 1
     # After a restart the pid can belong to an unrelated process.
-    started_boot = (read_status(argv[0]) or {}).get("boot_id")
+    status = read_status(argv[0]) or {}
+    started_boot = status.get("boot_id")
     boot = boot_id()
     if started_boot and boot and started_boot != boot:
         clear_running_marker(os.path.basename(argv[0].rstrip("/")))
         print("process group not running (the machine restarted)", file=sys.stderr)
         return 1
+    if not _same_process(pid, status.get("pid_start")):
+        clear_running_marker(os.path.basename(argv[0].rstrip("/")))
+        print("process group not running (its pid now belongs to another process)", file=sys.stderr)
+        return 1
     try:
         pgid = os.getpgid(pid)
         if cont_first:
             os.killpg(pgid, signal.SIGCONT)
-        os.killpg(pgid, sig)
+        if sig == signal.SIGSTOP:
+            _stop_group(pgid, pid)
+        else:
+            os.killpg(pgid, sig)
     except (ProcessLookupError, PermissionError):
         clear_running_marker(os.path.basename(argv[0].rstrip("/")))
         print("process group not running", file=sys.stderr)

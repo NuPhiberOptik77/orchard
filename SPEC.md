@@ -129,7 +129,8 @@ fallback; also written to status.json and the `finished` event),
 `ORCHARD_CKPT_DIR` (= `<job dir>/ckpt`, deliberately outside the staged workdir so
 re-staging never wipes it) and, when the checkpoint dir is non-empty at start,
 `ORCHARD_RESUME=1`. Jobs write checkpoints into `$ORCHARD_CKPT_DIR`. A preempted job
-is first SIGSTOPed in place; if the pause exceeds 30 min it is killed and requeued,
+is first SIGSTOPed in place (all of its group except `wrap`, which stays up to
+record a command killed while paused); if the pause exceeds 30 min it is killed and requeued,
 restarting with the last checkpoint (or from scratch if it wrote none).
 
 Input shipping: projects are tarred on the Air (streamed through a temp file, not
@@ -204,7 +205,11 @@ The worker also refuses a second job while *anything* runs on it: every executio
 (interactive or queued) writes a liveness-checked marker under
 `~/.orchard/state/running/<id>.json`, and the dispatcher holds queued jobs when the
 caps report a live `busy_job` — so a background job never stomps an interactive one
-(or the shared build cache). Stale markers are pruned by pid-group liveness.
+(or the shared build cache). Stale markers are pruned by pid-group liveness and
+boot id and, on Linux, by the group leader's start time (field 22 of
+`/proc/<pid>/stat`), because `wsl --terminate` restarts a distro with the same boot
+id and reuses its pids. A group whose leader has exited can't be dated, so it goes
+by liveness alone.
 `orchard cancel <id|prefix>` stops a queued or running job: remote kills go through
 the agent (with orphan-retry if the worker is unreachable), local kills signal the
 job's process group. Only one dispatcher processes the queue at a time: `--watch`
@@ -231,7 +236,12 @@ none, as after the machine restarted under it, it is requeued on the same worker
 Every job runs under the agent's `wrap`, which writes `exit.json` when the command
 ends, so a job that ran on to the end after its agent died is settled from that
 record and collected, not run again. A job stopped by a signal its `wrap` also got,
-as in a shutdown, is not settled and runs again. When `settle` gives no clear answer
+as in a shutdown, is not settled and runs again. So is a job that signals its own
+group, such as a shell with `trap 'kill 0' EXIT`: `wrap` records that signal too,
+so if the agent also died the job runs again. A signal that reaches `wrap` before
+its command has started is passed on once the command exists; one that lands in
+the instant after, and so reaches the command directly as well, arrives twice.
+When `settle` gives no clear answer
 the job is left running and asked about after another quiet spell.
 If the
 Air can't run it, the job stays running on its worker, with the reason in its note
@@ -270,7 +280,7 @@ marks the entry failed instead of tracking it forever.
 | Thermal preemption | pause below limit 50, resume at 60 (hysteresis); macOS only | `pmset -g therm` |
 | Short suspends | SIGSTOP in place (instant resume) | BOINC "leave tasks in memory" |
 | Long suspends (>30 min) | dispatcher kills and requeues; resumes from checkpoint | BOINC unload model |
-| Job process class | full speed; `caffeinate -is` only. `background_qos: true` opts into nice 10 + `taskpolicy -b` | measured 2.4x slower wrapped on the Pro; preemption already protects the user |
+| Job process class | full speed; `caffeinate -is -w <pid>` beside the job (outside its group, so a job's `kill 0` can't end it). `background_qos: true` opts into nice 10 + `taskpolicy -b` | measured 2.4x slower wrapped on the Pro; preemption already protects the user |
 | Low battery | pause below 20% even on (weak) AC | 2026-10-19 incident: 8 W charger drained the Pro under load |
 
 Preemption applies only to jobs launched with `preempt: true` (remote background
