@@ -247,13 +247,27 @@ def test_terminate_remote_sends_terminate(monkeypatch):
         raise subprocess.TimeoutExpired("ssh", 30)
 
     worker = Worker(name="pro", host="10.0.0.9")
+    # The run may come from an agent too old to know `terminate`: the current
+    # agent goes up first, and a failed upload sends nothing.
+    uploads = []
+    monkeypatch.setattr(engine.env, "ensure_agent_uploaded", lambda w: uploads.append(w.name))
     sent = []
     for code, want in ((0, True), (1, False), (255, None)):
         monkeypatch.setattr(engine.transport, "run", lambda w, cmd, c=code, **k: sent.append(cmd) or Proc(c))
         assert engine.terminate_remote(worker, "/Users/x/.orchard/jobs/j1") is want
     assert sent[0] == '/usr/bin/python3 "/Users/x/.orchard/bin/orchard-agent.py" terminate "/Users/x/.orchard/jobs/j1"'
+    assert uploads == ["pro"] * 3
     monkeypatch.setattr(engine.transport, "run", timeout)
     assert engine.terminate_remote(worker, "/Users/x/.orchard/jobs/j1") is None
+
+    def no_upload(w):
+        raise RuntimeError("ssh failed")
+
+    monkeypatch.setattr(engine.env, "ensure_agent_uploaded", no_upload)
+    monkeypatch.setattr(engine.transport, "run", lambda w, cmd, **k: sent.append(cmd) or Proc(0))
+    count = len(sent)
+    assert engine.terminate_remote(worker, "/Users/x/.orchard/jobs/j1") is None
+    assert len(sent) == count
 
 
 def test_launch_remote_drops_the_last_attempts_status_first(monkeypatch, tmp_path):
@@ -274,7 +288,10 @@ def test_launch_remote_drops_the_last_attempts_status_first(monkeypatch, tmp_pat
     engine.launch_remote(Worker(name="pro", host="10.0.0.9"), job, "j1", tmp_path, tmp_path,
                          rhome="/Users/x", attempt=2)
     start = cmds[-1]
-    drop = 'rm -f "/Users/x/.orchard/jobs/j1/status.json"'
+    # Its pid and kill request go too: a kill before the new agent starts
+    # must find no process, and the new run must not read as killed.
+    drop = ('rm -f "/Users/x/.orchard/jobs/j1/status.json" "/Users/x/.orchard/jobs/j1/pid" '
+            '"/Users/x/.orchard/jobs/j1/command.pid" "/Users/x/.orchard/jobs/j1/kill-requested"')
     assert drop in start
     assert start.index(drop) < start.index("nohup")
 
@@ -283,11 +300,13 @@ def test_launch_local_drops_the_last_runs_status_first(monkeypatch, tmp_path):
     class Proc:
         pid = 4321
 
-    (tmp_path / "status.json").write_text('{"state": "failed"}')
+    names = ("status.json", "pid", "command.pid", "kill-requested")
+    for name in names:
+        (tmp_path / name).write_text("1")
     seen = []
     monkeypatch.setattr(engine, "prepare_local_job",
                         lambda job, job_id, sdir, cwd, attempt: (None, sdir / "job.json"))
     monkeypatch.setattr(engine.subprocess, "Popen",
-                        lambda *a, **k: seen.append((tmp_path / "status.json").exists()) or Proc())
+                        lambda *a, **k: seen.append([(tmp_path / n).exists() for n in names]) or Proc())
     assert engine.launch_local(JobSpec(name="demo", cmd=["true"]), "j1", tmp_path, tmp_path) == (None, 4321)
-    assert seen == [False]
+    assert seen == [[False] * 4]

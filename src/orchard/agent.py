@@ -725,8 +725,12 @@ def _terminate_group(pgid, grace=10.0):
 
 
 def _log_line(log, text):
-    log.write("orchard: %s\n" % text)
-    log.flush()
+    # A full disk must not kill the agent before it signals or records the job.
+    try:
+        log.write("orchard: %s\n" % text)
+        log.flush()
+    except OSError:
+        pass
 
 
 def cmd_exec(argv):
@@ -921,6 +925,10 @@ def cmd_exec(argv):
         elapsed_s=round(time.time() - started, 1),
         active_s=round(active_s, 1),
         exit_code=exit_code,
+        # Whether `kill` or `terminate` reached this run. A preempted run whose
+        # kill reply was lost is run again only if it was; one that ended by
+        # itself first is finished as it ended.
+        kill_requested=os.path.exists(kill_path),
     )
     # The final status goes first: once the marker is gone the dispatcher
     # can start the next attempt, which must not find this one still running.
@@ -1039,6 +1047,7 @@ def settle_status(job_dir):
         ended_at=ended_at,
         elapsed_s=round(ended_at - (status.get("started_at") or ended_at), 1),
         exit_code=exit_code,
+        kill_requested=os.path.exists(_kill_request_path(job_dir)),
     )
     try:
         _atomic_write_json(os.path.join(job_dir, "status.json"), status)
@@ -1075,8 +1084,14 @@ def cmd_signal(argv, sig, label, cont_first=False):
     if pid is None:
         print("no pid file in %s" % argv[0], file=sys.stderr)
         return 1
+    # A pid file with no status.json is a leftover (the start command removes
+    # both, and exec writes status.json first), so its pid proves nothing.
+    status = read_status(argv[0])
+    if status is None:
+        clear_running_marker(os.path.basename(argv[0].rstrip("/")))
+        print("process group not running (no status.json beside its pid file)", file=sys.stderr)
+        return 1
     # After a restart the pid can belong to an unrelated process.
-    status = read_status(argv[0]) or {}
     started_boot = status.get("boot_id")
     boot = boot_id()
     if started_boot and boot and started_boot != boot:

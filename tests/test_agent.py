@@ -30,7 +30,7 @@ def test_agent_runs_under_stock_python(tmp_path):
 
 def _exec(tmp_path, cmd, **fields):
     job_dir = tmp_path / "job"
-    job_dir.mkdir()
+    job_dir.mkdir(exist_ok=True)
     job = {"id": "j1", "cmd": cmd, "venv": None, "workdir": str(tmp_path), "job_dir": str(job_dir),
            "timeout_s": None, "preempt": False, "env": {}, **fields}
     (job_dir / "job.json").write_text(json.dumps(job))
@@ -47,6 +47,25 @@ def test_exec_records_attempt(tmp_path):
     status = _exec(tmp_path, ["sh", "-c", 'echo "$ORCHARD_ATTEMPT" > attempt.txt'], attempt=3)
     assert (status["state"], status["attempt"]) == ("succeeded", 3)
     assert (tmp_path / "attempt.txt").read_text().strip() == "3"
+
+
+def test_a_kill_request_left_by_the_last_attempt_is_not_this_runs(tmp_path):
+    # A preempted run whose kill reply was lost is run again only if the kill
+    # reached it, so the last attempt's request must not count for this one.
+    (tmp_path / "job").mkdir()
+    (tmp_path / "job" / "kill-requested").write_text("1")
+    status = _exec(tmp_path, ["true"])
+    assert (status["state"], status["kill_requested"]) == ("succeeded", False)
+
+
+def test_log_line_survives_a_full_disk():
+    class Full:
+        def write(self, text):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        flush = write
+
+    agent._log_line(Full(), "stopping")
 
 
 def test_exec_timeout_stops_group(tmp_path):
@@ -819,6 +838,25 @@ def test_signal_eperm_from_another_users_group_clears_the_marker(tmp_path, monke
     assert not _signal_job(tmp_path, monkeypatch, PermissionError(1, "Operation not permitted"), own=False)
 
 
+def test_signal_ignores_a_pid_file_with_no_status(tmp_path, monkeypatch):
+    # A leftover pid file (the start removes it with status.json) names a pid
+    # that may belong to anything by now.
+    monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
+    victim = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        job_dir = tmp_path / "home" / "jobs" / "job-s"
+        job_dir.mkdir(parents=True)
+        (job_dir / "pid").write_text(str(victim.pid))
+        agent.write_running_marker("job-s", victim.pid)
+        assert agent.main(["kill", str(job_dir)]) == 1
+        time.sleep(0.2)
+        assert victim.poll() is None
+        assert not os.path.exists(agent._marker_path("job-s"))
+    finally:
+        victim.kill()
+        victim.wait()
+
+
 def test_signal_esrch_clears_the_marker(tmp_path, monkeypatch):
     assert not _signal_job(tmp_path, monkeypatch, ProcessLookupError(3, "No such process"), own=True)
 
@@ -1453,6 +1491,25 @@ def test_kill_ends_a_job_that_ignores_sigterm(tmp_path):
         assert "asked to end" in text
         assert "after it was asked to end; killing" in text
         assert json.loads((job_dir / "status.json").read_text())["state"] != "running"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        _leftovers(job_dir)
+
+
+def test_terminate_ends_a_run_at_once_and_records_the_kill(tmp_path):
+    # A long grace: only terminate's own SIGKILL can end the run in time.
+    job_dir, env, proc = _exec_job(tmp_path, timeout_s=120, kill_grace=60)
+    try:
+        log = job_dir / "log.txt"
+        deadline = time.time() + 20
+        while time.time() < deadline and not (log.exists() and "ready" in log.read_text()):
+            time.sleep(0.1)
+        assert "ready" in log.read_text()
+        subprocess.run([sys.executable, agent.__file__, "terminate", str(job_dir)], env=env, check=True, timeout=30)
+        proc.wait(timeout=10)
+        assert json.loads((job_dir / "status.json").read_text())["kill_requested"] is True
     finally:
         if proc.poll() is None:
             proc.kill()

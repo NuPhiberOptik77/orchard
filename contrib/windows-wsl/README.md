@@ -54,8 +54,8 @@ the last person signs out. Those samples say `"source":"windows-signed-out"`.
 Windows 11 usually signs you back in by itself after any restart and locks
 the screen, while "Use my sign-in info to automatically finish setting up"
 is on in Sign-in options. You'll then see `"source":"windows"` instead, which
-is fine. The signed-out path only runs with that setting off, and it hasn't
-been tested on real hardware yet.
+is fine. After a restart, the signed-out path only runs with that setting off;
+signing out takes it either way. It hasn't been tested on real hardware yet.
 When someone signs in, it marks the PC in use once, then passes on what the
 sign-in task reports. If that is missing or more than 30 s old, it writes
 nothing and the file goes stale. If it can't tell whether anyone is signed in,

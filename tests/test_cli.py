@@ -187,10 +187,11 @@ def _queued_preempted(monkeypatch, tmp_path, kill):
     return kills
 
 
-@pytest.mark.parametrize("kill", [True, None])
+@pytest.mark.parametrize("kill", [True, False, None])
 def test_cancel_kills_a_preempted_run_that_may_still_be_going(monkeypatch, tmp_path, kill):
     # Requeued after a preempt whose kill reply was lost: the run can still be
     # going on the worker, so cancel stops it or leaves it to the dispatcher.
+    # False is the agent finding no run: it has ended, so nothing is left.
     kills = _queued_preempted(monkeypatch, tmp_path, kill)
     result = CliRunner().invoke(cli.app, ["cancel", "demo-q"])
     assert result.exit_code == 0, result.output
@@ -198,12 +199,35 @@ def test_cancel_kills_a_preempted_run_that_may_still_be_going(monkeypatch, tmp_p
     assert kills == [rjob]
     entry = dispatcher.load_entries()[0]
     assert entry["state"] == "cancelled"
-    if kill:
+    if kill is not None:
         assert not entry.get("orphan")
+        assert "dispatcher will retry" not in result.output
     else:
         assert entry["orphan"] == {"worker": "pro", "rjob": rjob, "rhome": "/Users/x", "attempt": 1,
                                    "preempted": True}
         assert "dispatcher will retry" in result.output
+
+
+def test_cancel_stands_when_the_tick_records_the_end_of_the_run_it_stopped(monkeypatch, tmp_path):
+    # The kill ends a local run, and a tick can record it failed before cancel
+    # saves: it was still cancelled, not "already failed".
+    monkeypatch.setattr(dispatcher, "QUEUE_DIR", tmp_path / "queue")
+    entry = dispatcher.enqueue(JobSpec(name="demo", cmd=["true"]), "demo-l", Path("/tmp/p"), tmp_path / "s",
+                               worker="local")
+    entry.update(state="running", attempts=1)
+    dispatcher.save_entry(entry)
+    monkeypatch.setattr(cli.engine, "local_status", lambda sdir: {"pgid": 4242})
+
+    def terminate(pgid, grace):
+        disk = dispatcher.load_entries()[0]
+        disk.update(state="failed", note="exit 143")
+        dispatcher.save_entry(disk)
+
+    monkeypatch.setattr(cli.agent, "_terminate_group", terminate)
+    result = CliRunner().invoke(cli.app, ["cancel", "demo-l"])
+    assert result.exit_code == 0, result.output
+    assert "cancelled: demo-l (was running)" in result.output
+    assert dispatcher.load_entries()[0]["state"] == "cancelled"
 
 
 def test_cancel_stops_a_run_started_while_it_acts(monkeypatch, tmp_path):

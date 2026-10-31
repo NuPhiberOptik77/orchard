@@ -380,11 +380,16 @@ def tick(workers: list[Worker] | None = None) -> list[str]:
             _save(entry)
             lines.append(f"{entry['id']}: held (worker busy)")
             continue
+        tried: list[str] = []
         try:
-            lines += start_queued(entry, worker_map, cfg, caps_of)
+            lines += start_queued(entry, worker_map, cfg, caps_of, tried)
         except Exception as exc:
             lines += _note_launch_error(entry, cfg, exc)
-        if entry.get("state") == "running":
+        # A launch that was tried keeps its worker for the rest of the tick, even
+        # one that cancel stopped or that errored: its run may still be ending there.
+        if tried:
+            busy.add(tried[0])
+        elif entry.get("state") == "running":
             busy.add(entry["worker"])
 
     for entry in entries:
@@ -562,8 +567,13 @@ def _note_launch_error(entry: dict, cfg: dict, exc: Exception) -> list[str]:
 
 
 def start_queued(
-    entry: dict, worker_map: dict[str, Worker], cfg: dict, caps_of: Callable[[Worker], dict | None]
+    entry: dict,
+    worker_map: dict[str, Worker],
+    cfg: dict,
+    caps_of: Callable[[Worker], dict | None],
+    tried: list[str] | None = None,
 ) -> list[str]:
+    """Launch or hold one queued job. A launch it tries adds the worker to `tried`."""
     worker_name = entry["worker"]
     job = spec_of(entry)
     sdir = Path(entry["sdir"])
@@ -587,6 +597,8 @@ def start_queued(
                 _save(entry)
                 return [f"{entry['id']}: held ({entry['note']})"]
         attempt = entry.get("attempts", 0) + 1
+        if tried is not None:
+            tried.append("local")
         venv, pid = engine.launch_local(job, entry["id"], sdir, cwd, attempt=attempt)
         entry.update(
             state="running",
@@ -623,7 +635,7 @@ def start_queued(
             return _hold_or_fallback(entry, job, cfg, f"waiting for the preempted run on {worker.name} to end")
         if alive:
             return _wait_preempted(entry, worker, cfg)
-        entry["preempted_attempt"] = None
+        entry.update(preempted_attempt=None, preempt_sent_at=None, terminate_sent_at=None)
     elif engine.remote_job_running(worker, entry["id"]):
         rhome = engine.remote_home(worker)
         entry.update(
@@ -656,6 +668,12 @@ def start_queued(
         return _hold_or_fallback(entry, job, cfg, hold)
 
     attempt = entry.get("attempts", 0) + 1
+    # The ssh calls above give `orchard cancel` time to cancel the job, which
+    # is then not launched. A cancel during the launch is caught after it.
+    if not _save(entry):
+        return [f"{entry['id']}: cancelled meanwhile; not launched"]
+    if tried is not None:
+        tried.append(worker_name)
     try:
         rhome, _rjob = engine.launch_remote(worker, job, entry["id"], sdir, cwd, attempt=attempt)
     except Exception as exc:
@@ -698,14 +716,16 @@ def _wait_preempted(entry: dict, worker: Worker, cfg: dict) -> list[str]:
     """
     now = time.time()
     entry["launch_errors"] = 0
-    if entry.get("held_since") is None:
-        entry["held_since"] = now
+    # The worker just answered, so a fallback (once it stops answering) waits
+    # its full time from here, not from when the wait began.
+    entry["held_since"] = now
     if entry.get("preempt_sent_at") is None:
         entry["preempt_sent_at"] = now
     last = entry.get("terminate_sent_at") or entry["preempt_sent_at"]
     if entry.get("rhome") and now - last >= cfg.get("kill_grace_s", 120):
         rjob = engine.remote_job_dir(entry["rhome"], entry["id"])
-        if engine.terminate_remote(worker, rjob) is not None:
+        # Only True is a SIGKILL sent; False means no run was signalled.
+        if engine.terminate_remote(worker, rjob) is True:
             entry["terminate_sent_at"] = now
     entry["note"] = f"waiting for the preempted run on {worker.name} to end"
     if entry.get("terminate_sent_at"):
@@ -799,6 +819,11 @@ def poll_running(entry: dict, worker_map: dict[str, Worker], cfg: dict) -> list[
                         "rhome": entry["rhome"],
                         "attempt": entry.get("attempts"),
                     }
+                    # A preempt of this attempt was sent, its reply lost: the
+                    # run ending is that preemption (settle_orphan).
+                    preempting = entry.get("preempting_attempt")
+                    if preempting is not None and preempting == entry.get("attempts"):
+                        orphan["preempted"] = True
                 entry.update(
                     state="queued",
                     worker="local",
@@ -914,10 +939,16 @@ def finish_or_track(
     state = status.get("state", "unknown")
     if state in agent.TERMINAL_STATES:
         preempting = entry.get("preempting_attempt")
-        if preempting is not None and status.get("attempt", preempting) == preempting:
+        if (
+            preempting is not None
+            and status.get("attempt", preempting) == preempting
+            and status.get("kill_requested", True)
+        ):
             # track_paused's kill reached the run but its reply was lost: the
             # run ending (killed, or exiting cleanly from a SIGTERM trap) is
-            # the preemption, not the job finishing.
+            # the preemption, not the job finishing. A run the kill never
+            # reached ended by itself and is finished as it ended. An agent
+            # too old to record that is taken to have been reached.
             return _requeue_preempted(entry, "preempted run ended (its kill reply was lost)")
         return finish(entry, status, worker_map)
     if state == "paused":
@@ -997,8 +1028,8 @@ def settle_orphan(entry: dict, worker: Worker) -> list[str]:
     # its own exit record settles it, so it is adopted instead of cancelled and
     # run twice. An agent too old to settle answers False and the plain status
     # decides. No clear answer (a timeout, a status.json that won't parse) is
-    # asked about again for ORPHAN_ASKS passes, unless the job has no status at
-    # all, which no later pass will change. The last pass reads the plain status.
+    # asked about again for ORPHAN_ASKS passes, and so is a run with no pid yet
+    # (its agent may still be starting). The last pass reads the plain status.
     settled = engine.remote_settle(worker, rjob)
     asks = orphan.get("asks", 0) + 1
     status = settled if isinstance(settled, dict) else None
@@ -1022,6 +1053,9 @@ def settle_orphan(entry: dict, worker: Worker) -> list[str]:
         ok = engine.kill_remote(worker, rjob)
         if ok is None:
             return [f"{job_id}: could not reach {worker.name} to cancel the orphan; trying again"]
+        if ok is False and not status.get("pid") and asks < ORPHAN_ASKS:
+            _save_orphan(entry, None, orphan={**orphan, "asks": asks})
+            return [f"{job_id}: the orphan on {worker.name} has no pid yet; asking again"]
         _save_orphan(entry, f"orphan cancelled ({'ok' if ok else 'no-op'})", orphan=None)
         events.append("orphan", job=job_id, worker=worker.name, outcome="cancelled", attempt=expected)
         return [f"{job_id}: cancelled orphaned remote job on {worker.name}"]
@@ -1049,8 +1083,10 @@ def settle_orphan(entry: dict, worker: Worker) -> list[str]:
         ran_again = rerun not in ("queued", "cancelled")
     else:
         ran_again = entry.get("attempts", 0) > expected
-    # A preempted run's exit is the preemption ending, even a clean one.
-    if state == "succeeded" and local_rerun and not orphan.get("preempted"):
+    # A preempted run's exit is the preemption ending, even a clean one, unless
+    # the kill never reached it (as in finish_or_track).
+    preempted = orphan.get("preempted") and status.get("kill_requested", True)
+    if state == "succeeded" and local_rerun and not preempted:
         if rerun == "running":
             _stop_local_rerun(entry, sdir)
         engine.collect_remote(worker, job_id, rjob, sdir, cwd)

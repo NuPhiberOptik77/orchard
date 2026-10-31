@@ -110,6 +110,22 @@ def test_lost_contact_requeues_locally(tmp_path, monkeypatch):
     }
 
 
+def test_lost_contact_after_a_preempt_marks_the_orphan_preempted(tmp_path, monkeypatch):
+    # The preempt went out, its reply was lost, then the worker went quiet:
+    # the orphan ending is that preemption (settle_orphan).
+    monkeypatch.setattr(dispatcher, "QUEUE_DIR", tmp_path / "queue")
+    monkeypatch.setattr(dispatcher.engine, "remote_status", lambda worker, rdir: None)
+    monkeypatch.setattr(dispatcher.engine, "remote_caps", lambda worker: None)
+    monkeypatch.setattr(dispatcher, "_local_fallback", lambda job: (True, ""))
+    monkeypatch.setattr(dispatcher.engine, "launch_local", lambda *a, **k: (None, None))
+    entry = dispatcher.enqueue(make_job(), "demo-lost", Path("/tmp/p"), Path("/tmp/s"), worker="pro")
+    entry.update(state="running", rhome="/Users/x", attempts=1, preempting_attempt=1,
+                 misses=dispatcher.DISPATCH_DEFAULTS["max_misses"])
+    dispatcher.save_entry(entry)
+    dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
+    assert dispatcher.load_entries()[0]["orphan"].get("preempted") is True
+
+
 def test_orphan_cancelled_when_worker_reachable(tmp_path, monkeypatch):
     monkeypatch.setattr(dispatcher, "QUEUE_DIR", tmp_path / "queue")
     monkeypatch.setattr(dispatcher.engine, "remote_status", lambda worker, rdir: None)
@@ -215,6 +231,33 @@ def test_orphan_success_adopted_before_rerun_starts(tmp_path, monkeypatch):
     assert orphan["duplicate"] is False
 
 
+def test_preempted_orphan_the_kill_never_reached_is_adopted(tmp_path, monkeypatch):
+    # The run ended by itself before the lost kill could reach it, so its
+    # success is the job's (as in finish_or_track).
+    remote = {"state": "succeeded", "exit_code": 0, "attempt": 1, "kill_requested": False}
+    sdir, _cwd, _kills, collected = _orphaned(tmp_path, monkeypatch, remote, "queued", attempts=1,
+                                              orphan={**ORPHAN, "preempted": True})
+    monkeypatch.setattr(dispatcher, "start_queued", lambda *a, **k: [])
+    dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
+    entry = dispatcher.load_entries()[0]
+    assert (entry["state"], entry["worker"]) == ("done", "pro")
+    assert collected == [(sdir, None)]
+
+
+def test_orphan_with_no_pid_yet_is_asked_about_again(tmp_path, monkeypatch):
+    # Its agent may still be starting: the kill finds no process, and letting
+    # the orphan go would leave the run going beside the local rerun.
+    remote = {"state": "running", "attempt": 1}
+    _orphaned(tmp_path, monkeypatch, remote, "queued", settled=remote)
+    kills = []
+    monkeypatch.setattr(dispatcher.engine, "kill_remote", lambda w, rjob: kills.append(rjob) or False)
+    monkeypatch.setattr(dispatcher, "start_queued", lambda *a, **k: [])
+    lines = dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
+    assert any("the orphan on pro has no pid yet; asking again" in line for line in lines), lines
+    assert dispatcher.load_entries()[0]["orphan"]["asks"] == 1
+    assert kills == [ORPHAN["rjob"]]
+
+
 def test_orphan_after_finished_rerun_kept_as_duplicate(tmp_path, monkeypatch):
     remote = {"state": "succeeded", "exit_code": 0, "attempt": 1}
     sdir, cwd, kills, collected = _orphaned(tmp_path, monkeypatch, remote, "done")
@@ -302,7 +345,7 @@ def test_orphan_asked_about_a_bounded_number_of_times(tmp_path, monkeypatch):
 
 
 def test_orphan_kept_when_its_worker_cant_be_reached_to_cancel_it(tmp_path, monkeypatch):
-    running = {"state": "running", "attempt": 1}
+    running = {"state": "running", "attempt": 1, "pid": 4242}
     _sdir, _cwd, kills, _collected = _orphaned(tmp_path, monkeypatch, running, "done")
     monkeypatch.setattr(dispatcher.engine, "kill_remote", lambda w, rjob: kills.append(rjob) or None)
     lines = dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
@@ -1003,6 +1046,39 @@ def test_preempt_retried_when_the_worker_cant_be_reached(tmp_path, monkeypatch):
     assert len(kills) == 1 and launches == []
 
 
+def test_preempt_is_recorded_before_the_kill_goes_out(tmp_path, monkeypatch):
+    # A lost reply can only be told from the job ending by itself if the
+    # preempt is on disk before the kill is sent.
+    _long_paused(tmp_path, monkeypatch, kill=True, alive=[True])
+    seen = []
+
+    def kill(w, rjob):
+        seen.append(json.loads(dispatcher.entry_path("demo-p").read_text()).get("preempting_attempt"))
+        return True
+
+    monkeypatch.setattr(dispatcher.engine, "kill_remote", kill)
+    dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
+    assert seen == [1]
+
+
+def test_a_run_the_lost_kill_never_reached_finishes_as_it_ended(tmp_path, monkeypatch):
+    # The kill's reply was lost. A run that then ends with no kill request on
+    # record ended by itself: it is finished, not run again.
+    kills, launches = _long_paused(tmp_path, monkeypatch, kill=None, alive=[False])
+    workers = [Worker(name="pro", host="10.0.0.9")]
+    dispatcher.tick(workers=workers)
+    status = {"state": "succeeded", "exit_code": 0, "attempt": 1, "kill_requested": False}
+    monkeypatch.setattr(dispatcher.engine, "remote_status", lambda worker, rjob: status)
+    collected = []
+    monkeypatch.setattr(dispatcher.engine, "collect_remote", lambda *a, **k: collected.append(a) or status)
+    monkeypatch.setattr(dispatcher.engine, "remote_job_running", lambda w, job_id: False)
+    lines = dispatcher.tick(workers=workers)
+    entry = dispatcher.load_entries()[0]
+    assert entry["state"] == "done", lines
+    assert collected and launches == []
+    assert not any(e["event"] == "requeued" for e in events.load())
+
+
 def _age(job_id, **seconds_ago):
     """Move the entry's timestamps back by the given seconds."""
     path = dispatcher.entry_path(job_id)
@@ -1148,6 +1224,58 @@ def test_preemptions_do_not_use_up_attempts(tmp_path, monkeypatch):
     assert launches == [21]
 
 
+def test_a_sigkill_that_signalled_nothing_is_sent_again(tmp_path, monkeypatch):
+    # terminate answers False when it found no run to signal: the note must
+    # not claim a SIGKILL, and the next pass tries again.
+    kills, _launches = _long_paused(tmp_path, monkeypatch, kill=True, alive=[True] * 5)
+    monkeypatch.setattr(dispatcher.engine, "terminate_remote",
+                        lambda w, rjob: kills.append(("terminate", rjob)) or False)
+    workers = [Worker(name="pro", host="10.0.0.9")]
+    rjob = "/Users/x/.orchard/jobs/demo-p"
+    dispatcher.tick(workers=workers)
+    _age("demo-p", preempt_sent_at=200)
+    dispatcher.tick(workers=workers)
+    entry = dispatcher.load_entries()[0]
+    assert not entry["note"].endswith("SIGKILL sent") and entry.get("terminate_sent_at") is None
+    dispatcher.tick(workers=workers)
+    assert kills == [rjob, ("terminate", rjob), ("terminate", rjob)]
+
+
+def test_a_preempted_wait_falls_back_only_once_the_worker_stops_answering(tmp_path, monkeypatch):
+    # Each answer from the worker restarts the fallback timer, so a run that
+    # took long to end doesn't send the job local the first time an ssh fails.
+    _long_paused(tmp_path, monkeypatch, kill=True, alive=[True, True, None])
+    monkeypatch.setattr(dispatcher, "_local_fallback", lambda job: (True, ""))
+    local = []
+    monkeypatch.setattr(dispatcher.engine, "launch_local", lambda *a, **k: local.append(a) or (None, None))
+    workers = [Worker(name="pro", host="10.0.0.9")]
+    dispatcher.tick(workers=workers)
+    _age("demo-p", held_since=2000)
+    dispatcher.tick(workers=workers)
+    lines = dispatcher.tick(workers=workers)
+    entry = dispatcher.load_entries()[0]
+    assert (entry["state"], entry["worker"]) == ("queued", "pro"), lines
+    assert local == []
+
+
+def test_second_preemption_gets_its_own_sigterm_grace(tmp_path, monkeypatch):
+    kills, launches = _long_paused(tmp_path, monkeypatch, kill=True, alive=[True, True, False, True])
+    workers = [Worker(name="pro", host="10.0.0.9")]
+    rjob = "/Users/x/.orchard/jobs/demo-p"
+    dispatcher.tick(workers=workers)
+    _age("demo-p", preempt_sent_at=200)
+    dispatcher.tick(workers=workers)
+    dispatcher.tick(workers=workers)
+    assert launches == [2] and kills == [rjob, ("terminate", rjob)]
+    entry = dispatcher.load_entries()[0]
+    assert (entry.get("preempt_sent_at"), entry.get("terminate_sent_at")) == (None, None)
+    # Paused long again: SIGTERM only, so the run gets kill_grace_s to checkpoint.
+    paused = {"state": "paused", "attempt": 2, "paused_since": time.time() - 4000, "pause_reason": "user active"}
+    monkeypatch.setattr(dispatcher.engine, "remote_status", lambda worker, r: paused)
+    dispatcher.tick(workers=workers)
+    assert kills == [rjob, ("terminate", rjob), rjob]
+
+
 def _cancel_on_disk(job_id, was):
     path = dispatcher.entry_path(job_id)
     disk = json.loads(path.read_text())
@@ -1196,6 +1324,51 @@ def test_cancel_while_a_remote_run_starts_stops_it(path, killed, tmp_path, monke
         assert any("will stop the run on pro once it can" in line for line in lines), lines
         orphan = {key: entry["orphan"][key] for key in ("worker", "rjob", "rhome", "attempt")}
         assert orphan == {"worker": "pro", "rjob": rjob, "rhome": "/Users/x", "attempt": 1}
+
+
+def _launch_setup(tmp_path, monkeypatch):
+    monkeypatch.setattr(dispatcher, "QUEUE_DIR", tmp_path / "queue")
+    monkeypatch.setattr(dispatcher, "load_config", lambda: dict(dispatcher.DISPATCH_DEFAULTS))
+    monkeypatch.setattr(dispatcher.engine, "remote_caps", lambda worker: dict(IDLE_CAPS))
+    monkeypatch.setattr(dispatcher.engine, "kill_remote", lambda w, r: True)
+
+
+def test_cancel_during_the_checks_before_a_launch_stops_it(tmp_path, monkeypatch):
+    _launch_setup(tmp_path, monkeypatch)
+
+    def running(w, job_id):
+        _cancel_on_disk(job_id, "queued")
+        return False
+
+    monkeypatch.setattr(dispatcher.engine, "remote_job_running", running)
+    launches = []
+    monkeypatch.setattr(dispatcher.engine, "launch_remote",
+                        lambda *a, **k: launches.append(a) or ("/Users/x", "/Users/x/.orchard/jobs/demo-c"))
+    dispatcher.enqueue(make_job(), "demo-c", tmp_path / "proj", tmp_path / "state", worker="pro")
+    lines = dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
+    assert any("demo-c: cancelled meanwhile; not launched" in line for line in lines), lines
+    assert launches == []
+    assert dispatcher.load_entries()[0]["state"] == "cancelled"
+
+
+def test_a_launch_cancel_stopped_still_keeps_its_worker_busy(tmp_path, monkeypatch):
+    # The stopped run may still be ending there, so the next job waits for a
+    # later tick instead of starting beside it.
+    _launch_setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(dispatcher.engine, "remote_job_running", lambda w, job_id: False)
+    launches = []
+
+    def launch(worker, job, job_id, sdir, cwd, attempt):
+        launches.append(job_id)
+        _cancel_on_disk(job_id, "queued")
+        return "/Users/x", f"/Users/x/.orchard/jobs/{job_id}"
+
+    monkeypatch.setattr(dispatcher.engine, "launch_remote", launch)
+    for job_id in ("demo-a", "demo-b"):
+        dispatcher.enqueue(make_job(), job_id, tmp_path / "proj", tmp_path / job_id, worker="pro")
+    lines = dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
+    assert launches == ["demo-a"]
+    assert "demo-b: held (worker busy)" in lines, lines
 
 
 def test_cancel_while_a_local_run_starts_stops_it(tmp_path, monkeypatch):

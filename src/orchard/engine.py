@@ -278,10 +278,11 @@ def launch_remote(
     payload = agent_job_payload(job, job_id, rjob, rwork, venv, preempt=True, attempt=attempt)
     transport.push_bytes(worker, f"{rjob}/job.json", json.dumps(payload, indent=2).encode())
 
-    # An earlier attempt's status.json goes first, so a poll before the new
-    # agent writes its own finds nothing rather than how the last one ended.
+    # An earlier attempt's files go first: a poll before the new agent writes
+    # its own status finds nothing rather than how the last one ended, and a
+    # `kill` before it writes its pid finds no stale pid (or kill request) to act on.
     start = (
-        f'cd "{rroot}" && rm -f "{rjob}/status.json" && nohup /usr/bin/python3 "{rroot}/bin/orchard-agent.py" exec "{rjob}/job.json" '
+        f'cd "{rroot}" && rm -f "{rjob}/status.json" "{rjob}/pid" "{rjob}/command.pid" "{rjob}/kill-requested" && nohup /usr/bin/python3 "{rroot}/bin/orchard-agent.py" exec "{rjob}/job.json" '
         f'> "{rjob}/agent.out" 2>&1 & echo started'
     )
     transport.run_checked(worker, start, timeout=30)
@@ -450,7 +451,14 @@ def kill_remote(worker: Worker, rjob: str) -> bool | None:
 
 
 def terminate_remote(worker: Worker, rjob: str) -> bool | None:
-    """Like kill_remote, with SIGKILL at once: for a job that outlived its kill."""
+    """Like kill_remote, with SIGKILL at once: for a job that outlived its kill.
+
+    The run may have been started by an agent too old to know `terminate`, so
+    the current one is uploaded first; None if that fails."""
+    try:
+        env.ensure_agent_uploaded(worker)
+    except Exception:
+        return None
     return _signal_remote(worker, rjob, "terminate")
 
 
@@ -486,8 +494,10 @@ def launch_local(
     job: JobSpec, job_id: str, sdir: Path, cwd: Path, attempt: int = 1
 ) -> tuple[Path | None, int]:
     venv, job_json = prepare_local_job(job, job_id, sdir, cwd, attempt)
-    # A rerun in the same folder must not be judged by the last run's status.
-    (sdir / "status.json").unlink(missing_ok=True)
+    # A rerun in the same folder must not be judged by the last run's status,
+    # nor killed through its pid or kill request.
+    for name in ("status.json", "pid", "command.pid", "kill-requested"):
+        (sdir / name).unlink(missing_ok=True)
     proc = subprocess.Popen(
         [sys.executable, str(Path(agent.__file__)), "exec", str(job_json)],
         stdout=subprocess.DEVNULL,

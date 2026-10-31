@@ -360,7 +360,10 @@ as "user active, power unknown", which holds new jobs and pauses running ones, a
   before every launch + adoption on restart (v0.6.2). A preempted run that may still be alive holds
   its job on that worker. The exceptions are fallbacks from a worker that stopped
   answering (§5): the old run is killed once the worker answers again, and its output
-  is kept apart from the rerun's.
+  is kept apart from the rerun's. A preempted run whose kill never arrived and that
+  then ends on its own is finished as it ended, not rerun; an agent too old to say
+  whether a kill reached the run counts as reached, so that run is rerun from its
+  checkpoint.
 - **No job loss**: every submitted job reaches a terminal state (done/failed/cancelled)
   with a note, even across dispatcher restarts.
 - **Fallback bound**: when the worker is unavailable/reserved, an eligible queued job
@@ -466,10 +469,17 @@ controller app (no launchd LaunchAgent needed).
   can run on unpaused.
 - A run that no signal ends (uninterruptible sleep) holds its job on that worker
   with no fallback; the dispatcher keeps sending `terminate`.
-- A preempted run that resumes by itself after its kill reply was lost, and then
-  finishes, is still requeued and reruns from its checkpoint.
+- A preempted run that ends on its own after its kill reply was lost is finished as
+  it ended only when the agent records that no kill reached it. An older agent that
+  doesn't record this is taken as reached, and the run reruns from its checkpoint.
 - A cancel saved in the instant between a tick's last re-read of the entry and its
   write can still be overwritten.
+- The mirror case: a tick that records a run's end in the instant between cancel's
+  last re-read and its save is overwritten by the cancel.
+- Cancel saves the copy of the entry it read before its kill, so it can re-arm an
+  orphan that a tick settled meanwhile.
+- A previous exec of the same job that stalls past its relaunch can clear the new
+  attempt's kill marker.
 - A worker that keeps returning another attempt's status counts those polls as
   misses, so the job ends in a lost-contact fallback after `max_misses`.
 
