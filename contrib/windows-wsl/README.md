@@ -96,18 +96,35 @@ harmlessly.
    public key to `~/.ssh/authorized_keys`.
 6. **Open port 2222** from an admin PowerShell. Mirrored mode with
    `firewall=true` filters the distro's traffic through the Hyper-V firewall,
-   which needs its own rule. The GUID is WSL's fixed VM creator id.
+   which needs its own rule. Both rules apply only on Private networks, so
+   sshd stays closed on public Wi-Fi, and your home network has to be Private.
+   List the networks:
+
+   ```powershell
+   Get-NetConnectionProfile | Format-List Name,InterfaceAlias,InterfaceIndex,NetworkCategory,IPv4Connectivity
+   ```
+
+   If your home network says `Public`, mark only that one Private, using the
+   `InterfaceIndex` the list shows for it, and list it again:
+
+   ```powershell
+   Set-NetConnectionProfile -InterfaceIndex <n> -NetworkCategory Private
+   Get-NetConnectionProfile -InterfaceIndex <n> | Format-List Name,NetworkCategory
+   ```
+
+   Go no further until it says `Private`. Pick the network by its index: the
+   alias may not be `Wi-Fi`, and `-InterfaceAlias 'Wi-Fi'` then fails with
+   `ObjectNotFound`. Leave a network that isn't your own as it is. Then add
+   the rules and check the Hyper-V one. The GUID is WSL's fixed VM creator id.
 
    ```powershell
    New-NetFirewallHyperVRule -Name OrchardSSH -DisplayName "Orchard SSH (WSL)" -Direction Inbound -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -Protocol TCP -LocalPorts 2222 -Profiles Private
    New-NetFirewallRule -DisplayName "Orchard SSH (WSL)" -Direction Inbound -Protocol TCP -LocalPort 2222 -Action Allow -Profile Private
-   Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private
+   Get-NetFirewallHyperVRule -Name OrchardSSH | Format-List Name,Profiles,Enabled,PortStatuses
    ```
 
-   Both rules apply only on Private networks, so sshd stays closed on public
-   Wi-Fi. The last line marks your current network Private. Skip it if you'd
-   rather do that in Settings, or if this isn't your own network. A Hyper-V
-   rule made without `-Profiles` applies everywhere; fix it with
+   It should show `Profiles : Private` and `Enabled : True`. A Hyper-V rule
+   made without `-Profiles` applies everywhere; fix it with
    `Set-NetFirewallHyperVRule -Name OrchardSSH -Profiles Private`.
 7. **Keep it awake on the charger**, lid closed included:
 
@@ -120,8 +137,11 @@ harmlessly.
 
    A laptop that stays plugged in lasts longer with a charge limit, if the
    maker's app has one.
-8. **Register the status tasks.** Put both `.ps1` files in one folder and run,
-   from an admin PowerShell:
+8. **Register the status tasks.** Close other WSL clients first: VS Code
+   Remote-WSL, Docker Desktop, and Explorer windows on `\\wsl.localhost`. One
+   of them could start WSL before the startup task does, and the VM would be
+   its session's; the script asks for a restart if it finds one running. Put
+   both `.ps1` files in one folder and run, from an admin PowerShell:
 
    ```powershell
    powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\Orchard\register-task.ps1"
@@ -138,8 +158,19 @@ harmlessly.
    admin prompt runs as another one: give the full path to your folder, add
    `-User <pc>\<you>`, and restart Windows afterwards. Run it again after
    updating the scripts: it replaces and restarts both. Pass `-Distro <name>`
-   if yours isn't `Ubuntu-24.04`. A minute later
-   `cat ~/.orchard/host-status.json` in the distro shows fresh numbers.
+   if yours isn't `Ubuntu-24.04`. Before any restart it asks for, check that
+   the startup task holds the VM:
+
+   ```powershell
+   Start-Sleep 20
+   Get-CimInstance Win32_Process -Filter "Name='wsl.exe'" | Format-List ProcessId,SessionId,CommandLine
+   ```
+
+   One entry must show `SessionId : 0` with `--exec sh -c` in its command
+   line: that is the startup task's writer. If none does, restart Windows and
+   check again; `Get-ScheduledTaskInfo 'Orchard WSL worker (startup)'` shows
+   the task's last result. A minute later `cat ~/.orchard/host-status.json`
+   in the distro shows fresh numbers.
 9. **Clean up old jobs.** Nothing deletes finished job folders on the worker
    by itself, and they fill C: in the end. A cron line in the distro runs the
    agent's cleanup every 6 hours: folders older than 2 days go, then newer
@@ -180,6 +211,17 @@ time, and `orchard doctor` should show no host-status warning. Every machine run
 newer first: an older one doesn't know `os:*` tags and would send macOS jobs to
 the PC.
 
+To check that the worker keeps reporting with nobody signed in, restart the PC
+and, before signing in, run on the controller:
+
+```sh
+ssh <alias> 'cat ~/.orchard/host-status.json; echo; date +%s'
+```
+
+It should say `"source": "windows-signed-out"`, with a `ts` no more than about
+20 s behind the number on the last line. A missing file or an old `ts` means
+the startup task isn't running: sign in and go back over step 8.
+
 ## Limits
 
 - **Thermal throttling isn't checked.** Linux in WSL can't read it, so the
@@ -198,6 +240,14 @@ the PC.
 - **`wsl --shutdown` stops running jobs,** which the dispatcher runs again.
   The startup task starts the distro again within seconds, and the VM stays
   its own even if you open the distro first.
+- **`wsl --terminate` keeps the boot id** and hands pids out again, so the
+  agent also compares each job's start time in `/proc` before trusting or
+  signalling its pid. A job whose first process has exited while its children
+  run on can't be dated that way, and is judged by whether its process group
+  is alive.
+- **A job that signals its own process group,** for example a shell with
+  `trap 'kill 0' EXIT`, signals the agent's `wrap` too, which records it. If
+  the agent died as well, that job runs again instead of being collected.
 - **Other Linux machines** work as workers too, but they need something that
   writes `host-status.json`, or every job stays held. On a headless server
   nobody uses, a cron job or systemd timer that writes `"power": "ac"`, a large
