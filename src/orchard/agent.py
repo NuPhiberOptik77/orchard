@@ -1122,16 +1122,26 @@ def cmd_signal(argv, sig, label, cont_first=False):
     # the worker doesn't read as free while a command shrugs off SIGTERM.
     pgid = status.get("pgid") or pid
     if sig in (signal.SIGTERM, signal.SIGKILL):
-        # Read by the job's agent (cmd_exec) and by a pause in flight (_stop_group).
-        # Without it, a run this ends would read as having ended by itself and
-        # be finished rather than rerun, so no signal goes out: exit 3 tells
-        # the dispatcher nothing happened and to ask again.
-        try:
-            with open(_kill_request_path(argv[0]), "w") as f:
-                f.write(str(time.time()))
-        except OSError as exc:
-            print("could not record the kill request (%s); not signalled" % exc, file=sys.stderr)
-            return 3
+        # A group that is gone needs no request (its run ended by itself), and
+        # a request that can't be written must not keep the dispatcher asking.
+        if not _group_alive(pgid):
+            clear_running_marker(os.path.basename(argv[0].rstrip("/")))
+            print("process group not running", file=sys.stderr)
+            return 1
+        # Read by the job's agent (cmd_exec) and by a pause in flight (_stop_group),
+        # which only check that it exists. Without it, a run this ends would
+        # read as having ended by itself and be finished rather than rerun, so
+        # no signal goes out: exit 3 tells the dispatcher nothing happened and
+        # to ask again. An empty file is enough, so a full disk with inodes
+        # left still records it, and one already there needs no write.
+        kill_path = _kill_request_path(argv[0])
+        if not os.path.exists(kill_path):
+            try:
+                os.close(os.open(kill_path, os.O_CREAT | os.O_WRONLY, 0o644))
+            except OSError as exc:
+                if not os.path.exists(kill_path):
+                    print("could not record the kill request (%s); not signalled" % exc, file=sys.stderr)
+                    return 3
     try:
         if cont_first:
             os.killpg(pgid, signal.SIGCONT)

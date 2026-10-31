@@ -274,9 +274,8 @@ default poll). After that a readable status that still says running is killed,
 through the agent's fences, and an orphan with no readable status is let go. A
 running orphan with no pid yet (its agent may still be starting) whose kill finds
 nothing is asked about again the same way, and after `ORPHAN_ASKS` passes it is let
-go as a no-op. A
-kill that fails because ssh did (exit 255 or a timeout) keeps the orphan for the
-next pass.
+go as a no-op. A kill that fails because ssh did (exit 255 or a timeout), or that
+the agent could not record (exit 3), keeps the orphan for the next pass.
 
 Each case logs an `orphan` event with the outcome and `duplicate: true` when the
 job was launched again after the orphan's attempt. Contact loss can't be told apart from a dead worker in time to avoid
@@ -284,9 +283,11 @@ the rerun, so a job whose side effects must not repeat should key them on
 `ORCHARD_JOB_ID` and check `ORCHARD_ATTEMPT`.
 
 Preempted runs: a run paused past `kill_paused_after_s` is sent `kill`, which
-sends SIGTERM and leaves `kill-requested` in the job folder. An agent that can't
-write that file sends nothing and exits 3, which the dispatcher treats like a failed
-ssh and asks again. The run's final status says whether the file was there
+sends SIGTERM and leaves an empty `kill-requested` file in the job folder (one
+already there is kept). A group that is already gone gets neither, and the agent
+exits 1 as for any run that isn't running. An agent that can't create the file
+sends nothing and exits 3, which the dispatcher treats like a failed ssh and asks
+again. The run's final status says whether the file was there
 (`kill_requested`), so a run that ended by itself can be told from one the kill
 ended; a run started by an agent too old to keep track (no `kill_marker` in its
 status) says nothing and is taken to have been reached. From then on its agent
@@ -316,7 +317,9 @@ kills a requeued preempted run that may still be going. Any other orphan outcome
 leaves the cancel in place. A run that ended by itself while the cancel was acting
 (the agent found nothing to signal, or a local group was already gone) keeps the
 state the tick records for it, and a local run whose status already says it ended is
-reported as "already <state>" and left for the tick.
+reported as "already <state>" and left for the tick. The exception is a cancel whose
+earlier pass left an orphan: the local run is still left alone, but the orphan is
+recorded and the cancel stands.
 
 Local liveness: local jobs record the agent's pid; if the status file still says
 running but the process is gone (e.g. the Air shut down mid-job), the dispatcher

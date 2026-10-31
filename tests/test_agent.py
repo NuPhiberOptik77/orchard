@@ -1526,11 +1526,83 @@ def test_kill_sends_nothing_when_its_request_cannot_be_recorded(tmp_path, monkey
     (job_dir / "pid").write_text("4242")
     (job_dir / "status.json").write_text(json.dumps({"state": "running", "pgid": 4242}))
     monkeypatch.setattr(agent, "_kill_request_path", lambda d: str(tmp_path / "missing" / "kill-requested"))
+    monkeypatch.setattr(agent, "_group_alive", lambda pgid: True)
     sent = []
     monkeypatch.setattr(agent.os, "killpg", lambda pgid, sig: sent.append(sig))
     assert agent.main(["kill", str(job_dir)]) == 3
     assert agent.main(["terminate", str(job_dir)]) == 3
     assert sent == []
+
+
+def _kill_request_fails(monkeypatch, kill_path, create):
+    """Make writing kill_path fail through open() and os.open alike; `create`
+    leaves the empty file behind first, as a full disk with inodes left does."""
+    real_open, real_os_open = open, os.open
+
+    def fail():
+        if create:
+            os.close(real_os_open(kill_path, os.O_CREAT | os.O_WRONLY, 0o644))
+            raise OSError(errno.ENOSPC, "No space left on device")
+        raise OSError(errno.EACCES, "Permission denied")
+
+    def fake_open(path, *args, **kwargs):
+        if str(path) == kill_path:
+            fail()
+        return real_open(path, *args, **kwargs)
+
+    def fake_os_open(path, *args, **kwargs):
+        if str(path) == kill_path:
+            fail()
+        return real_os_open(path, *args, **kwargs)
+
+    # Shadows the builtin in agent only (the harness runs as root, so a
+    # read-only file or folder wouldn't stop the write).
+    monkeypatch.setattr(agent, "open", fake_open, raising=False)
+    monkeypatch.setattr(agent.os, "open", fake_os_open)
+
+
+@pytest.mark.parametrize("recorded", [True, False])
+def test_kill_signals_once_its_request_is_on_record_even_if_the_write_fails(tmp_path, monkeypatch, recorded):
+    # Readers only check that the file exists: one already there (that can't be
+    # rewritten), or one a full disk let be created but not written, is the request.
+    monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
+    job_dir = tmp_path / "home" / "jobs" / "job-r"
+    job_dir.mkdir(parents=True)
+    kill_path = job_dir / "kill-requested"
+    proc = subprocess.Popen(["/bin/sh", "-c", "exec sleep 30"], start_new_session=True)
+    try:
+        (job_dir / "pid").write_text(str(proc.pid))
+        (job_dir / "status.json").write_text(json.dumps({"state": "running"}))
+        if recorded:
+            kill_path.write_text("")
+        _kill_request_fails(monkeypatch, str(kill_path), create=not recorded)
+        assert agent.cmd_signal([str(job_dir)], signal.SIGTERM, "kill", cont_first=True) == 0
+        assert proc.wait(timeout=5) == -signal.SIGTERM
+        assert kill_path.exists()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_kill_of_a_gone_group_writes_nothing_and_says_not_running(tmp_path, monkeypatch):
+    # A run that ended by itself, with its status still saying running and a job
+    # folder that can't be written: exit 1 lets the dispatcher settle it at
+    # once, where exit 3 would have it ask again every pass.
+    monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
+    job_dir = tmp_path / "home" / "jobs" / "job-d"
+    job_dir.mkdir(parents=True)
+    gone = subprocess.Popen(["true"], start_new_session=True)
+    gone.wait()
+    (job_dir / "pid").write_text(str(gone.pid))
+    (job_dir / "status.json").write_text(json.dumps({"state": "running", "pgid": gone.pid}))
+    agent.write_running_marker("job-d", gone.pid)
+    kill_path = job_dir / "kill-requested"
+    _kill_request_fails(monkeypatch, str(kill_path), create=False)
+    assert agent.main(["kill", str(job_dir)]) == 1
+    assert agent.main(["terminate", str(job_dir)]) == 1
+    assert not kill_path.exists()
+    assert not os.path.exists(agent._marker_path("job-d"))
 
 
 def test_settle_says_whether_a_kill_reached_the_run_only_when_its_agent_kept_track(tmp_path, monkeypatch):

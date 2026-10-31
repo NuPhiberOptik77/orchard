@@ -262,6 +262,34 @@ def test_cancel_stops_a_run_started_while_it_acts(monkeypatch, tmp_path):
     assert entry["note"] == "cancelled by user (was running)"
 
 
+def test_cancel_leaves_a_local_rerun_that_ended_while_an_orphan_waits(monkeypatch, tmp_path):
+    # Pass 1 can't reach the preempted run, so it becomes an orphan, and a tick
+    # starts the job here meanwhile. That run has ended by pass 2 (its pgid may
+    # be another group's by now): nothing is signalled and the cancel stands.
+    _queued_preempted(monkeypatch, tmp_path, None)
+
+    def kill_remote(w, rjob):
+        dispatcher.save_entry(dict(dispatcher.load_entries()[0], state="running", worker="local", attempts=2))
+        return None
+
+    monkeypatch.setattr(cli.engine, "kill_remote", kill_remote)
+    other = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    monkeypatch.setattr(cli.engine, "local_status",
+                        lambda sdir: {"state": "succeeded", "exit_code": 0, "pgid": other.pid})
+    stopped = []
+    monkeypatch.setattr(cli.agent, "_terminate_group", lambda pgid, grace: stopped.append(pgid))
+    try:
+        result = CliRunner().invoke(cli.app, ["cancel", "demo-q"])
+    finally:
+        other.kill()
+        other.wait()
+    assert result.exit_code == 0, result.output
+    assert stopped == []
+    entry = dispatcher.load_entries()[0]
+    assert entry["state"] == "cancelled" and entry["orphan"]["preempted"] is True
+    assert "dispatcher will retry" in result.output
+
+
 def _cancel_remote_run_that_ends(monkeypatch, tmp_path, kill):
     """A remote running job; the tick records it done during cancel's kill, which answers `kill`."""
     monkeypatch.setattr(dispatcher, "QUEUE_DIR", tmp_path / "queue")

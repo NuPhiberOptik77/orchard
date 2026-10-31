@@ -1510,3 +1510,37 @@ def test_orphan_with_no_pid_is_let_go_after_orphan_asks(tmp_path, monkeypatch):
     entry = dispatcher.load_entries()[0]
     assert entry["orphan"] is None and "no-op" in entry["note"]
     assert kills == [ORPHAN["rjob"]] * 2
+
+
+def test_orphan_whose_group_is_gone_is_settled_even_if_its_folder_cannot_be_written(tmp_path, monkeypatch):
+    # Its status still says running but its group is gone: the agent answers
+    # not running (exit 1) without trying to record a kill, so the orphan is
+    # settled at once rather than asked about every pass as unreachable.
+    real_kill = dispatcher.engine.kill_remote
+    gone = subprocess.Popen(["true"], start_new_session=True)
+    gone.wait()
+    remote = {"state": "running", "attempt": 1, "pid": gone.pid, "pgid": gone.pid}
+    _orphaned(tmp_path, monkeypatch, remote, "queued", settled=remote)
+    monkeypatch.setattr(dispatcher.engine, "kill_remote", real_kill)
+    monkeypatch.setattr(dispatcher.agent, "ORCHARD_HOME", str(tmp_path / "home"))
+    job_dir = tmp_path / "home" / "jobs" / "demo-o"
+    job_dir.mkdir(parents=True)
+    (job_dir / "pid").write_text(str(gone.pid))
+    (job_dir / "status.json").write_text(json.dumps(remote))
+    missing = tmp_path / "missing"
+    monkeypatch.setattr(dispatcher.agent, "_kill_request_path", lambda d: str(missing / "kill-requested"))
+    other = []
+
+    def run(worker, cmd, timeout=None, **kwargs):
+        if cmd.endswith(f'kill "{ORPHAN["rjob"]}"'):
+            return subprocess.CompletedProcess(cmd, dispatcher.agent.main(["kill", str(job_dir)]))
+        other.append(cmd)
+        return subprocess.CompletedProcess(cmd, 255)
+
+    monkeypatch.setattr(dispatcher.engine.transport, "run", run)
+    monkeypatch.setattr(dispatcher, "start_queued", lambda *a, **k: [])
+    lines = dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
+    assert any("cancelled orphaned remote job on pro" in line for line in lines), lines
+    entry = dispatcher.load_entries()[0]
+    assert entry["orphan"] is None and "no-op" in entry["note"]
+    assert other == [] and not missing.exists()
