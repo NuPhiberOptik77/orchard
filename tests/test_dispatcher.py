@@ -432,7 +432,8 @@ def test_running_pid_rejects_reused_pid(tmp_path, monkeypatch):
 def test_proc_command_reads_the_real_command_line():
     proc = subprocess.Popen(["sleep", "30"])
     try:
-        assert dispatcher._proc_command(proc.pid).split() == ["sleep", "30"]
+        # Under user-mode emulation (qemu, Rosetta) ps shows the emulator first.
+        assert dispatcher._proc_command(proc.pid).split()[-2:] == ["sleep", "30"]
         assert not dispatcher._is_dispatcher(proc.pid)
     finally:
         proc.kill()
