@@ -24,7 +24,7 @@ Linux disk is a file on C: that can't grow past C:'s free space. So
 distro every 10 seconds:
 
 ```json
-{"ts": 1767225600, "idle_seconds": 412.5, "power": "ac", "battery_pct": 60, "disk_free_gb": 210.4, "source": "windows"}
+{"ts":1767225600,"idle_seconds":412.5,"power":"ac","battery_pct":60,"disk_free_gb":210.4,"source":"windows"}
 ```
 
 The agent fails closed. When the file is missing, unreadable, incomplete or
@@ -172,7 +172,9 @@ harmlessly.
    line: that is the startup task's writer. If none does, restart Windows and
    check again; `Get-ScheduledTaskInfo 'Orchard WSL worker (startup)'` shows
    the task's last result. A minute later `cat ~/.orchard/host-status.json`
-   in the distro shows fresh numbers.
+   in the distro shows fresh numbers. This only shows that the startup task's
+   writer started; the check with nobody signed in at the end of this guide
+   is what shows the VM stays up without you.
 9. **Clean up old jobs.** Nothing deletes finished job folders on the worker
    by itself, and they fill C: in the end. A cron line in the distro runs the
    agent's cleanup every 6 hours: folders older than 2 days go, then newer
@@ -221,7 +223,9 @@ ssh <alias> 'cat ~/.orchard/host-status.json; echo; date +%s'
 ```
 
 It should say `"source":"windows-signed-out"`, with a `ts` no more than about
-20 s behind the number on the last line. If ssh can't connect after a restart
+20 s behind the number on the last line. `"source":"windows"` before you've
+signed in means Windows signed you in by itself (it can after an update):
+sign out from the Start menu and check again. If ssh can't connect after a restart
 with nobody signed in, the startup task didn't start WSL: sign in and go back
 over step 8. ssh working with a missing file or an old `ts` means the writer
 stopped.

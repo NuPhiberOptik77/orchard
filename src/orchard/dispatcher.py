@@ -363,6 +363,10 @@ def tick(workers: list[Worker] | None = None) -> list[str]:
             busy.add(entry["worker"])
 
     for entry in entries:
+        # Synced first: the loops above make ssh calls, which give `orchard
+        # cancel` time to rewrite the entry.
+        if not entry.get("orphan") or not _fresh(entry):
+            continue
         orphan = entry.get("orphan")
         if not orphan:
             continue
@@ -435,6 +439,7 @@ def _hold_or_fallback(entry: dict, job: JobSpec, cfg: dict, reason: str) -> list
             entry.update(
                 worker="local",
                 held_since=None,
+                preempted_attempt=None,
                 note=f"{reason}; falling back to local after {waited / 60:.0f}m",
             )
             save_entry(entry)
@@ -568,7 +573,15 @@ def start_queued(
     if caps is None:
         return _hold_or_fallback(entry, job, cfg, "worker unreachable")
 
-    if engine.remote_job_running(worker, entry["id"]):
+    if entry.get("preempted_attempt") is not None:
+        # track_paused stopped this attempt. Its marker stays until the whole
+        # group is gone, and a job that traps SIGTERM can take the agent's grace
+        # to exit, so adopting it would collect the dying run. Wait for it to
+        # end, then launch the next attempt, which resumes from its checkpoint.
+        if engine.remote_job_alive(worker, entry["id"]) is not False:
+            return _hold_or_fallback(entry, job, cfg, f"waiting for the preempted run on {worker.name} to end")
+        entry["preempted_attempt"] = None
+    elif engine.remote_job_running(worker, entry["id"]):
         entry.update(
             state="running",
             misses=0,
@@ -840,7 +853,6 @@ def settle_orphan(entry: dict, worker: Worker) -> list[str]:
     orphan = entry["orphan"]
     rjob = orphan["rjob"]
     expected = orphan.get("attempt")
-    note = entry.get("note") or ""
     # A run that went on to the end after its agent died still reads "running";
     # its own exit record settles it, so it is adopted instead of cancelled and
     # run twice. An agent too old to settle answers False and the plain status
@@ -855,13 +867,11 @@ def settle_orphan(entry: dict, worker: Worker) -> list[str]:
     if status is None:
         if not engine.remote_status_missing(worker, rjob):
             if asks < ORPHAN_ASKS:
-                orphan["asks"] = asks
-                save_entry(entry)
+                _save_orphan(entry, None, orphan={**orphan, "asks": asks})
                 return [f"{job_id}: no clear answer about the orphan on {worker.name}; asking again"]
             # The agent's `kill` skips its boot and pid fences when it can't
             # read the status, so an orphan nothing vouches for is let go.
-            entry.update(orphan=None, note=f"{note}; orphan left alone (no readable status on {worker.name})")
-            save_entry(entry)
+            _save_orphan(entry, f"orphan left alone (no readable status on {worker.name})", orphan=None)
             events.append("orphan", job=job_id, worker=worker.name, outcome="dropped", attempt=expected)
             return [f"{job_id}: no readable status for the orphan on {worker.name}; left it alone"]
         status = {}
@@ -872,14 +882,12 @@ def settle_orphan(entry: dict, worker: Worker) -> list[str]:
         ok = engine.kill_remote(worker, rjob)
         if ok is None:
             return [f"{job_id}: could not reach {worker.name} to cancel the orphan; trying again"]
-        entry.update(orphan=None, note=f"{note}; orphan cancelled ({'ok' if ok else 'no-op'})")
-        save_entry(entry)
+        _save_orphan(entry, f"orphan cancelled ({'ok' if ok else 'no-op'})", orphan=None)
         events.append("orphan", job=job_id, worker=worker.name, outcome="cancelled", attempt=expected)
         return [f"{job_id}: cancelled orphaned remote job on {worker.name}"]
 
     if attempt is not None and expected is not None and attempt != expected:
-        entry.update(orphan=None, note=f"{note}; orphan ignored (attempt {attempt}, expected {expected})")
-        save_entry(entry)
+        _save_orphan(entry, f"orphan ignored (attempt {attempt}, expected {expected})", orphan=None)
         events.append("orphan", job=job_id, worker=worker.name, outcome="stale", state=state, attempt=attempt)
         return [f"{job_id}: ignored stale orphan result on {worker.name}"]
 
@@ -897,8 +905,10 @@ def settle_orphan(entry: dict, worker: Worker) -> list[str]:
             _stop_local_rerun(entry, sdir)
         engine.collect_remote(worker, job_id, rjob, sdir, cwd)
         _keep_final_status(sdir, status)
-        stopped ="local rerun stopped" if rerun == "running" else "local rerun not started"
-        entry.update(
+        stopped = "local rerun stopped" if rerun == "running" else "local rerun not started"
+        if not _save_orphan(
+            entry,
+            f"orphan succeeded on {worker.name} while out of contact (collected into {sdir})",
             state="done",
             worker=worker.name,
             rhome=orphan.get("rhome"),
@@ -906,8 +916,8 @@ def settle_orphan(entry: dict, worker: Worker) -> list[str]:
             orphan=None,
             paused_since=None,
             note=f"succeeded on {worker.name} while out of contact (exit {status.get('exit_code')}); {stopped}",
-        )
-        save_entry(entry)
+        ):
+            return [f"{job_id}: orphan succeeded on {worker.name}; collected, job left {entry.get('state')}"]
         events.append(
             "finished",
             job=job_id,
@@ -933,8 +943,7 @@ def settle_orphan(entry: dict, worker: Worker) -> list[str]:
     side.mkdir(parents=True, exist_ok=True)
     engine.collect_remote(worker, job_id, rjob, side, cwd, artifacts=cwd / ".orchard-out" / job_id / "orphan")
     _keep_final_status(side, status)
-    entry.update(orphan=None, note=f"{note}; orphan {state} on {worker.name} while out of contact (kept in {side})")
-    save_entry(entry)
+    _save_orphan(entry, f"orphan {state} on {worker.name} while out of contact (kept in {side})", orphan=None)
     events.append(
         "orphan",
         job=job_id,
@@ -946,6 +955,29 @@ def settle_orphan(entry: dict, worker: Worker) -> list[str]:
         duplicate=ran_again,
     )
     return [f"{job_id}: orphan {state} on {worker.name}; result kept beside the rerun"]
+
+
+def _save_orphan(entry: dict, suffix: str | None, **changes) -> bool:
+    """Save what settle_orphan decided without undoing a change made while it ran.
+
+    Its ssh calls can take a while, and `orchard cancel` may rewrite the entry
+    in that time. Then only the orphan field and `suffix` (added to the note)
+    are applied to what is on disk, and this returns False.
+    """
+    try:
+        disk = json.loads(entry_path(entry["id"]).read_text())
+    except (OSError, json.JSONDecodeError):
+        disk = None
+    applied = disk is None or disk.get("state") == entry.get("state")
+    if not applied:
+        entry.clear()
+        entry.update(disk)
+        changes = {k: v for k, v in changes.items() if k == "orphan"}
+    if suffix and "note" not in changes:
+        changes["note"] = f"{entry.get('note') or ''}; {suffix}"
+    entry.update(changes)
+    save_entry(entry)
+    return applied
 
 
 def _stop_local_rerun(entry: dict, sdir: Path) -> None:
@@ -984,12 +1016,17 @@ def track_paused(entry: dict, status: dict, worker_map: dict[str, Worker], cfg: 
         worker_name = entry["worker"]
         if worker_name != "local":
             worker = worker_map.get(worker_name)
-            if worker is not None:
-                engine.kill_remote(worker, engine.remote_job_dir(entry["rhome"], job_id))
+            if worker is not None and engine.kill_remote(worker, engine.remote_job_dir(entry["rhome"], job_id)) is None:
+                # Requeued now, the job could fall back to local while the paused
+                # run waits on the worker, untracked, to resume. Ask again next poll.
+                entry["note"] = f"paused: {reason}; could not reach {worker_name} to preempt; retrying"
+                save_entry(entry)
+                return [f"{job_id}: could not reach {worker_name} to preempt; retrying"]
         entry.update(
             state="queued",
             paused_since=None,
             misses=0,
+            preempted_attempt=entry.get("attempts", 0),
             note="preempted after long pause; resumes from checkpoint",
         )
         save_entry(entry)

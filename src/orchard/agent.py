@@ -50,11 +50,60 @@ def _marker_path(job_id):
 def _group_alive(pid):
     try:
         os.killpg(int(pid), 0)
-        return True
     except ProcessLookupError:
         return False
+    except PermissionError:
+        # macOS's answer for a group of unreaped zombies, and everywhere for a
+        # group of another user's processes: a number reused since the marker
+        # was written. Only a member of our own still counts.
+        return _group_has_own_process(pid) is not False
     except OSError:
         return True
+    return _group_has_live_member(pid) is not False
+
+
+def _group_has_live_member(pgid):
+    """Whether pgid has a member that isn't a zombie; None when /proc can't say.
+
+    Linux answers killpg(pgid, 0) for a group of zombies too, and under a PID 1
+    that doesn't reap (a container without an init) they stay. The state is
+    the first field after the command name's last ")" and the group the third.
+    """
+    if os_family() != "linux":
+        return None
+    try:
+        pids = [name for name in os.listdir("/proc") if name.isdigit()]
+    except OSError:
+        return None
+    seen = False
+    for name in pids:
+        try:
+            fields = _read_text("/proc/%s/stat" % name).rsplit(")", 1)[1].split()
+            if int(fields[2]) != int(pgid):
+                continue
+        except (IndexError, ValueError):
+            continue
+        seen = True
+        if fields[0] not in ("Z", "X"):
+            return True
+    return False if seen else None
+
+
+def _group_has_own_process(pgid):
+    """Whether one of pgid's members runs as us; None when ps can't say."""
+    found = False
+    uid = os.getuid()
+    for line in _run(["ps", "-axo", "pgid=,uid="]).splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        found = True
+        try:
+            if int(parts[0]) == int(pgid) and int(parts[1]) == uid:
+                return True
+        except ValueError:
+            continue
+    return False if found else None
 
 
 def boot_id():
@@ -326,9 +375,17 @@ def benchmark(python_path=None, iterations=300000):
     return round(iterations / dt, 0)
 
 
-def other_cpu_pct(own_pgid):
+def other_cpu_pct(job_pgid=None):
+    """CPU used by everything but this agent and the job, in percent; None if unknown.
+
+    ps reports each process's CPU time over its lifetime, so a process seconds
+    old can read 50-100% (on Linux; less on macOS, but not 0). This agent, the
+    shell that started it and ps itself are all that young, and all in the
+    agent's process group, so that group is left out with the job's.
+    """
+    mine = {os.getpgrp(), job_pgid}
     total = 0.0
-    own = 0.0
+    rows = 0
     for line in _run(["ps", "-axo", "pgid=,pcpu="]).splitlines():
         parts = line.split()
         if len(parts) != 2:
@@ -337,10 +394,11 @@ def other_cpu_pct(own_pgid):
             pgid, cpu = int(parts[0]), float(parts[1])
         except ValueError:
             continue
-        total += cpu
-        if pgid == own_pgid:
-            own += cpu
-    return round(total - own, 1)
+        rows += 1
+        if pgid not in mine:
+            total += cpu
+    # No ps (a minimal image without procps) prints nothing; 0% would read idle.
+    return round(total, 1) if rows else None
 
 
 def _xcode_path():
@@ -439,7 +497,7 @@ def collect_caps(bench_python=None):
         "power": power,
         "battery_pct": pct,
         "pause_on_low_battery_pct": policy.get("pause_on_low_battery_pct"),
-        "other_cpu_pct": other_cpu_pct(None) if max_other is not None else None,
+        "other_cpu_pct": other_cpu_pct() if max_other is not None else None,
         "max_other_cpu_pct": max_other,
         "thermal_limit": thermal,
         "host_status": host_status,
@@ -594,8 +652,13 @@ def _stop_group(pgid, leader, started):
     let go, it would start the command after the stop and the job would run
     on unpaused. wrap writes `started` right after the command starts, and a
     stopped wrap can't write it, so checking for it after the stop is safe.
+
+    macOS can miss a process that is forking or execing when the group is
+    stopped, and it then runs on unpaused, so the group is stopped twice.
     Raises what killpg raises.
     """
+    os.killpg(pgid, signal.SIGSTOP)
+    time.sleep(0.05)
     os.killpg(pgid, signal.SIGSTOP)
     if not os.path.exists(started):
         return
@@ -619,6 +682,8 @@ def _terminate_group(pgid, grace=10.0):
         try:
             os.killpg(pgid, 0)
         except gone:
+            return
+        if _group_has_live_member(pgid) is False:
             return
         time.sleep(0.25)
     try:
@@ -670,8 +735,9 @@ def cmd_exec(argv):
 
     preempt = bool(job.get("preempt"))
     # The job records its own start and exit (see cmd_wrap), so drop an
-    # earlier attempt's.
-    for path in (exit_path, started_path):
+    # earlier attempt's. Its pid goes too: until this attempt's is written,
+    # a kill or pause must find no process rather than the last attempt's.
+    for path in (exit_path, started_path, pid_path):
         try:
             os.unlink(path)
         except OSError:
@@ -978,7 +1044,10 @@ def cmd_signal(argv, sig, label, cont_first=False):
         return 1
     except PermissionError:
         # macOS, for a group of unreaped zombies: its agent reaps them and
-        # clears the marker.
+        # clears the marker. A group with none of our processes is another
+        # user's, its number reused, and the marker is stale.
+        if not _group_alive(pgid):
+            clear_running_marker(os.path.basename(argv[0].rstrip("/")))
         print("process group not running", file=sys.stderr)
         return 1
     return 0

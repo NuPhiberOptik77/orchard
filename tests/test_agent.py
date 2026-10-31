@@ -239,8 +239,8 @@ def test_job_killed_while_paused_ends_at_once(tmp_path, monkeypatch):
     killer.join()
     assert time.time() - started < 5
     assert (rc, status["state"], status["exit_code"]) == (1, "failed", -signal.SIGKILL)
-    # One stop, then the agent's check that nothing of the group is left.
-    assert sent == [signal.SIGSTOP, 0]
+    # One pause (two stops), then the agent's check that nothing of the group is left.
+    assert sent == [signal.SIGSTOP, signal.SIGSTOP, 0]
     ended = json.loads((tmp_path / "job" / "exit.json").read_text())
     assert ended["exit_code"] == -signal.SIGKILL
 
@@ -331,6 +331,45 @@ def test_call_command_passes_on_an_early_signal(tmp_path):
                          capture_output=True, text=True, timeout=30, start_new_session=True)
     assert out.stdout.split() == [str(-signal.SIGTERM)] * 2 + ["True"], out.stderr
     assert agent._call_command(["sh", "-c", "exit 3"], []) == 3
+
+
+def test_call_command_survives_a_failed_start(monkeypatch):
+    # Popen raises SubprocessError, not OSError, when the child dies between
+    # fork and exec. The command never started: 126, or the early signal.
+    def popen(*a, **k):
+        raise subprocess.SubprocessError("Exception occurred in preexec_fn.")
+
+    monkeypatch.setattr(agent.subprocess, "Popen", popen)
+    assert agent._call_command(["true"], []) == 126
+    assert agent._call_command(["true"], [signal.SIGTERM]) == -signal.SIGTERM
+
+
+def test_exec_drops_the_last_attempts_files_before_starting(tmp_path, monkeypatch):
+    # Until this attempt's pid is written, a kill or pause must find no
+    # process rather than the last attempt's.
+    monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(agent, "load_policy", lambda: dict(agent.DEFAULT_POLICY))
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    stale = [job_dir / "pid", job_dir / "exit.json", Path(agent._started_path(str(job_dir)))]
+    for path in stale:
+        path.write_text("1")
+    seen = []
+    real_popen = agent.subprocess.Popen
+
+    def popen(argv, **kw):
+        if "wrap" in argv:
+            seen.append([path.exists() for path in stale])
+            raise OSError(errno.EAGAIN, "Resource temporarily unavailable")
+        return real_popen(argv, **kw)
+
+    monkeypatch.setattr(agent.subprocess, "Popen", popen)
+    job = {"id": "j1", "cmd": ["true"], "venv": None, "workdir": str(tmp_path),
+           "job_dir": str(job_dir), "timeout_s": None, "preempt": False, "env": {}, "attempt": 2}
+    (job_dir / "job.json").write_text(json.dumps(job))
+    assert agent.cmd_exec([str(job_dir / "job.json")]) == 1
+    assert seen == [[False, False, False]]
+    assert json.loads((job_dir / "status.json").read_text())["state"] == "failed"
 
 
 def test_wrap_passes_on_a_signal_that_came_before_the_command(tmp_path):
@@ -446,11 +485,12 @@ def test_pause_lets_wrap_run_only_once_the_command_started(tmp_path, monkeypatch
     monkeypatch.setattr(agent.os, "killpg", lambda pgid, sig: calls.append(("group", pgid, sig)))
     monkeypatch.setattr(agent.os, "kill", lambda pid, sig: calls.append(("leader", pid, sig)))
     assert agent.cmd_signal([str(job_dir)], signal.SIGSTOP, "pause") == 0
-    assert calls == [("group", 4242, signal.SIGSTOP)]
+    # Stopped twice: macOS can miss a process that is forking during the first.
+    assert calls == [("group", 4242, signal.SIGSTOP)] * 2
     calls.clear()
     (job_dir / "command.pid").write_text("4243")
     assert agent.cmd_signal([str(job_dir)], signal.SIGSTOP, "pause") == 0
-    assert calls == [("group", 4242, signal.SIGSTOP), ("leader", 4242, signal.SIGCONT)]
+    assert calls == [("group", 4242, signal.SIGSTOP)] * 2 + [("leader", 4242, signal.SIGCONT)]
 
 
 def test_keep_awake_watches_wrap(tmp_path, monkeypatch):
@@ -747,22 +787,118 @@ def test_process_start_counts_fields_after_the_last_paren(monkeypatch):
     assert agent.process_start(42) == 22
 
 
-def test_signal_survives_eperm(tmp_path, monkeypatch):
-    # macOS answers EPERM for a group of unreaped zombies: nothing to signal.
-    # Its agent reaps them and clears the marker.
+def _signal_job(tmp_path, monkeypatch, error, own=None):
+    """cmd_signal a job whose group answers killpg with `error`; True if its marker is kept."""
     monkeypatch.setattr(agent, "ORCHARD_HOME", str(tmp_path / "home"))
     job_dir = tmp_path / "home" / "jobs" / "job-e"
-    job_dir.mkdir(parents=True)
+    job_dir.mkdir(parents=True, exist_ok=True)
     (job_dir / "pid").write_text(str(os.getpid()))
     (job_dir / "status.json").write_text(json.dumps({"state": "running"}))
     agent.write_running_marker("job-e", os.getpid())
 
     def killpg(pgid, sig):
+        raise error
+
+    monkeypatch.setattr(agent.os, "killpg", killpg)
+    monkeypatch.setattr(agent, "_group_has_own_process", lambda pgid: own)
+    assert agent.cmd_signal([str(job_dir)], signal.SIGSTOP, "pause") == 1
+    return os.path.exists(agent._marker_path("job-e"))
+
+
+def test_signal_survives_eperm(tmp_path, monkeypatch):
+    # macOS answers EPERM for a group of unreaped zombies: nothing to signal.
+    # Its agent reaps them and clears the marker.
+    assert _signal_job(tmp_path, monkeypatch, PermissionError(1, "Operation not permitted"), own=True)
+    # ps unavailable: keep it, as before.
+    assert _signal_job(tmp_path, monkeypatch, PermissionError(1, "Operation not permitted"), own=None)
+
+
+def test_signal_eperm_from_another_users_group_clears_the_marker(tmp_path, monkeypatch):
+    # macOS has no start-time fence: a pgid reused by another user's group
+    # answers EPERM too, and must not keep the worker busy forever.
+    assert not _signal_job(tmp_path, monkeypatch, PermissionError(1, "Operation not permitted"), own=False)
+
+
+def test_signal_esrch_clears_the_marker(tmp_path, monkeypatch):
+    assert not _signal_job(tmp_path, monkeypatch, ProcessLookupError(3, "No such process"), own=True)
+
+
+def test_group_alive_on_eperm_asks_whose_group_it_is(monkeypatch):
+    def killpg(pgid, sig):
         raise PermissionError(1, "Operation not permitted")
 
     monkeypatch.setattr(agent.os, "killpg", killpg)
-    assert agent.cmd_signal([str(job_dir)], signal.SIGSTOP, "pause") == 1
-    assert os.path.exists(agent._marker_path("job-e"))
+    for own, alive in ((True, True), (None, True), (False, False)):
+        monkeypatch.setattr(agent, "_group_has_own_process", lambda pgid, own=own: own)
+        assert agent._group_alive(4242) is alive
+
+
+def test_group_has_own_process_reads_ps(monkeypatch):
+    uid = os.getuid()
+    rows = {"ps": "  4242   %d\n  4242   %d\n  777   %d\n" % (uid + 1, uid + 2, uid)}
+    monkeypatch.setattr(agent, "_run", lambda cmd, **k: rows["ps"])
+    assert agent._group_has_own_process(4242) is False
+    assert agent._group_has_own_process(777) is True
+    rows["ps"] = ""
+    assert agent._group_has_own_process(4242) is None
+
+
+def _fake_proc(monkeypatch, stats):
+    """Pretend to be Linux with /proc/<pid>/stat as given ({pid: (state, pgrp)})."""
+    monkeypatch.setattr(agent, "os_family", lambda: "linux")
+    real_listdir = os.listdir
+    monkeypatch.setattr(agent.os, "listdir",
+                        lambda path: [str(p) for p in stats] + ["self"] if path == "/proc" else real_listdir(path))
+    monkeypatch.setattr(agent, "_read_text", lambda path: "%s (a) b) %s 1 %s 0 0" % (
+        path.split("/")[2], *stats[int(path.split("/")[2])]) if path.split("/")[2].isdigit() else "")
+
+
+def test_group_of_zombies_is_gone_on_linux(monkeypatch):
+    # Linux answers killpg(pgid, 0) for zombies, and a PID 1 that doesn't reap
+    # (a container without an init) leaves them there.
+    _fake_proc(monkeypatch, {10: ("Z", 10), 11: ("Z", 10), 12: ("S", 99)})
+    monkeypatch.setattr(agent.os, "killpg", lambda pgid, sig: None)
+    assert agent._group_has_live_member(10) is False
+    assert agent._group_alive(10) is False
+    assert agent._group_has_live_member(99) is True
+    assert agent._group_alive(99) is True
+    assert agent._group_has_live_member(5) is None
+    assert agent._group_alive(5) is True
+
+
+def test_terminate_stops_waiting_for_a_group_of_zombies(monkeypatch):
+    _fake_proc(monkeypatch, {10: ("Z", 10)})
+    sent = []
+    monkeypatch.setattr(agent.os, "killpg", lambda pgid, sig: sent.append(sig))
+    started = time.time()
+    agent._terminate_group(10, grace=5)
+    assert time.time() - started < 1
+    assert signal.SIGKILL not in sent
+
+
+def test_terminate_wakes_a_paused_group(tmp_path):
+    # A stopped process only acts on SIGTERM once it runs again: without the
+    # SIGCONT it is SIGKILLed after the grace and never gets to clean up.
+    flag = tmp_path / "terminated"
+    code = ("import signal, sys, time, pathlib\n"
+            "def bye(*a):\n    pathlib.Path(%r).write_text('x'); sys.exit(0)\n"
+            "signal.signal(signal.SIGTERM, bye)\n"
+            "print('ready', flush=True)\n"
+            "time.sleep(30)\n" % str(flag))
+    proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, start_new_session=True)
+    try:
+        assert proc.stdout.readline().strip() == b"ready"
+        os.killpg(proc.pid, signal.SIGSTOP)
+        reaper = threading.Thread(target=proc.wait, daemon=True)
+        reaper.start()
+        agent._terminate_group(proc.pid, grace=5)
+        reaper.join(5)
+        assert flag.exists()
+        assert proc.returncode == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
 
 
 def test_cmd_running(capsys, tmp_path, monkeypatch):
@@ -953,6 +1089,58 @@ def test_sample_preemption_linux_uses_host_status(monkeypatch, tmp_path):
     sample_ = agent.sample_preemption_state(dict(agent.DEFAULT_POLICY), 0)
     assert sample_["host_status"] == "missing"
     assert agent.decide_preemption(sample_, dict(agent.DEFAULT_POLICY), False) == ("pause", "host status missing")
+
+
+def test_collect_caps_carries_what_decide_preemption_reads(monkeypatch, tmp_path):
+    # The dispatcher holds a worker a job would pause on at once, so caps say
+    # everything decide_preemption checks. The agent's own process group is
+    # seconds old and reads high, so it doesn't count as other CPU.
+    fake_linux(monkeypatch, tmp_path, {"idle_seconds": 900, "power": "ac", "battery_pct": 37})
+    rows = "%d 90.0\n4242 4.5\n4243 2.0\n" % os.getpgrp()
+    monkeypatch.setattr(agent, "_run", lambda argv, **k: rows if argv[0] == "ps" else "")
+    monkeypatch.setattr(agent, "running_jobs", lambda: ["j7", "j8"])
+    (tmp_path / "policy.json").write_text(json.dumps(
+        {"max_other_cpu_pct": 25, "pause_on_low_battery_pct": 30, "paused": True}))
+    caps = agent.collect_caps()
+    assert caps["battery_pct"] == 37
+    assert caps["pause_on_low_battery_pct"] == 30
+    assert caps["other_cpu_pct"] == 6.5
+    assert caps["max_other_cpu_pct"] == 25
+    assert caps["policy_paused"] is True
+    assert caps["busy_jobs"] == ["j7", "j8"]
+    assert caps["busy_job"] == "j7"
+
+    (tmp_path / "policy.json").unlink()
+    monkeypatch.setattr(agent, "_run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("ps unasked")))
+    monkeypatch.setattr(agent, "running_jobs", lambda: [])
+    caps = agent.collect_caps()
+    assert caps["other_cpu_pct"] is None
+    assert caps["max_other_cpu_pct"] is None
+    assert caps["pause_on_low_battery_pct"] == agent.DEFAULT_POLICY["pause_on_low_battery_pct"]
+    assert caps["policy_paused"] is False
+    assert (caps["busy_jobs"], caps["busy_job"]) == ([], None)
+
+
+def test_sampler_leaves_out_the_agent_and_the_job(monkeypatch, tmp_path):
+    fake_linux(monkeypatch, tmp_path, {"idle_seconds": 900, "power": "ac"})
+    policy = {**agent.DEFAULT_POLICY, "max_other_cpu_pct": 25}
+    me = os.getpgrp()
+    for other, action in ((3.0, None), (30.0, "pause")):
+        rows = "%d 80.0\n4242 70.0\n4243 %s\n" % (me, other)
+        monkeypatch.setattr(agent, "_run", lambda argv, rows=rows, **k: rows if argv[0] == "ps" else "")
+        sample_ = agent.sample_preemption_state(policy, 4242)
+        assert sample_["other_cpu_pct"] == other
+        assert agent.decide_preemption(sample_, policy, False)[0] == action
+
+
+def test_other_cpu_is_unknown_without_ps(monkeypatch):
+    # A minimal image without procps: no rows is not 0% busy, and an unknown
+    # reading holds nothing.
+    monkeypatch.setattr(agent, "_run", lambda *a, **k: "")
+    assert agent.other_cpu_pct(4242) is None
+    policy = {**agent.DEFAULT_POLICY, "max_other_cpu_pct": 25}
+    sample_ = {"idle_seconds": 900, "power": "ac", "other_cpu_pct": None}
+    assert agent.decide_preemption(sample_, policy, False) == (None, None)
 
 
 def test_collect_caps_macos_has_no_host_status():

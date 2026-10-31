@@ -99,6 +99,26 @@ def test_doctor_flags_dispatcher_killed_without_cleanup(tmp_path, monkeypatch):
     assert "1 queued job(s) will not start" in result.output
 
 
+def test_doctor_says_when_other_cpu_cant_be_read(tmp_path, monkeypatch):
+    # A worker with no ps can't honour max_other_cpu_pct, and the dispatcher
+    # ignores it there, so doctor says so rather than letting it look enforced.
+    _isolate_control_plane(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(cli.store, "BLOB_DIR", tmp_path / "blobs")
+    monkeypatch.setattr(cli.dispatcher, "load_entries", lambda: [])
+    monkeypatch.setattr(cli, "load_workers", lambda: [Worker(name="pro", host="10.0.0.9")])
+    monkeypatch.setattr(cli.transport, "file_sha256_remote", lambda w, path: None)
+    unknown = "other CPU unknown (no ps), max_other_cpu_pct ignored"
+    for caps, shown in (
+        (dict(FULL_CAPS, max_other_cpu_pct=25, other_cpu_pct=None), True),
+        (dict(FULL_CAPS, max_other_cpu_pct=25, other_cpu_pct=3.0), False),
+        (dict(FULL_CAPS, max_other_cpu_pct=None, other_cpu_pct=None), False),
+    ):
+        monkeypatch.setattr(cli.engine, "remote_caps", lambda worker, caps=caps: caps)
+        result = CliRunner().invoke(cli.app, ["doctor"])
+        assert (unknown in result.output) == shown, result.output
+
+
 def test_watch_hands_off_to_launchd(tmp_path, monkeypatch):
     _isolate_control_plane(tmp_path, monkeypatch, installed=True, agent=(True, 4242))
     monkeypatch.delenv(cli.dispatcher.SUPERVISED_ENV, raising=False)

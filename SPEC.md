@@ -290,7 +290,7 @@ marks the entry failed instead of tracking it forever.
 |---|---|---|
 | Suspend when user active | yes; "in use" = input in last 3 min | BOINC default |
 | Suspend on battery | yes | BOINC default |
-| Suspend when non-orchard CPU > 25% | **off by default** (opt-in: `policy.json` → `max_other_cpu_pct`) | BOINC default available but noisy on macOS |
+| Suspend when non-orchard CPU > 25% | **off by default** (opt-in: `policy.json` → `max_other_cpu_pct`) | BOINC default available but noisy: `ps` CPU is a lifetime average, so young processes read high on macOS and Linux. The agent's own process group and the job's don't count; with no `ps` the reading is unknown and the limit is ignored |
 | Thermal preemption | pause below limit 50, resume at 60 (hysteresis); macOS only | `pmset -g therm` |
 | Short suspends | SIGSTOP in place (instant resume) | BOINC "leave tasks in memory" |
 | Long suspends (>30 min) | dispatcher kills and requeues; resumes from checkpoint | BOINC unload model |

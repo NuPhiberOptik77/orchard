@@ -681,6 +681,8 @@ def doctor() -> None:
         line = f"  {mark}  {w.name}: {idle_txt} · {caps.get('power', '?')} · {disk:.1f} GB free"
         if caps.get("policy_paused"):
             line += " · paused by owner"
+        if caps.get("max_other_cpu_pct") is not None and caps.get("other_cpu_pct") is None:
+            line += " · other CPU unknown (no ps), max_other_cpu_pct ignored"
         if caps.get("host_status") not in (None, "ok"):
             line += f" · host status {caps['host_status']}"
         print(line)

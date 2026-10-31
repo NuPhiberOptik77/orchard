@@ -488,6 +488,7 @@ def test_is_dispatcher_matches_whole_words(monkeypatch):
     for cmd, want in (("/Users/x/orchard/.venv/bin/python -m orchard dispatch --watch", True),
                       ("/Users/x/My Project/orchard/bin/orchard dispatch", True),
                       ("vim /Users/x/orchard/src/orchard/dispatcher.py", False),
+                      ("/Users/x/orchard/bin/orchard dispatcher-log", False),
                       ("python -m orchard status", False)):
         monkeypatch.setattr(dispatcher, "_proc_command", lambda pid, c=cmd: c)
         assert dispatcher._is_dispatcher(os.getpid()) is want, cmd
@@ -891,3 +892,102 @@ def test_stalled_run_that_ran_on_after_its_agent_died_is_collected(tmp_path, mon
     assert out[-1] == ["demo-s: succeeded on pro"]
     assert any(e["event"] == "finished" for e in events.load())
     assert not any(e["event"] == "requeued" for e in events.load())
+
+
+def test_kept_orphan_keeps_its_settled_status(tmp_path, monkeypatch):
+    # The worker's status.json still says running (its agent died), and the
+    # copy collect_remote pulls would say so too: the settled status wins.
+    settled = {"state": "failed", "exit_code": -15, "attempt": 1}
+    sdir, _cwd, kills, _collected = _orphaned(
+        tmp_path, monkeypatch, {"state": "running", "attempt": 1}, "done", settled=settled
+    )
+    lines = dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
+    assert any("result kept beside the rerun" in line for line in lines)
+    assert kills == []
+    assert json.loads((sdir / "orphan" / "status.json").read_text()) == settled
+
+
+def test_orphan_outcome_does_not_undo_a_cancel(tmp_path, monkeypatch):
+    # `orchard cancel` rewrites the entry while settle_orphan waits on ssh.
+    for i, (remote, kept) in enumerate(((
+        {"state": "running", "attempt": 1}, "orphan cancelled (ok)"),
+        ({"state": "succeeded", "exit_code": 0, "attempt": 1}, "orphan succeeded on pro while out of contact"),
+    )):
+        (tmp_path / str(i)).mkdir()
+        _orphaned(tmp_path / str(i), monkeypatch, remote, "running", settled=remote)
+        path = dispatcher.entry_path("demo-o")
+
+        def cancel_meanwhile(worker, rjob, remote=remote):
+            disk = json.loads(path.read_text())
+            disk.update(state="cancelled", note="cancelled by user (was running)")
+            path.write_text(json.dumps(disk))
+            return remote
+
+        monkeypatch.setattr(dispatcher.engine, "remote_settle", cancel_meanwhile)
+        dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
+        entry = json.loads(path.read_text())
+        assert (entry["state"], entry["worker"], entry["orphan"]) == ("cancelled", "local", None)
+        assert entry["note"].startswith("cancelled by user (was running); " + kept), entry["note"]
+    assert not any(e["event"] == "finished" for e in events.load())
+
+
+IDLE_CAPS = {"machine": "x86_64", "idle_seconds": 9999, "power": "ac", "thermal_limit": 100,
+             "ram_gb": 8, "disk_free_gb": 30}
+
+
+def _long_paused(tmp_path, monkeypatch, kill, alive):
+    """A remote job paused past kill_paused_after_s. kill_remote answers `kill`;
+    remote_job_alive pops its answers from `alive`."""
+    monkeypatch.setattr(dispatcher, "QUEUE_DIR", tmp_path / "queue")
+    monkeypatch.setattr(dispatcher.engine, "remote_caps", lambda worker: dict(IDLE_CAPS))
+    paused = {"state": "paused", "attempt": 1, "paused_since": time.time() - 4000, "pause_reason": "user active"}
+    monkeypatch.setattr(dispatcher.engine, "remote_status", lambda worker, rjob: paused)
+    kills, launches = [], []
+    monkeypatch.setattr(dispatcher.engine, "kill_remote", lambda w, rjob: kills.append(rjob) or kill)
+    monkeypatch.setattr(dispatcher.engine, "remote_job_alive", lambda w, job_id: alive.pop(0))
+    # The real marker stays until the group is gone, so this would say yes.
+    monkeypatch.setattr(dispatcher.engine, "remote_job_running", lambda w, job_id: True)
+
+    def launch(worker, job, job_id, sdir, cwd, attempt):
+        launches.append(attempt)
+        return "/Users/x", f"/Users/x/.orchard/jobs/{job_id}"
+
+    monkeypatch.setattr(dispatcher.engine, "launch_remote", launch)
+    entry = dispatcher.enqueue(make_job(), "demo-p", tmp_path / "proj", tmp_path / "state", worker="pro")
+    entry.update(state="running", rhome="/Users/x", attempts=1)
+    dispatcher.save_entry(entry)
+    return kills, launches
+
+
+def test_preempted_run_is_waited_for_then_relaunched_not_adopted(tmp_path, monkeypatch):
+    # A job that traps SIGTERM takes a while to exit after the kill. Adopting
+    # it would collect the dying run; the next attempt resumes instead.
+    kills, launches = _long_paused(tmp_path, monkeypatch, kill=True, alive=[True, None, False])
+    workers = [Worker(name="pro", host="10.0.0.9")]
+    lines = dispatcher.tick(workers=workers)
+    assert any("preempted after 1800s paused" in line for line in lines)
+    assert any("waiting for the preempted run on pro to end" in line for line in lines), lines
+    entry = dispatcher.load_entries()[0]
+    assert (entry["state"], entry["preempted_attempt"]) == ("queued", 1)
+    assert kills == ["/Users/x/.orchard/jobs/demo-p"] and launches == []
+    # No clear answer is not "gone".
+    dispatcher.tick(workers=workers)
+    assert launches == [] and dispatcher.load_entries()[0]["state"] == "queued"
+    lines = dispatcher.tick(workers=workers)
+    assert any("launched on pro" in line for line in lines), lines
+    entry = dispatcher.load_entries()[0]
+    assert (entry["state"], entry["attempts"], entry["preempted_attempt"]) == ("running", 2, None)
+    assert launches == [2]
+    assert not any(e["event"] == "adopted" for e in events.load())
+
+
+def test_preempt_retried_when_the_worker_cant_be_reached(tmp_path, monkeypatch):
+    # Requeued without a kill, the job could fall back to local while the
+    # paused run sits on the worker, untracked, ready to resume.
+    kills, launches = _long_paused(tmp_path, monkeypatch, kill=None, alive=[])
+    lines = dispatcher.tick(workers=[Worker(name="pro", host="10.0.0.9")])
+    assert any("could not reach pro to preempt; retrying" in line for line in lines), lines
+    entry = dispatcher.load_entries()[0]
+    assert entry["state"] == "running" and entry.get("preempted_attempt") is None
+    assert not any(e["event"] == "requeued" for e in events.load())
+    assert len(kills) == 1 and launches == []
