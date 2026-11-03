@@ -284,8 +284,11 @@ a new fact, never coordination.
   laptop's Linux. The rule stays the default, so existing jobs place exactly
   as before. Learning removes it where it is safe: `orchard prove -- <cmd>`
   runs a check on every reachable machine whatever its OS, and each pass is
-  a sealed receipt. A job tagged `-t os:proven` may then go to any OS that
-  has a sealed pass for the same command in the same project. When the OSes
+  a sealed receipt. A job tagged `-t os:proven` may then go to macOS or to
+  any OS whose latest sealed run of the same command in the same project
+  passed; a newer failure there takes that OS away again. The answer is
+  fixed when the job is submitted, so the dispatcher's later checks agree
+  with it, and it never changes the job's work key. When the OSes
   disagree, consensus labels it platform-only and remembers why (a
   case-sensitive path, a missing tool), so the difference becomes knowledge
   instead of a wall. What cannot merge is physical: Xcode, iOS simulators

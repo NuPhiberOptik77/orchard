@@ -10,6 +10,7 @@ DEFAULT_MEM_NEED_GB = 1.0
 OS_TAG_PREFIX = "os:"
 DEFAULT_OS = "macos"
 ANY_OS = "any"
+PROVEN_OS = "proven"
 
 
 @dataclass
@@ -37,7 +38,12 @@ def worker_os(caps: dict) -> str:
 
 def allowed_oses(job: JobSpec) -> set[str]:
     """OSes the job may run on. Default-deny: a job with no `os:*` tag is a macOS job."""
-    return {t[len(OS_TAG_PREFIX):] for t in job.tags or [] if t.startswith(OS_TAG_PREFIX)} or {DEFAULT_OS}
+    allowed = {t[len(OS_TAG_PREFIX):] for t in job.tags or [] if t.startswith(OS_TAG_PREFIX)} or {DEFAULT_OS}
+    if PROVEN_OS in allowed:
+        # Learned portability: macOS plus every OS where a sealed receipt shows
+        # this command passing (attached at submit by receipts.attach_proof).
+        allowed = (allowed - {PROVEN_OS}) | {DEFAULT_OS} | set(job.requires.get("proven_os") or [])
+    return allowed
 
 
 def problems(job: JobSpec, caps: dict) -> list[str]:
@@ -51,6 +57,8 @@ def problems(job: JobSpec, caps: dict) -> list[str]:
     os_name = worker_os(caps)
     if ANY_OS not in allowed and os_name not in allowed:
         hint = f" (add -t {OS_TAG_PREFIX}{os_name} to allow it)" if "," not in os_name else ""
+        if OS_TAG_PREFIX + PROVEN_OS in (job.tags or []):
+            hint = f" (not proven on {os_name} yet; run orchard prove -- <cmd>)"
         probs.append(f"worker OS is {os_name}; job allows {', '.join(sorted(allowed))}{hint}")
     if not caps.get("platform_ok", True):
         probs.append(f"platform resolve failed ({caps.get('platform_note', 'unknown')})")

@@ -24,11 +24,13 @@ import stat
 import time
 from pathlib import Path
 
-from . import events
+from . import events, placement
 from .config import ORCHARD_HOME, STATE_DIR
 from .job import JobSpec
 
 KEY_PATH = ORCHARD_HOME / "receipt.key"
+# Evidence attached to a job at submit; it changes with history, not with the work.
+EVIDENCE_KEYS = ("proven_os",)
 INDEX_DIR = STATE_DIR / "receipts"
 VERSION = 1
 
@@ -113,7 +115,7 @@ def work_fields(job: JobSpec) -> dict:
         "python": job.python,
         "requirements": hashlib.sha256((job.requirements or "").encode()).hexdigest(),
         "tags": sorted(job.tags or []),
-        "requires": job.requires or {},
+        "requires": {k: v for k, v in (job.requires or {}).items() if k not in EVIDENCE_KEYS},
         "env": sorted(job.env or []),
         "env_mac": _mac(_canonical(env_values)) if env_values else None,
     }
@@ -216,6 +218,27 @@ def all_receipts() -> list[dict]:
         except (OSError, json.JSONDecodeError):
             continue
     return found
+
+
+def proven_oses(cmd: list[str], project: Path | str) -> list[str]:
+    """OSes where the latest finished run of cmd in project passed, by verified receipt."""
+    latest: dict[str, dict] = {}
+    for receipt in all_receipts():
+        family = (receipt.get("worker") or {}).get("os_family")
+        if (not family or receipt.get("project") != str(project)
+                or (receipt.get("work") or {}).get("cmd") != list(cmd)
+                or receipt.get("state") == "cancelled" or not verify(receipt)):
+            continue
+        if (receipt.get("sealed_at") or 0) >= (latest.get(family, {}).get("sealed_at") or 0):
+            latest[family] = receipt
+    return sorted(f for f, r in latest.items() if r.get("state") == "succeeded")
+
+
+def attach_proof(job: JobSpec, cwd: Path) -> None:
+    """Record, on an `os:proven` job, the OSes it has passed on. Done once at
+    submit so the dispatcher's later checks read the same answer from spec.json."""
+    if placement.OS_TAG_PREFIX + placement.PROVEN_OS in (job.tags or []):
+        job.requires = {**(job.requires or {}), "proven_os": proven_oses(job.cmd, cwd)}
 
 
 def deep_check(receipt: dict, sdir: Path, out_dir: Path | None) -> list[str]:

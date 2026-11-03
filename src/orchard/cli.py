@@ -364,6 +364,7 @@ def answer_from_receipt(job: JobSpec, cwd: Path) -> dict | None:
 def submit(job: JobSpec, where: str, background: bool, now: bool, cwd: Path, reuse: bool = False) -> None:
     if reuse and answer_from_receipt(job, cwd) is not None:
         raise typer.Exit(0)
+    receipts.attach_proof(job, cwd)
     job_id = new_job_id(job.name)
     sdir = JOBS_DIR / job_id
     sdir.mkdir(parents=True, exist_ok=True)

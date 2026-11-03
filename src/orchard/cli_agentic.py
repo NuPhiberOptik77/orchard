@@ -15,7 +15,7 @@ from typing import Optional
 
 import typer
 
-from . import consensus, fleet, receipts, worlds
+from . import consensus, fleet, placement, receipts, worlds
 from .job import slugify
 from .cli import app, find_jobs
 
@@ -260,3 +260,73 @@ def fork(
     if winner:
         raise typer.Exit(0)
     raise typer.Exit(1 if ready else 2)
+
+
+@app.command()
+def prove(
+    cmd: Optional[list[str]] = typer.Argument(None, help="command to prove (after --)"),
+    on: list[str] = typer.Option([], "--on", help="run only on these machines (repeatable)"),
+    tag: list[str] = typer.Option([], "--tag", "-t", help="required worker capability tag (repeatable)"),
+    env_names: list[str] = typer.Option([], "--env", help="forward this env var to the job (repeatable)"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", help="seconds before each run is killed"),
+    json_out: bool = typer.Option(False, "--json", help="machine-readable output"),
+) -> None:
+    """Run a command on every reachable machine, whatever its OS, and record
+    where it passes. Afterwards `-t os:proven` lets it run on any of those.
+    Exit 0 passed everywhere it ran, 1 failed somewhere, 2 nothing finished."""
+    if not cmd:
+        print("error: provide a command after --", file=sys.stderr)
+        raise typer.Exit(2)
+    cwd = Path.cwd()
+    token = fleet.new_token()
+    say = (lambda _msg: None) if json_out else print
+    tags = list(dict.fromkeys([*tag, placement.OS_TAG_PREFIX + placement.ANY_OS]))
+    targets = list(on) or fleet.capable_targets(fleet.job_like_run(cmd, cwd, tags, env_names, timeout))
+    if not targets:
+        print("prove: no reachable machine can run this", file=sys.stderr)
+        raise typer.Exit(2)
+    say(f"prove: running on {', '.join(targets)}")
+    plans = [{"target": t, "cmd": cmd, "cwd": cwd, "name": fleet.job_name("prove", token, t, i),
+              "tags": tags, "env_names": env_names, "timeout": timeout} for i, t in enumerate(targets)]
+    runs = fleet.run_spread(plans)
+    done = [r for r in runs if consensus.usable(r)]
+    passed_on = sorted({r.get("os_family") or "?" for r in done if consensus.passed(r)})
+    failing = [r for r in done if not consensus.passed(r)]
+    failed_on = sorted({r.get("os_family") or "?" for r in failing})
+    label = reason = sig = None
+    if failing and passed_on:
+        # A split between machines is a consensus verdict; remember it like one.
+        label, reason = consensus.classify(failing[0], [r for r in done if r is not failing[0]])
+        sig = consensus.signature(failing[0].get("log_tail") or "")
+    allowed = sorted({placement.DEFAULT_OS, *receipts.proven_oses(cmd, cwd)})
+    out = {
+        "cmd": list(cmd),
+        "passed_on": passed_on,
+        "failed_on": failed_on,
+        "label": label,
+        "reason": reason,
+        "proven_allows": allowed,
+        "runs": [{k: r.get(k) for k in ("target", "job", "state", "machine", "os_family", "why")} for r in runs],
+    }
+    if label:
+        consensus.remember({"label": label, "reason": reason, "signature": sig,
+                            "signature_id": consensus.signature_id(sig), "cmd": list(cmd),
+                            "runs": [{k: r.get(k) for k in ("target", "job", "state", "machine", "os_family",
+                                                            "load_per_core")} for r in done]})
+    if json_out:
+        print(json.dumps(out, indent=2))
+    else:
+        for run in runs:
+            print(_run_line("run", run))
+        if not done:
+            print("prove: no run finished")
+        elif not failing:
+            print(f"prove: passes on {', '.join(passed_on)}")
+        elif not passed_on:
+            print(f"prove: fails everywhere it ran ({', '.join(failed_on)})")
+        else:
+            print(f"prove: passes on {', '.join(passed_on)}; fails on {', '.join(failed_on)} ({label}: {reason})")
+        print(f"  -t os:proven may now run it on: {', '.join(allowed)}")
+    if not done:
+        raise typer.Exit(2)
+    raise typer.Exit(1 if failing else 0)

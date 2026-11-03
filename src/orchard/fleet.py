@@ -18,7 +18,7 @@ import sys
 import threading
 from pathlib import Path
 
-from . import agent, engine, env, placement
+from . import agent, engine, env, placement, receipts
 from .config import JOBS_DIR, STATE_DIR, load_workers
 from .job import JobSpec, capture_env, slugify
 
@@ -36,6 +36,7 @@ def job_like_run(cmd: list[str], cwd: Path, tags: list[str] | None = None,
         job.env = list(dict.fromkeys(env_names))
         job.env_values, _missing = capture_env(job.env)
     job.requirements, _notes = env.capture_requirements(cwd)
+    receipts.attach_proof(job, cwd)
     return job
 
 
