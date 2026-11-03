@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -15,7 +16,7 @@ from typing import Optional
 
 import typer
 
-from . import consensus, fleet, placement, receipts, speculate, worlds
+from . import consensus, fleet, placement, receipts, replica, speculate, transport, worlds
 from .job import slugify
 from .cli import app, find_jobs
 
@@ -476,3 +477,137 @@ def speculate_stats(json_out: bool = typer.Option(False, "--json", help="machine
           f"(hit rate {s['hit_rate']:.0%})")
     print(f"  agent wait saved: {s['saved_s']}s; CPU spent on runs nobody asked for (yet): {s['wasted_s']}s")
 
+
+replica_app = typer.Typer(no_args_is_help=True, help="Living replicas: a warm copy of the project on each body.")
+app.add_typer(replica_app, name="replica")
+
+
+def _replica_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except replica.ReplicaError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise typer.Exit(2)
+    except (transport.RemoteError, subprocess.TimeoutExpired) as exc:
+        print(f"error: a body went quiet ({exc})", file=sys.stderr)
+        raise typer.Exit(2)
+
+
+def _need_cmd(cmd: Optional[list[str]]) -> list[str]:
+    if not cmd:
+        print("error: provide a command after --", file=sys.stderr)
+        raise typer.Exit(2)
+    return cmd
+
+
+@replica_app.command("up")
+def replica_up(
+    worker: str = typer.Option(..., "--worker", "-w", help="body to hold the replica"),
+    role: Optional[str] = typer.Option(None, "--role", help="day (acts) or dusk (remembers the last green tree)"),
+    prep: Optional[str] = typer.Option(None, "--prep", help="command that readies a fresh copy, e.g. 'npm ci' (\"\" clears)"),
+    prep_key: list[str] = typer.Option([], "--prep-key", help="file or glob whose change reruns prep (repeatable; default: lockfiles)"),
+    augment: list[str] = typer.Option([], "--augment", help="tag this replica gains from tools it installs in tools/bin (repeatable)"),
+    env_names: list[str] = typer.Option([], "--env", help="forward this env var to prep (repeatable)"),
+) -> None:
+    """Create or refresh a replica on a body: copy the project, build its env, run prep (Dawn)."""
+    raise typer.Exit(_replica_call(replica.up, Path.cwd(), worker, role, prep, prep_key, augment, env_names))
+
+
+@replica_app.command("run")
+def replica_run(
+    cmd: Optional[list[str]] = typer.Argument(None, help="command to run (after --)"),
+    worker: Optional[str] = typer.Option(None, "--worker", "-w", help="run on this replica only"),
+    tag: list[str] = typer.Option([], "--tag", "-t", help="required worker capability tag (repeatable)"),
+    env_names: list[str] = typer.Option([], "--env", help="forward this env var to the job (repeatable)"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", help="seconds before the run is killed"),
+    reuse: bool = typer.Option(False, "--reuse", help="answer from a sealed passing receipt for this exact tree and check"),
+    as_is: bool = typer.Option(False, "--as-is", help="run on the body's copy as it is, without sending this tree (needs -w)"),
+    bless: bool = typer.Option(False, "--bless", help="when it passes, move the dusk to this tree"),
+    no_local: bool = typer.Option(False, "--no-local", help="never fall back to running on this Mac"),
+    target_file: Optional[Path] = typer.Option(None, "--target-file", hidden=True),
+    result_file: Optional[Path] = typer.Option(None, "--result-file", hidden=True),
+    pooled: bool = typer.Option(False, "--pooled", hidden=True),
+) -> None:
+    """Send only what changed to the nearest free replica and run there (Day)."""
+    cmd = _need_cmd(cmd)
+    raise typer.Exit(_replica_call(replica.run, cmd, Path.cwd(), worker, tag, env_names, timeout, reuse, as_is,
+                                   bless, no_local, target_file, result_file, pooled))
+
+
+@replica_app.command("check")
+def replica_check(
+    split: Optional[str] = typer.Option(None, "--split", help="command template with {i} and {n}, e.g. 'pytest --shard {i}/{n}'"),
+    shards: int = typer.Option(0, "--shards", min=0, help="how many shards --split makes"),
+    no_local: bool = typer.Option(False, "--no-local", help="never fall back to running on this Mac"),
+    env_names: list[str] = typer.Option([], "--env", help="forward this env var to every check (repeatable)"),
+) -> None:
+    """Run every speculate check (or every shard) across the day replicas at once.
+    When all pass on one tree, the dusk moves to it."""
+    raise typer.Exit(_replica_call(replica.check, Path.cwd(), split, shards, no_local, env_names))
+
+
+@replica_app.command("compare")
+def replica_compare(
+    cmd: Optional[list[str]] = typer.Argument(None, help="command to run (after --)"),
+    tag: list[str] = typer.Option([], "--tag", "-t", help="required worker capability tag (repeatable)"),
+    env_names: list[str] = typer.Option([], "--env", help="forward this env var to the job (repeatable)"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", help="seconds before the run is killed"),
+) -> None:
+    """Run a check on your tree and on the dusk's last green tree at once: is it your change?"""
+    cmd = _need_cmd(cmd)
+    raise typer.Exit(_replica_call(replica.compare, Path.cwd(), cmd, tag, env_names, timeout))
+
+
+@replica_app.command("blame")
+def replica_blame(
+    cmd: Optional[list[str]] = typer.Argument(None, help="failing command (after --)"),
+    tag: list[str] = typer.Option([], "--tag", "-t", help="required worker capability tag (repeatable)"),
+    env_names: list[str] = typer.Option([], "--env", help="forward this env var to the job (repeatable)"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", help="seconds before each run is killed"),
+) -> None:
+    """Find the fewest changed files that make a check fail, testing mixed trees across every day replica."""
+    cmd = _need_cmd(cmd)
+    raise typer.Exit(_replica_call(replica.blame, Path.cwd(), cmd, tag, env_names, timeout))
+
+
+@replica_app.command("list")
+def replica_list(json_out: bool = typer.Option(False, "--json", help="machine-readable output")) -> None:
+    """Show this project's replicas: role, whether each holds your tree, drift, pending prep."""
+    rows = _replica_call(replica.list_rows, Path.cwd())
+    if json_out:
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("no replicas yet: orchard replica up -w <worker>")
+        return
+    for r in rows:
+        notes = []
+        if r.get("augment"):
+            notes.append("augmented: " + ", ".join(r["augment"]))
+        if r.get("busy"):
+            notes.append(f"busy: {r['busy']}")
+        if r.get("drifted"):
+            notes.append(f"drifted: {len(r['drifted'])} file(s)")
+        if r.get("dawn_pending"):
+            notes.append("prep pending")
+        if r["role"] == "dusk" and "blessed" in r:
+            notes.append("last green" if r["blessed"] else "not blessed")
+        elif r.get("digest"):
+            notes.append("holds your tree" if r.get("current") else "behind your tree")
+        tree = (r.get("digest") or "")[:12] or "-"
+        print(f"  {r['name']:16} {r['role']:5} {r['status']:8} {tree:12}  {'; '.join(notes)}".rstrip())
+
+
+@replica_app.command("role")
+def replica_role(
+    name: str = typer.Argument(..., help="replica's worker name"),
+    role: str = typer.Argument(..., help="day or dusk"),
+) -> None:
+    """Make a replica a day replica or the dusk."""
+    _replica_call(replica.set_role, Path.cwd(), name, role)
+
+
+@replica_app.command("down")
+def replica_down(name: str = typer.Argument(..., help="replica's worker name")) -> None:
+    """Remove a replica's copy from its body and forget it here."""
+    _replica_call(replica.down, Path.cwd(), name)

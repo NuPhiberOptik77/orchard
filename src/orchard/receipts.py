@@ -72,17 +72,42 @@ def _entry_line(full: Path, arcname: str) -> bytes:
     st = full.lstat()
     if stat.S_ISLNK(st.st_mode):
         return f"L\0{arcname}\0{os.readlink(full)}\n".encode()
+    if not stat.S_ISREG(st.st_mode):
+        # A folder (a submodule or nested repo), a socket or a pipe: it ships
+        # as nothing a digest can name, and opening a pipe would hang.
+        return f"?\0{arcname}\n".encode()
     exe = "x" if st.st_mode & 0o111 else "-"
     return f"F\0{arcname}\0{exe}\0{_sha_file(full)}\n".encode()
 
 
 def digest_entries(entries: list[tuple[Path, str]]) -> str:
     h = hashlib.sha256()
+    seen = set()
     for full, arcname in sorted(entries, key=lambda e: e[1]):
+        if arcname in seen:  # git lists a path once per stage while a merge is unresolved
+            continue
+        seen.add(arcname)
         try:
             h.update(_entry_line(full, arcname))
         except OSError:
             h.update(f"?\0{arcname}\n".encode())
+    return h.hexdigest()
+
+
+def digest_manifest(manifest: dict) -> str:
+    """The digest tree_digest gives the tree a replica manifest describes:
+    {arc: ["L", target, ...] | ["F", exe, sha, ...] | ["?", ...]}, "?" being
+    an entry that could not be read as a file or a link."""
+    h = hashlib.sha256()
+    for arc in sorted(manifest):
+        e = manifest[arc]
+        if e[0] == "L":
+            line = f"L\0{arc}\0{e[1]}\n"
+        elif e[0] == "F":
+            line = f"F\0{arc}\0{e[1]}\0{e[2]}\n"
+        else:
+            line = f"?\0{arc}\n"
+        h.update(line.encode())
     return h.hexdigest()
 
 

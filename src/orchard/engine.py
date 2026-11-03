@@ -312,13 +312,21 @@ def remote_status_missing(worker: Worker, rjob: str) -> bool:
     return proc.returncode == 0 and proc.stdout.decode("utf-8", "replace").strip() == "no"
 
 
-def watch_remote(worker: Worker, rjob: str, interval: float = 4.0) -> dict | None:
+def watch_remote(worker: Worker, rjob: str, interval: float = 4.0,
+                 lost_after: float | None = None) -> dict | None:
+    """Follow a remote job to its end. With lost_after, gives up and returns
+    None once the worker has not answered for that many seconds."""
     last_state = None
+    quiet_since = None
     while True:
         status = remote_status(worker, rjob)
         if status is None:
+            quiet_since = quiet_since or time.monotonic()
+            if lost_after is not None and time.monotonic() - quiet_since >= lost_after:
+                return None
             time.sleep(3)
             continue
+        quiet_since = None
         state = status.get("state")
         if state != last_state:
             detail = f" [{status.get('pause_reason')}]" if state == "paused" else ""

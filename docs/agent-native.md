@@ -197,42 +197,144 @@ asked for), wait saved (their run time, once per reuse) and wasted CPU
 
 ## 5. Living replicas
 
-**Journey.** Today each remote job ships the tree, unpacks it, and installs
-dependencies before the first test runs. A replica is a warm copy of the
-project that lives on a worker: dependencies installed once, caches kept.
-After an edit, `orchard replica run -w pro -- npx jest src/foo` sends only
-the changed files and starts the test in the warm tree. `orchard replica
-check` splits the project's checks (or one suite, sharded) across every
-replica and prints a live state: "tree 3f2a91: green on pro and local, red
-on laptop".
+**Journey.** Today each remote job ships the whole tree, unpacks it and
+installs dependencies before the first test runs. A replica is a warm copy
+of the project that lives on a body (a worker): dependencies installed once,
+caches kept. After an edit, `orchard replica run -- npx jest src/foo` sends
+only the changed files to the nearest free replica and starts the test
+there. When it goes red, `orchard replica compare` says whether your change
+did it, and `orchard replica blame` names the files that broke it.
+
+**One genome, three ages.** The layer takes its shape from the Cleons in
+Asimov's Foundation: one genome living in several bodies at different ages.
+
+- The genome is the project tree. Every replica holds the same tree, and a
+  digest proves it.
+- **Dawn learns.** `orchard replica up -w <worker> --prep 'npm ci'` copies the
+  tree, builds its Python env and runs prep. Prep runs again only when a prep
+  key changes (lockfiles and manifests such as `package.json` by default;
+  `--prep-key` chooses others), so editing source never reinstalls anything.
+- **Day acts.** Day replicas run checks.
+- **Dusk advises.** One replica may be the dusk (`up --role dusk`, or
+  `orchard replica role <worker> dusk`). It holds the last tree a check passed
+  on and does not follow your edits. `run --bless` moves it forward after a
+  pass, and `replica check` moves it when every check passes on one tree;
+  `up` never moves it. A plain run on the dusk is refused ("the dusk moves
+  only on green"); `--as-is` runs on its copy without moving it. A blessed
+  run that falls back to this Mac still moves the dusk when it passes.
+- **Demerzel** is the ledger: every replica run seals a receipt, so the record
+  of what passed where outlives any one body.
 
 **Mechanism.**
 
-- `orchard replica up -w <worker> [--prep 'npm ci' --prep-key package-lock.json]`
-  creates `~/.orchard/replicas/<project key>/work` on the worker.
-- Sync is a manifest diff: the worker keeps the manifest of what it holds,
-  Orchard sends a tar of only added or changed files plus a list of deleted
-  ones. Untracked-and-ignored folders like `node_modules` never ship and are
-  never deleted, which is what keeps the replica warm.
-- `--prep` runs again only when a `--prep-key` file changes.
-- `replica run` clears `out/`, runs the command through the normal agent (so
-  pause, kill and timeouts all work), collects `out/`, and seals a receipt
-  against the local tree digest, since sync made the replica equal to it.
-- `replica check --split 'npx jest --shard={i}/{n}'` runs shard *i* of *n* on
-  each replica at once and merges the verdicts.
+- The copy lives at `~/.orchard/replicas/<project key>/work` on the body. The
+  body keeps a manifest of what it holds (path, kind, exec bit, size, content
+  hash) and its digest, computed exactly like a receipt's tree digest, so
+  "this replica holds your tree" is a digest comparison, not a guess.
+- Sync is a manifest diff: Orchard sends a tar of only the added or changed
+  files, a list of deleted ones and the digest it expects the copy to start
+  from. If the copy moved since Orchard looked (another sync, or a check that
+  edited it), the body refuses, and Orchard reads its manifest again and
+  retries. The body unpacks into a temporary folder, refuses any path that
+  leaves the copy and any member it did not ask for, replaces a symlinked
+  parent with a real folder, and checks the final digest before it answers.
+- Each sync has its own names on the body, so two syncs never read each
+  other's files. The body notes which files it is about to change before it
+  touches them; a sync cut short (a crash, a lost connection) is finished on
+  the next look, when those files are hashed again.
+- A submodule, pipe or socket in the tree is named and refused ("cannot send
+  pipe"): Orchard can only send files and links.
+- Ignored folders like `node_modules` never ship and are never deleted, which
+  is what keeps the replica warm.
+- `replica run` clears untracked files from `out/`, runs the command through
+  the normal agent (so pause, kill and timeouts all work), collects `out/` and
+  seals a receipt against the tree digest. `--reuse` answers from a sealed
+  passing receipt for the same tree, check and prep.
+- A job starts only on the tree Orchard checked. The body refuses to begin
+  if the copy moved since; Orchard brings it back and tries once more. When
+  prep rewrote a tracked file, Orchard says so ("dawn: prep changed 1 tracked
+  file(s) (a.txt); sending them back") and puts it back before the run.
+- The body holds the copy for that job until Orchard has collected the
+  results, then Orchard releases it. A sync cannot land in between.
+- A body runs one job at a time: a replica job does not start while any
+  other job runs there. Required tags and idle holds apply as usual. Naming
+  a held body with `-w` for a single run still runs it, and says so ("note:
+  pro: owner active (running anyway: you named it)"); `check`, `compare` and
+  `blame` always pass held bodies over.
 
-**Self-healing.** Consensus memory plugs in here: a failure whose signature
-was labelled `flaky` or `load-sensitive` before is rerun once on another
-replica before it is reported.
+**Nearest mind.** Without `-w`, `run` ranks the free replicas that can take
+the job by how many bytes each would need to be sent, and picks the closest.
+A replica that already holds your tree costs nothing. Only if none can take
+it does the job run on this Mac (`--no-local` forbids that).
 
-**Not in this cut.** Resident watchers (a `tsc --watch` that never exits)
-and streaming edits as they are typed. Both need a long-lived process on
-the worker; the replica layout is where they will live.
+**Succession.** A replica that is busy, or whose body does not answer, is
+passed over, and Orchard says why: "succession: pro cannot take it (quiet:
+no answer)". The next in line takes the run. A body that goes quiet during
+a run (no answer for 10 minutes) is given up on: the run is reported as
+unavailable ("succession: pro went quiet mid-run"; the job may still finish
+there), and nothing is retried behind your back.
 
-**Modules.** New `replica.py` and a small worker-side script,
-`replica_remote.py`, sent per call like the agent.
+**Drift hygiene.** After each run the body compares its copy with what was
+sent. A check that rewrote tracked files (a formatter, a snapshot update, a
+cache written into the tree) is named ("hygiene: the check changed 1 tracked
+file(s) in the copy: a.txt") and recorded in `drift.json` in the job's state
+folder. The next sync puts those files back.
 
-**Measure.** Edit to verdict through a replica versus a fresh job.
+**Augment and borrow.** Some bodies cannot run some checks. There are two
+opt-in ways around that; the placement guard itself is unchanged.
+
+- **Augment.** Prep may install tools into the replica's own `tools/bin`
+  (`$ORCHARD_REPLICA_TOOLS` names the folder), which goes first on PATH for
+  every job in that replica. `up --augment node` records that this replica
+  now carries the `node` tag, so a check that needs `-t node` can place there
+  even though the body alone could not take it.
+- **Borrow.** `replica check` sends a tagged check only to the replicas that
+  can run it, and says so: "borrow: npm test needs node: only pro can run it".
+
+**Check, compare and blame.**
+
+- `replica check` runs every speculate check (or one suite split with
+  `--split 'pytest --shard {i}/{n}' --shards N`) across the day replicas at
+  once, giving the next piece of work to whichever body frees up first. Work
+  from a body that goes quiet moves to another; work no body can run is
+  reported, not dropped.
+- `replica compare -- <cmd>` runs the check on your tree and on the dusk's
+  copy at the same time and says which it is: "your change broke it (it
+  passes at the dusk tree)", "it fails at the dusk tree too, so it is not
+  your change", or green now. If the dusk's copy is no longer the tree it
+  was blessed at (edited on the body, say), compare gives no verdict, and the
+  next blessed run puts the copy back.
+- `replica blame -- <cmd>` finds the fewest of your changed files that
+  together make the check fail. It builds mixed trees (the dusk's version of
+  most files, yours of a few), tests them in parallel across the day replicas
+  with delta debugging, and prints the culprits. It never syncs the dusk,
+  and refuses to start when the dusk is not the tree it was blessed at. A
+  tree that does not finish (a timeout, a body that went quiet) ends with no
+  verdict rather than a wrong one.
+
+**Disk.** A body's normal `gc` removes a replica only when it has been idle
+for 14 days or more and nothing is running in it. When disk runs low, `gc`
+still spares any replica used in the last 24 hours. `orchard replica down
+<worker>` removes one now; if some files cannot be removed it says so and
+keeps the replica listed. `orchard replica list` shows each replica's role,
+whether it holds your tree, drift and pending prep.
+
+**Not in this cut.**
+
+- Resident watchers (a `tsc --watch` that never exits) and streaming edits as
+  they are typed. Both need a long-lived process on the body; the replica
+  layout is where they will live.
+- Self-healing from consensus memory: rerunning a failure whose signature was
+  labelled `flaky` before on another replica before reporting it.
+- **Dreaming.** An idle dusk could replay the day's red checks against small
+  mixes of its green tree and the trees that failed, so that when the same
+  failure signature comes back, blame is already known.
+
+**Modules.** New `replica.py`; seven `replica-*` verbs in the agent (state,
+apply, begin, release, meta, pack, down) and replica entries in its `gc`.
+
+**Measure.** Edit to verdict through a replica versus a fresh job; for
+blame, trees tested and minutes to the culprit versus bisecting by hand.
 
 ## 6. Checking alongside the AI
 
@@ -357,4 +459,6 @@ without drafting machines.
   other. Mitigation: they are cancelled when stale, and each project has at
   most 3 in flight at once.
 - **Replica drift.** A replica edited by hand on the worker. Mitigation:
-  `replica up --verify` rebuilds the manifest from disk before diffing.
+  before every sync and run the body hashes again any file whose size or
+  modified time changed, so the edit shows up as drift and the next sync
+  puts it back. A job starts only on the digest Orchard checked.

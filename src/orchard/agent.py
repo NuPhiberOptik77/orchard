@@ -16,19 +16,30 @@ Usage:
   python3 agent.py settle <job_dir>
   python3 agent.py wrap <exit.json> <attempt> -- <cmd...>
   python3 agent.py gc [max_age_days] [min_free_gb]
+  python3 agent.py replica-state <key> [manifest]
+  python3 agent.py replica-apply <key> [token]
+  python3 agent.py replica-begin <key> <job.json> <digest>
+  python3 agent.py replica-release <key> <job>
+  python3 agent.py replica-meta <key> <json>
+  python3 agent.py replica-pack <key>   (paths as JSON on stdin, tar.gz on stdout)
+  python3 agent.py replica-down <key>
 """
 
 from __future__ import annotations
 
+import contextlib
 import errno
+import hashlib
 import json
 import math
 import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
+import tarfile
 import time
 
 TERMINAL_STATES = ("succeeded", "failed", "timed_out", "killed")
@@ -483,7 +494,7 @@ def cached_bench(python_path, cache_dir=None, ttl=BENCH_TTL_S):
     return value
 
 
-def collect_caps(bench_python=None):
+def collect_caps(bench_python=None, bench=True):
     family = os_family()
     home = os.path.expanduser("~")
     policy = load_policy()
@@ -524,7 +535,7 @@ def collect_caps(bench_python=None):
         "thermal_limit": thermal,
         "host_status": host_status,
         "has_taskpolicy": bool(shutil.which("taskpolicy")),
-        "bench": cached_bench(bench_python),
+        "bench": cached_bench(bench_python) if bench else None,
         "bench_python": bench_python or sys.executable,
         "policy_paused": bool(policy.get("paused")),
         "busy_jobs": busy,
@@ -762,6 +773,8 @@ def cmd_exec(argv):
 
     env = dict(os.environ)
     env.update({str(k): str(v) for k, v in (job.get("env") or {}).items()})
+    for extra in reversed(job.get("path_prepend") or []):
+        env["PATH"] = str(extra) + os.pathsep + env.get("PATH", "")
     venv = job.get("venv")
     cmd = list(job["cmd"])
     if venv:
@@ -1197,7 +1210,7 @@ def select_garbage(entries, now, max_age_days, min_free_gb, free_gb):
     for entry in entries:
         if entry.get("protected"):
             continue
-        if now - entry["mtime"] > max_age_days * 86400:
+        if now - entry["mtime"] > entry.get("max_age_days", max_age_days) * 86400:
             picked.append(entry)
         else:
             leftover.append(entry)
@@ -1206,6 +1219,8 @@ def select_garbage(entries, now, max_age_days, min_free_gb, free_gb):
         for entry in sorted(leftover, key=lambda e: e["mtime"]):
             if free_gb + freed_gb >= min_free_gb:
                 break
+            if entry.get("recent"):
+                continue
             picked.append(entry)
             freed_gb += entry["size"] / 1e9
     return picked
@@ -1271,6 +1286,27 @@ def _gc_entries(now, max_age_days=14.0):
             except OSError:
                 mtime = now
             entries.append({"path": path, "mtime": mtime, "size": _dir_size(path), "protected": protected})
+    replicas_dir = os.path.join(ORCHARD_HOME, "replicas")
+    if os.path.isdir(replicas_dir):
+        for name in os.listdir(replicas_dir):
+            path = os.path.join(replicas_dir, name)
+            if not REPLICA_KEY_RE.match(name) or not os.path.isdir(path):
+                continue
+            protected = bool(_replica_busy(path)) or any(w.startswith(path + os.sep) for w in live_workdirs)
+            mtime = 0.0
+            for part in (path, os.path.join(path, "meta.json"), os.path.join(path, "used"),
+                         os.path.join(path, "current")):
+                try:
+                    mtime = max(mtime, os.path.getmtime(part))
+                except OSError:
+                    pass
+            mtime = mtime or now
+            # A replica is meant to stay warm between uses, so it outlives job
+            # folders; low free space still takes it, oldest first, but not
+            # one used in the last day.
+            entries.append({"path": path, "mtime": mtime, "size": _dir_size(path), "protected": protected,
+                            "replica": True, "max_age_days": max(max_age_days, REPLICA_MIN_AGE_DAYS),
+                            "recent": now - mtime < REPLICA_RECENT_S})
     return entries
 
 
@@ -1287,6 +1323,12 @@ def cmd_gc(argv):
     picked = select_garbage(_gc_entries(now, max_age), now, max_age, min_free, _gc_free_gb())
     freed = 0
     for entry in picked:
+        if entry.get("replica"):
+            # A sync or a run may start between the scan and here.
+            with _replica_lock(entry["path"], block=False, create=False) as got:
+                if got and not _replica_busy(entry["path"]) and _rmtree_force(entry["path"]):
+                    freed += entry["size"]
+            continue
         try:
             if os.path.isdir(entry["path"]):
                 shutil.rmtree(entry["path"])
@@ -1301,6 +1343,673 @@ def cmd_gc(argv):
         "free_gb": _gc_free_gb(),
     }))
     return 0
+
+
+# Living replicas. A replica is a warm copy of one project, kept in
+# ~/.orchard/replicas/<key>/: work/ (the tree), manifest.json (path ->
+# [kind, exe flag or link target, sha256, size, mtime_ns] for every file the
+# Air ships), meta.json, and current (the job using it, from replica-begin
+# until the Air has collected its results and released it). The Air sends
+# only what changed; these verbs apply it under a lock and say what the tree
+# is now. The digest of a manifest is the same tree digest receipts use.
+
+REPLICA_KEY_RE = re.compile(r"^[0-9a-f]{12}$")
+JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+TOKEN_RE = re.compile(r"^[0-9a-f]{6,32}$")
+DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+REPLICA_META_FIELDS = ("project", "prep_digest", "prep_job", "env_key", "venv")
+REPLICA_STARTING_S = 60  # how long a job just begun counts as running before its agent says so
+REPLICA_COLLECT_S = 600  # how long a finished job holds its replica for the Air to collect
+REPLICA_RECENT_S = 86400  # low disk spares a replica used this recently
+REPLICA_INCOMING_MAX_S = 3600  # an update left this long was abandoned by its sender
+REPLICA_MIN_AGE_DAYS = 14.0
+REPLICA_USAGE = {
+    "replica-state": "<key> [manifest]",
+    "replica-apply": "<key> [token]",
+    "replica-begin": "<key> <job.json> <digest>",
+    "replica-release": "<key> <job>",
+    "replica-meta": "<key> <json>",
+    "replica-pack": "<key>",
+    "replica-down": "<key>",
+}
+
+
+def _replica_dir(key):
+    if not isinstance(key, str) or not REPLICA_KEY_RE.match(key):
+        raise ValueError("bad replica key: %r" % (key,))
+    return os.path.join(ORCHARD_HOME, "replicas", key)
+
+
+@contextlib.contextmanager
+def _replica_lock(rep, block=True, create=True):
+    """Hold the replica's lock; yields whether it was taken. Without create a
+    missing replica is not made, and yields None."""
+    import fcntl
+    lock_path = os.path.join(rep, ".lock")
+    while True:
+        if create:
+            os.makedirs(rep, exist_ok=True)
+        try:
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        except FileNotFoundError:
+            yield None
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if block else fcntl.LOCK_NB))
+            got = True
+        except OSError:
+            got = False
+        try:
+            same = os.path.samestat(os.fstat(fd), os.stat(lock_path))
+        except OSError:
+            same = False
+        if got and not same:
+            # replica-down removed the folder while this waited for it.
+            os.close(fd)
+            continue
+        break
+    try:
+        yield got
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def _machine_lock():
+    """One replica-begin at a time on this machine, so two cannot both find
+    it free."""
+    import fcntl
+    state_dir = os.path.join(ORCHARD_HOME, "state")
+    os.makedirs(state_dir, exist_ok=True)
+    fd = os.open(os.path.join(state_dir, "replica-begin.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _read_json(path, default):
+    try:
+        with open(path) as f:
+            value = json.load(f)
+    except (OSError, ValueError):
+        return default
+    return value if isinstance(value, type(default)) else default
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def replica_entry(path, prev=None):
+    """The manifest entry for path, reusing prev's hash while its size, mtime
+    and exe bit are unchanged; None for anything but a file or a link."""
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode):
+        entry = ["L", os.readlink(path), None, st.st_size, st.st_mtime_ns]
+        return prev if prev == entry else entry
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    exe = "x" if st.st_mode & 0o111 else "-"
+    if prev and prev[0] == "F" and prev[1] == exe and prev[3] == st.st_size and prev[4] == st.st_mtime_ns:
+        return prev
+    return ["F", exe, _sha256_file(path), st.st_size, st.st_mtime_ns]
+
+
+def manifest_digest(manifest):
+    """The digest receipts.tree_digest gives the tree this manifest describes.
+    A "?" entry is a file whose content is not known (one that could not be
+    read, or one an interrupted update was changing)."""
+    h = hashlib.sha256()
+    for arc in sorted(manifest):
+        entry = manifest[arc]
+        if entry[0] == "L":
+            h.update(("L\0%s\0%s\n" % (arc, entry[1])).encode())
+        elif entry[0] == "?":
+            h.update(("?\0%s\n" % arc).encode())
+        else:
+            h.update(("F\0%s\0%s\0%s\n" % (arc, entry[1], entry[2])).encode())
+    return h.hexdigest()
+
+
+def _match_case(folder, name, listing):
+    """Give folder's entry the spelling name when it is there in another case:
+    on a case-insensitive disk a renamed folder or file keeps its old spelling
+    otherwise. listing caches folder contents across calls."""
+    names = listing.get(folder)
+    if names is None:
+        names = listing[folder] = set(os.listdir(folder))
+    if name in names:
+        return
+    for other in names:
+        if other.lower() == name.lower():
+            os.rename(os.path.join(folder, other), os.path.join(folder, name))
+            names.discard(other)
+            break
+    names.add(name)
+
+
+def _replica_path(work, arc, make_parents=False, listing=None):
+    """Where arc lives under work. Refuses absolute paths, "..", and anything
+    that would resolve outside work. With make_parents, a file or link in the
+    way of a parent folder is replaced by the folder, and a parent spelled in
+    another case takes arc's spelling."""
+    parts = arc.split("/") if isinstance(arc, str) else []
+    if not parts or "\0" in arc or any(p in ("", ".", "..") for p in parts):
+        raise ValueError("unsafe path in replica: %r" % (arc,))
+    if make_parents:
+        listing = {} if listing is None else listing
+        cur = work
+        for part in parts[:-1]:
+            parent, cur = cur, os.path.join(cur, part)
+            if os.path.islink(cur) or (os.path.lexists(cur) and not os.path.isdir(cur)):
+                os.unlink(cur)
+                listing.pop(parent, None)
+            if os.path.isdir(cur):
+                _match_case(parent, part, listing)
+            else:
+                os.mkdir(cur)
+                listing.pop(parent, None)
+    path = os.path.join(work, *parts)
+    real_work = os.path.realpath(work)
+    parent = os.path.realpath(os.path.dirname(path))
+    if parent != real_work and not parent.startswith(real_work + os.sep):
+        raise ValueError("path leaves the replica: %r" % (arc,))
+    return path
+
+
+def _rmtree_force(path):
+    """Remove path even when a run left read-only folders in it. True once it
+    is gone."""
+    def writable(folder):
+        try:
+            if not os.path.islink(folder):
+                os.chmod(folder, stat.S_IMODE(os.lstat(folder).st_mode) | stat.S_IRWXU)
+        except OSError:
+            pass
+    if os.path.isdir(path) and not os.path.islink(path):
+        writable(path)
+        for dirpath, dirnames, _filenames in os.walk(path):
+            for name in dirnames:
+                writable(os.path.join(dirpath, name))
+        shutil.rmtree(path, ignore_errors=True)
+    elif os.path.lexists(path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    return not os.path.lexists(path)
+
+
+def _remove_path(path):
+    if os.path.lexists(path) and not _rmtree_force(path):
+        raise OSError(errno.EACCES, "could not remove", path)
+
+
+def _prune_empty(work, folder):
+    while folder != work and folder.startswith(work + os.sep):
+        try:
+            os.rmdir(folder)
+        except OSError:
+            return
+        folder = os.path.dirname(folder)
+
+
+def _replica_refresh(rep, manifest):
+    """Re-stat what the manifest lists and rehash what changed. A file a
+    check wrote to, or someone edited in the copy, gets its real entry; a
+    missing one is dropped. Either way the Air sees the difference and
+    resends it. Returns (drifted paths, whether the manifest changed)."""
+    work = os.path.join(rep, "work")
+    drifted = []
+    changed = False
+    for arc in sorted(manifest):
+        old = manifest[arc]
+        try:
+            new = replica_entry(_replica_path(work, arc), old)
+        except (OSError, ValueError):
+            new = None
+        if new is old:
+            continue
+        changed = True
+        if new is None:
+            del manifest[arc]
+            drifted.append(arc)
+            continue
+        manifest[arc] = new
+        if new[:3] != old[:3]:
+            drifted.append(arc)
+    return drifted, changed
+
+
+def _replica_recover(rep, manifest):
+    """Clear up after an update that was cut short (its sender killed, the
+    machine off): the paths it was changing are rehashed on the next refresh
+    and its half-written files go. True if there was one; the caller removes
+    the journal once the manifest is written."""
+    journal = os.path.join(rep, "applying.json")
+    if not os.path.lexists(journal):
+        return False
+    work = os.path.join(rep, "work")
+    for arc in _read_json(journal, []):
+        if not isinstance(arc, str):
+            continue
+        try:
+            present = os.path.lexists(_replica_path(work, arc))
+        except ValueError:
+            continue
+        if present:
+            manifest[arc] = ["?", None, None, 0, 0]
+        else:
+            manifest.pop(arc, None)
+    for dirpath, _dirnames, filenames in os.walk(work):
+        for name in filenames:
+            if name.startswith(".orchard-incoming-"):
+                try:
+                    os.unlink(os.path.join(dirpath, name))
+                except OSError:
+                    pass
+    return True
+
+
+def _replica_job(rep):
+    """(job id, phase) of the job holding this replica: "running", "starting"
+    (begun, its agent not up yet) or "collecting" (finished, its results not
+    yet fetched and released). (None, None) when it is free."""
+    current = os.path.join(rep, "current")
+    try:
+        with open(current) as f:
+            job_id = f.read().strip()
+        begun = os.path.getmtime(current)
+    except OSError:
+        return None, None
+    if not JOB_ID_RE.match(job_id):
+        return None, None
+    if job_id in running_jobs():
+        return job_id, "running"
+    job_dir = os.path.join(ORCHARD_HOME, "jobs", job_id)
+    status = read_status(job_dir) or {}
+    now = time.time()
+    if status.get("state") in TERMINAL_STATES:
+        try:
+            ended = os.path.getmtime(os.path.join(job_dir, "status.json"))
+        except OSError:
+            ended = begun
+        return (job_id, "collecting") if now - ended < REPLICA_COLLECT_S else (None, None)
+    if now - begun < REPLICA_STARTING_S:
+        return job_id, "starting"
+    return None, None
+
+
+def _replica_busy(rep):
+    """The job holding this replica, or None."""
+    return _replica_job(rep)[0]
+
+
+def _machine_busy(rep):
+    """A job running on this machine outside rep. A replica run takes the
+    whole machine, like any other job."""
+    for job_id in running_jobs():
+        status = read_status(os.path.join(ORCHARD_HOME, "jobs", job_id)) or {}
+        if status.get("state") not in TERMINAL_STATES:
+            return job_id
+    replicas_dir = os.path.dirname(rep)
+    try:
+        names = os.listdir(replicas_dir)
+    except OSError:
+        names = []
+    for name in names:
+        other = os.path.join(replicas_dir, name)
+        if other != rep and REPLICA_KEY_RE.match(name):
+            job_id, phase = _replica_job(other)
+            if phase == "starting":
+                return job_id
+    return None
+
+
+def _replica_write(rep, manifest, meta):
+    _atomic_write_json(os.path.join(rep, "manifest.json"), manifest)
+    meta["digest"] = manifest_digest(manifest)
+    meta["files"] = len(manifest)
+    meta["last_used"] = time.time()
+    _atomic_write_json(os.path.join(rep, "meta.json"), meta)
+
+
+def _replica_files(rep):
+    return (_read_json(os.path.join(rep, "manifest.json"), {}),
+            _read_json(os.path.join(rep, "meta.json"), {}))
+
+
+def _replica_load(rep):
+    """The manifest and meta, brought up to date with what is on disk, and
+    the paths that had drifted."""
+    manifest, meta = _replica_files(rep)
+    recovered = _replica_recover(rep, manifest)
+    drifted, changed = _replica_refresh(rep, manifest)
+    if changed or recovered:
+        _replica_write(rep, manifest, meta)
+    if recovered:
+        os.unlink(os.path.join(rep, "applying.json"))
+    return manifest, meta, drifted
+
+
+def cmd_replica_state(argv):
+    rep = _replica_dir(argv[0])
+    want_manifest = argv[1:] == ["manifest"]
+    work = os.path.join(rep, "work")
+    out = {"exists": False, "busy": None, "drifted": [], "meta": {}}
+    manifest = {}
+    if os.path.isdir(work):
+        with _replica_lock(rep, create=False) as got:
+            if got and os.path.isdir(work):
+                manifest, meta, drifted = _replica_load(rep)
+                out.update(exists=True, busy=_replica_busy(rep), drifted=drifted, meta=meta)
+    out["digest"] = manifest_digest(manifest)
+    out["files"] = len(manifest)
+    # Enough for the Air to choose between replicas and match a check's tags
+    # in the same round trip.
+    out["caps"] = collect_caps(bench=False)
+    # Job paths in a replica must be spelled exactly as the agent spells them.
+    out["home"] = ORCHARD_HOME
+    if want_manifest:
+        out["manifest"] = manifest
+    print(json.dumps(out))
+    return 0
+
+
+def _replica_extract(work, tgz, wanted, manifest):
+    got = set()
+    listing = {}
+    with tarfile.open(tgz, "r:gz") as tar:
+        for member in tar:
+            arc = member.name
+            if arc not in wanted or arc in got:
+                raise ValueError("unexpected path in replica update: %r" % (arc,))
+            path = _replica_path(work, arc, make_parents=True, listing=listing)
+            if os.path.lexists(path):
+                _match_case(os.path.dirname(path), os.path.basename(path), listing)
+            if os.path.isdir(path) and not os.path.islink(path):
+                _remove_path(path)
+            if member.issym():
+                if os.path.lexists(path):
+                    os.unlink(path)
+                os.symlink(member.linkname, path)
+                manifest[arc] = replica_entry(path)
+            elif member.isreg():
+                src = tar.extractfile(member)
+                tmp = os.path.join(os.path.dirname(path), ".orchard-incoming-%d" % os.getpid())
+                h = hashlib.sha256()
+                try:
+                    with open(tmp, "wb") as out:
+                        for chunk in iter(lambda: src.read(1 << 20), b""):
+                            h.update(chunk)
+                            out.write(chunk)
+                    os.chmod(tmp, member.mode & 0o777)
+                    os.replace(tmp, path)
+                except BaseException:
+                    if os.path.lexists(tmp):
+                        os.unlink(tmp)
+                    raise
+                st = os.lstat(path)
+                manifest[arc] = ["F", "x" if st.st_mode & 0o111 else "-", h.hexdigest(), st.st_size, st.st_mtime_ns]
+            else:
+                raise ValueError("unsupported entry in replica update: %r" % (arc,))
+            got.add(arc)
+    return got
+
+
+def _drop_stale_incoming(rep):
+    """Updates whose senders gave up before applying them."""
+    now = time.time()
+    for name in os.listdir(rep):
+        if name.startswith("incoming") and name.endswith((".json", ".tgz")):
+            path = os.path.join(rep, name)
+            try:
+                if now - os.path.getmtime(path) > REPLICA_INCOMING_MAX_S:
+                    os.unlink(path)
+            except OSError:
+                pass
+
+
+def cmd_replica_apply(argv):
+    rep = _replica_dir(argv[0])
+    token = argv[1] if len(argv) > 1 else ""
+    if token and not TOKEN_RE.match(token):
+        raise ValueError("bad update token: %r" % (token,))
+    # Each sync has its own names, so two Airs updating one replica cannot
+    # apply each other's files.
+    suffix = "-" + token if token else ""
+    work = os.path.join(rep, "work")
+    incoming_json = os.path.join(rep, "incoming%s.json" % suffix)
+    incoming_tgz = os.path.join(rep, "incoming%s.tgz" % suffix)
+    journal = os.path.join(rep, "applying.json")
+    with _replica_lock(rep):
+        try:
+            busy = _replica_busy(rep)
+            if busy:
+                print(json.dumps({"error": "busy", "busy": busy}))
+                return 3
+            _drop_stale_incoming(rep)
+            incoming = _read_json(incoming_json, {})
+            os.makedirs(work, exist_ok=True)
+            manifest, meta, _drifted = _replica_load(rep)
+            base = manifest_digest(manifest)
+            if incoming.get("base") != base:
+                print(json.dumps({"error": "base", "digest": base}))
+                return 4
+            deleted = list(incoming.get("deleted") or [])
+            wanted = set(incoming.get("updates") or [])
+            # Written before any file changes: if this is killed part way, the
+            # next look at the replica rehashes these paths instead of
+            # trusting entries that may no longer be true.
+            _atomic_write_json(journal, deleted + sorted(wanted))
+            done = False
+            try:
+                for arc in deleted:
+                    path = _replica_path(work, arc)
+                    _remove_path(path)
+                    manifest.pop(arc, None)
+                    _prune_empty(work, os.path.dirname(path))
+                if wanted:
+                    missing = wanted - _replica_extract(work, incoming_tgz, wanted, manifest)
+                    if missing:
+                        raise ValueError("update is missing %d file(s), e.g. %r" % (len(missing), sorted(missing)[0]))
+                done = True
+            except Exception as exc:  # whatever stopped it, the copy and its manifest must still agree
+                print(json.dumps({"error": str(exc) or type(exc).__name__}))
+                return 6
+            finally:
+                if not done:
+                    _replica_recover(rep, manifest)
+                    _replica_refresh(rep, manifest)
+                _replica_write(rep, manifest, meta)
+                os.unlink(journal)
+        finally:
+            for path in (incoming_json, incoming_tgz):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+    if incoming.get("digest") and meta["digest"] != incoming["digest"]:
+        print(json.dumps({"error": "digest", "digest": meta["digest"]}))
+        return 5
+    print(json.dumps({"digest": meta["digest"], "files": len(manifest)}))
+    return 0
+
+
+def _replica_clear_out(work, manifest):
+    """Empty out/ of everything but the files the tree itself has there, so a
+    run starts with out/ as a fresh copy would have it."""
+    out = os.path.join(work, "out")
+    if os.path.islink(out) or (os.path.lexists(out) and not os.path.isdir(out)):
+        if "out" not in manifest:
+            os.unlink(out)
+        return
+    for dirpath, dirnames, filenames in os.walk(out, topdown=False):
+        for name in filenames + [d for d in dirnames if os.path.islink(os.path.join(dirpath, d))]:
+            full = os.path.join(dirpath, name)
+            if os.path.relpath(full, work).replace(os.sep, "/") not in manifest:
+                os.unlink(full)
+        if dirpath != out:
+            try:
+                os.rmdir(dirpath)
+            except OSError:
+                pass
+
+
+def _touch(path):
+    with open(path, "a"):
+        pass
+    os.utime(path, None)
+
+
+def cmd_replica_begin(argv):
+    """Start a job in the replica, if it still holds the tree the Air checked
+    (digest): prep, an earlier run or a person may have changed it since."""
+    rep = _replica_dir(argv[0])
+    job_json, expected = argv[1], argv[2]
+    if not DIGEST_RE.match(expected):
+        raise ValueError("bad digest: %r" % (expected,))
+    job = _read_json(job_json, {})
+    job_id = str(job.get("id") or "")
+    work = os.path.join(rep, "work")
+    if not JOB_ID_RE.match(job_id) or job.get("workdir") != work or not job.get("job_dir"):
+        print("replica-begin: job.json does not belong to this replica", file=sys.stderr)
+        return 2
+    job_dir = job["job_dir"]
+    with _machine_lock(), _replica_lock(rep, create=False) as got:
+        if not got or not os.path.isdir(work) or not os.path.exists(os.path.join(rep, "manifest.json")):
+            print(json.dumps({"error": "missing"}))
+            return 4
+        busy = _replica_busy(rep) or _machine_busy(rep)
+        if busy:
+            print(json.dumps({"error": "busy", "busy": busy}))
+            return 3
+        manifest, _meta, drifted = _replica_load(rep)
+        digest = manifest_digest(manifest)
+        if digest != expected:
+            print(json.dumps({"error": "moved", "digest": digest, "drifted": drifted[:20]}))
+            return 4
+        _replica_clear_out(work, manifest)
+        os.makedirs(job_dir, exist_ok=True)
+        for name in ("status.json", "pid", "command.pid", "kill-requested"):
+            try:
+                os.unlink(os.path.join(job_dir, name))
+            except OSError:
+                pass
+        _touch(os.path.join(rep, "used"))
+        with open(os.path.join(rep, "current"), "w") as f:
+            f.write(job_id)
+        with open(os.path.join(job_dir, "agent.out"), "wb") as out:
+            subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__), "exec", job_json],
+                cwd=ORCHARD_HOME, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+    print("started")
+    return 0
+
+
+def cmd_replica_release(argv):
+    """Free the replica once the Air has collected what the job left in it."""
+    rep = _replica_dir(argv[0])
+    job_id = argv[1]
+    released = False
+    with _replica_lock(rep, create=False) as got:
+        current = os.path.join(rep, "current")
+        if got:
+            try:
+                with open(current) as f:
+                    same = f.read().strip() == job_id
+            except OSError:
+                same = False
+            if same and _replica_job(rep)[1] in (None, "collecting"):
+                os.unlink(current)
+                released = True
+    print(json.dumps({"released": released}))
+    return 0
+
+
+def cmd_replica_meta(argv):
+    rep = _replica_dir(argv[0])
+    try:
+        fields = json.loads(argv[1])
+    except ValueError:
+        fields = None
+    if not isinstance(fields, dict) or set(fields) - set(REPLICA_META_FIELDS):
+        print("replica-meta: fields must be a JSON object of %s" % ", ".join(REPLICA_META_FIELDS), file=sys.stderr)
+        return 2
+    with _replica_lock(rep, create=False) as got:
+        if not got or not os.path.isdir(os.path.join(rep, "work")):
+            print("replica-meta: no such replica", file=sys.stderr)
+            return 4
+        meta = _read_json(os.path.join(rep, "meta.json"), {})
+        meta.update(fields)
+        _atomic_write_json(os.path.join(rep, "meta.json"), meta)
+    print(json.dumps(meta))
+    return 0
+
+
+def cmd_replica_pack(argv):
+    rep = _replica_dir(argv[0])
+    work = os.path.join(rep, "work")
+    arcs = _read_json(sys.stdin.fileno(), [])
+    with _replica_lock(rep, create=False) as got:
+        if not got or not os.path.isdir(work):
+            print("replica-pack: no such replica", file=sys.stderr)
+            return 4
+        with tarfile.open(fileobj=sys.stdout.buffer, mode="w|gz") as tar:
+            for arc in arcs:
+                path = _replica_path(work, arc)
+                if os.path.lexists(path) and not (os.path.isdir(path) and not os.path.islink(path)):
+                    tar.add(path, arcname=arc, recursive=False)
+    return 0
+
+
+def cmd_replica_down(argv):
+    rep = _replica_dir(argv[0])
+    with _replica_lock(rep, create=False) as got:
+        if not got:
+            print(json.dumps({"removed": False}))
+            return 0
+        busy = _replica_busy(rep)
+        if busy:
+            print(json.dumps({"error": "busy", "busy": busy}))
+            return 3
+        gone = _rmtree_force(rep)
+    if not gone:
+        print(json.dumps({"error": "some files could not be removed", "left": rep}))
+        return 7
+    print(json.dumps({"removed": True}))
+    return 0
+
+
+REPLICA_VERBS = {
+    "replica-state": (cmd_replica_state, (1, 2)),
+    "replica-apply": (cmd_replica_apply, (1, 2)),
+    "replica-begin": (cmd_replica_begin, (3,)),
+    "replica-release": (cmd_replica_release, (2,)),
+    "replica-meta": (cmd_replica_meta, (2,)),
+    "replica-pack": (cmd_replica_pack, (1,)),
+    "replica-down": (cmd_replica_down, (1,)),
+}
+
+
+def cmd_replica(verb, argv):
+    func, counts = REPLICA_VERBS[verb]
+    if len(argv) not in counts:
+        print("usage: agent.py %s %s" % (verb, REPLICA_USAGE[verb]), file=sys.stderr)
+        return 2
+    try:
+        return func(argv)
+    except ValueError as exc:
+        print("%s: %s" % (verb, exc), file=sys.stderr)
+        return 2
 
 
 def main(argv=None):
@@ -1332,6 +2041,8 @@ def main(argv=None):
         return cmd_settle(rest)
     if cmd == "wrap":
         return cmd_wrap(rest)
+    if cmd in REPLICA_VERBS:
+        return cmd_replica(cmd, rest)
     print("unknown command: %s" % cmd, file=sys.stderr)
     return 2
 
