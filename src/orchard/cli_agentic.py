@@ -7,6 +7,7 @@ this module registers them on the same Typer app. See docs/agent-native.md.
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -14,7 +15,8 @@ from typing import Optional
 
 import typer
 
-from . import consensus, fleet, receipts
+from . import consensus, fleet, receipts, worlds
+from .job import slugify
 from .cli import app, find_jobs
 
 
@@ -174,3 +176,87 @@ def consensus_cmd(
         if note:
             print(f"  memory: {note}")
     raise typer.Exit(consensus.exit_code(label))
+
+
+@app.command()
+def fork(
+    cmd: list[str] = typer.Argument(..., help="check to run in every world (after --)"),
+    patch: list[Path] = typer.Option([], "--patch", "-p", help="a unified diff to try (repeatable)"),
+    baseline: bool = typer.Option(False, "--baseline", help="also run the unpatched tree"),
+    first_only: bool = typer.Option(False, "--first", help="start no more worlds once one patch passes"),
+    keep: bool = typer.Option(False, "--keep", help="keep every world folder (default: only the winner's)"),
+    on: list[str] = typer.Option([], "--on", help="only use these machines (repeatable)"),
+    share: list[str] = typer.Option([], "--share", help="also link this ignored top-level folder (repeatable)"),
+    no_share: bool = typer.Option(False, "--no-share", help="link nothing; for patches that change dependencies"),
+    tag: list[str] = typer.Option([], "--tag", "-t", help="required worker capability tag (repeatable)"),
+    env_names: list[str] = typer.Option([], "--env", help="forward this env var to the job (repeatable)"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", help="seconds before each world is killed"),
+    json_out: bool = typer.Option(False, "--json", help="machine-readable output"),
+) -> None:
+    """Try several patches at once, each in its own copy of the tree, and name
+    the first that passes. Exit 0 with a winner, 1 without, 2 if none ran."""
+    if not patch:
+        print("error: give at least one --patch", file=sys.stderr)
+        raise typer.Exit(2)
+    missing = [str(p) for p in patch if not p.is_file()]
+    if missing:
+        print(f"error: no such patch: {', '.join(missing)}", file=sys.stderr)
+        raise typer.Exit(2)
+    root = Path.cwd()
+    token = fleet.new_token()
+    say = (lambda _msg: None) if json_out else print
+    shared = () if no_share else tuple(dict.fromkeys(worlds.SHARED_DIRS + tuple(share)))
+    entries = ([{"label": "baseline", "patch": None}] if baseline else []) + \
+        [{"label": str(p), "patch": p.resolve()} for p in patch]
+    base = worlds.WORLDS_DIR / f"fork-{token}"
+    for i, w in enumerate(entries):
+        w["dir"] = base / f"{i}-{slugify(Path(w['label']).name)}"
+        worlds.copy_tree(root, w["dir"], shared)
+        if w["patch"] is not None:
+            ok, err = worlds.apply_patch(w["dir"], w["patch"])
+            if not ok:
+                w.update(state="patch does not apply", why=err.splitlines()[0] if err else "")
+    ready = [w for w in entries if "state" not in w]
+    targets = list(on) or fleet.capable_targets(fleet.job_like_run(cmd, root, tag, env_names, timeout))
+    if not targets:
+        print("error: no reachable machine can run this check", file=sys.stderr)
+        raise typer.Exit(2)
+    run_opts = {"tags": tag, "env_names": env_names, "timeout": timeout}
+    plans = []
+    for (i, w), target in zip(enumerate(ready), worlds.assign(len(ready), targets)):
+        w["name"] = fleet.job_name("fork", token, target, i)
+        plans.append({"target": target, "cmd": cmd, "cwd": w["dir"], "name": w["name"], **run_opts})
+    say(f"fork: {len(ready)} world(s) on {', '.join(sorted(set(p['target'] for p in plans)))}")
+    base_prefix = next((slugify(w["name"]) + "-" for w in ready if w["patch"] is None), None)
+
+    def stop(result: dict) -> bool:
+        is_base = base_prefix is not None and (result.get("job") or "").startswith(base_prefix)
+        return first_only and consensus.passed(result) and not is_base
+
+    for w, result in zip(ready, fleet.run_spread(plans, stop=stop)):
+        w.update({k: result.get(k) for k in ("target", "job", "state", "why")})
+    decided = worlds.verdict(entries)
+    winner = next((w for w in entries if w["label"] == decided["winner"]), None)
+    stat = worlds.diff_stat(winner["patch"], root) if winner else ""
+    for w in entries:
+        if not keep and w is not winner:
+            shutil.rmtree(w["dir"], ignore_errors=True)
+    if base.exists() and not any(base.iterdir()):
+        base.rmdir()
+    if json_out:
+        rows = [{"label": w["label"], "patch": str(w["patch"]) if w["patch"] else None,
+                 **{k: w.get(k) for k in ("target", "job", "state", "why")},
+                 "world": str(w["dir"]) if w["dir"].exists() else None} for w in entries]
+        print(json.dumps({**decided, "stat": stat, "worlds": rows}, indent=2))
+    else:
+        for w in entries:
+            tail = w.get("job") or f"({w.get('why') or ''})"
+            print(f"  {w['label']:<24} {str(w.get('target') or '-'):<10} {str(w.get('state')):<20} {tail}")
+        print(f"fork: {decided['summary']}")
+        if stat:
+            print("\n".join("  " + line for line in stat.splitlines()))
+        if winner:
+            print(f"  world: {winner['dir']}")
+    if winner:
+        raise typer.Exit(0)
+    raise typer.Exit(1 if ready else 2)

@@ -121,12 +121,21 @@ patch gets its own copy of the tree on its own machine, they all run at
 once, and Orchard prints the winner with its diff stat. One round instead of
 three.
 
-**Mechanism.** Each world is a copy-on-write clone of the shipped tree
-(`cp -c` on APFS, a plain copy elsewhere) with one patch applied by
-`git apply`. Worlds are spread over the free, capable machines and run
-through `fleet.py`; each world leaves a receipt. With `--baseline`, an
-unpatched world runs too, so "fails before, passes after" is proved, not
-assumed.
+**Mechanism.** Each world is a copy of the files that would ship (a
+copy-on-write `clonefile` on APFS, a plain copy elsewhere) with one patch
+applied by `git apply`, which changes all of a patch or none of it. A patch
+that does not apply is reported, not run. Worlds are spread round-robin over
+the capable machines (or the ones named with `--on`) and run through
+`fleet.py`, so each leaves a receipt. With `--baseline`, an unpatched world
+runs too, so "fails before, passes after" is proved, not assumed. `--first`
+starts no more worlds once a patch passes. The winner's world is kept (its
+`out/` and logs live there); the rest are deleted unless `--keep`. Exit codes:
+0 a winner, 1 none, 2 nothing could run.
+
+Ignored folders a local check needs (`node_modules`, `.venv`, plus any
+`--share DIR`) are linked into each world, not copied; they never ship,
+because those names are excluded from every tarball. A patch that changes
+dependencies should use `--no-share`, or it will test against the old ones.
 
 **Modules.** New `worlds.py`.
 
@@ -233,10 +242,18 @@ interruption, on the same task set.
 
 ## 7. One mind (proposed, built after 1 to 6)
 
-**Journey.** Three machines stop behaving like three workers that message
-each other and start behaving like one mind with three bodies. Nobody asks
-"who takes this?", nobody waits for an answer, and when one machine goes
-quiet the other two already know exactly what it was doing.
+**The image.** Three people walking together who no longer notice they are
+three, because their understanding is so complete that all any of them
+perceives is the one walker. For machines that means two things. From the
+outside, there is one computer: you give it work and get answers, and no
+machine name appears unless you ask. From the inside, no machine keeps a list
+of "the others": each one plans over the same set of bodies, itself
+included, with no special case for self.
+
+**Journey.** Nobody asks "who takes this?", nobody waits for an answer, and
+when one body goes quiet the rest already know exactly what it was doing.
+The Mac and the Windows laptop are not two kinds of machine to choose
+between; there is one fleet that has learned what each part of it can do.
 
 **Why not a team that talks.** Messages are slow, can be lost, and every
 "I'll take this" / "no, I've got it" exchange is a chance to disagree. No
@@ -261,17 +278,38 @@ a new fact, never coordination.
   heat, which step of the plan it is on) a few times a second. The planner
   folds heartbeats into memory, so a machine that stops beating has its step
   reassigned by every copy at once, identically.
+- **One self across Mac and Windows.** Today the wall between them is a
+  rule, not the hardware: a job with no `os:` tag is treated as a Mac job,
+  because Orchard cannot tell whether it would behave the same on the
+  laptop's Linux. The rule stays the default, so existing jobs place exactly
+  as before. Learning removes it where it is safe: `orchard prove -- <cmd>`
+  runs a check on every reachable machine whatever its OS, and each pass is
+  a sealed receipt. A job tagged `-t os:proven` may then go to any OS that
+  has a sealed pass for the same command in the same project. When the OSes
+  disagree, consensus labels it platform-only and remembers why (a
+  case-sensitive path, a missing tool), so the difference becomes knowledge
+  instead of a wall. What cannot merge is physical: Xcode, iOS simulators
+  and Apple frameworks run only on macOS on Apple hardware. One mind still
+  lets each body do what it is able to, the way a hand does what an eye
+  can't, and routes that work to the Mac without being told. Windows-native
+  work (PowerShell, `.exe` builds) could join through WSL interop as an
+  `os:windows` capability; not in this cut.
 - **One train of thought** for local models. The Air holds the large model.
   The other machines run small drafts of the same model family that predict
   its next tokens and prepare the checks it will want (features 4 and 6).
   The large model accepts whole runs of predicted tokens in one pass, and
   only token ids cross the network.
 
-**Prior art.** Splitting one model's layers across machines exists (exo,
+**Prior art.** Making many machines look like one is old: single-system-image
+clusters (MOSIX, OpenSSI, Kerrighed) migrated processes inside the Linux
+kernel, between identical machines on a wired network, and Plan 9 gave a
+whole network one namespace. Splitting one model's layers across machines exists (exo,
 llama.cpp RPC) and is slow over Wi-Fi with an 8 GB Intel machine in the
 mix. Speculative decoding exists inside one machine. Lockstep planning
-exists in games and databases. Combining them, so a home fleet shares one
-memory, one plan and one train of thought, is the new part.
+exists in games and databases. The new part is combining them across
+different operating systems over Wi-Fi, without kernel changes, with the
+fleet learning from signed evidence what each body can do, so a home fleet
+shares one memory, one plan and one train of thought.
 
 **Measure.** Coordination messages per task (target: zero), time to recover
 a dead machine's step, and tokens per second for the local model with and
