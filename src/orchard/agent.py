@@ -814,6 +814,11 @@ def cmd_exec(argv):
         # This agent clears and reads the kill-requested file, so settle can
         # say whether a kill reached the run. Older agents' runs lack it.
         "kill_marker": True,
+        # What really ran it, for receipts.
+        "machine": os.uname().machine,
+        "os_family": os_family(),
+        # How busy the machine was at the start, for consensus.
+        "load_per_core": round(os.getloadavg()[0] / (os.cpu_count() or 1), 2),
     }
     _atomic_write_json(status_path, status)
 

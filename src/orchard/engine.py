@@ -20,7 +20,7 @@ import time
 from io import BytesIO
 from pathlib import Path
 
-from . import agent, env, events, store, transport
+from . import agent, env, events, receipts, store, transport
 from .config import Worker
 from .job import JobSpec, agent_job_payload
 
@@ -226,6 +226,7 @@ def launch_remote(
 
     is_build = job.kind == "build"
     check_shipping_size(cwd, job.kind)
+    receipts.record_inputs(sdir, cwd, job, worker.name)
     tmp = tempfile.NamedTemporaryFile(suffix=".tgz", delete=False)
     tmp.close()
     tar_path = Path(tmp.name)
@@ -480,6 +481,7 @@ def prepare_local_job(
     job: JobSpec, job_id: str, sdir: Path, cwd: Path, attempt: int = 1
 ) -> tuple[Path | None, Path]:
     job_json = sdir / "job.json"
+    receipts.record_inputs(sdir, cwd, job, "local")
     if job.kind == "build":
         payload = agent_job_payload(job, job_id, str(sdir), str(cwd), None, preempt=False, attempt=attempt)
         job_json.write_text(json.dumps(payload, indent=2) + "\n")

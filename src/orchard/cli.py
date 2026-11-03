@@ -15,7 +15,7 @@ from typing import Optional
 
 import typer
 
-from . import agent, dispatcher, engine, env, events, placement, store, transport
+from . import agent, dispatcher, engine, env, events, placement, receipts, store, transport
 from .config import DEFAULT_WORKER_HOST, JOBS_DIR, STATE_DIR, Worker, init_config, load_workers
 from .job import JobSpec, capture_env, load_job_file, new_job_id
 
@@ -177,6 +177,7 @@ def run(
     python: Optional[str] = typer.Option(None, "--python", help="Python spec (e.g. 3.12)"),
     tag: list[str] = typer.Option([], "--tag", "-t", help="required worker capability tag (repeatable)"),
     env_names: list[str] = typer.Option([], "--env", help="forward this env var to the job (repeatable)"),
+    reuse: bool = typer.Option(False, "--reuse", help="answer from a verified receipt for this exact work, if any"),
 ) -> None:
     """Submit a job: `orchard run -- python train.py`."""
     cwd = Path.cwd()
@@ -215,7 +216,7 @@ def run(
             for note in notes:
                 print(f"note: {note}")
 
-    submit(job, where=where, background=background, now=now, cwd=cwd)
+    submit(job, where=where, background=background, now=now, cwd=cwd, reuse=reuse)
 
 
 def _offload_target(job: JobSpec, worker: Optional[str], cfg: dict) -> tuple[Optional[Worker], str]:
@@ -318,6 +319,7 @@ def build(
     name: Optional[str] = typer.Option(None, "--name", help="job name"),
     timeout: Optional[int] = typer.Option(None, "--timeout", help="seconds before the agent kills the job"),
     env_names: list[str] = typer.Option([], "--env", help="forward this env var to the job (repeatable)"),
+    reuse: bool = typer.Option(False, "--reuse", help="answer from a verified receipt for this exact work, if any"),
 ) -> None:
     """Submit a build job: `orchard build -t x86_64 -t swift -- swift test`.
 
@@ -335,10 +337,33 @@ def build(
         job.env_values, missing = capture_env(job.env)
         for var in missing:
             print(f"note: env var {var} is not set here; it will not be forwarded")
-    submit(job, where=where, background=background, now=now, cwd=cwd)
+    submit(job, where=where, background=background, now=now, cwd=cwd, reuse=reuse)
 
 
-def submit(job: JobSpec, where: str, background: bool, now: bool, cwd: Path) -> None:
+def answer_from_receipt(job: JobSpec, cwd: Path) -> dict | None:
+    """The verified, succeeded receipt for this exact work, printed, or None."""
+    try:
+        key = receipts.describe(cwd, job)["work_key"]
+    except Exception as exc:
+        print(f"reuse: could not hash the tree ({exc}); running")
+        return None
+    hit = receipts.find_reusable(key)
+    if hit is None:
+        print(f"reuse: no receipt for this exact work (key {key[:12]}); running")
+        return None
+    ran_on = (hit.get("worker") or {}).get("name")
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(hit.get("sealed_at") or 0))
+    print(
+        f"reused: {hit['job']} passed on {ran_on} at {when} ({hit.get('elapsed_s')}s, "
+        f"tree {hit['tree'][:12]}); receipt verified, nothing ran"
+    )
+    events.append("reused", job=hit["job"], worker=ran_on)
+    return hit
+
+
+def submit(job: JobSpec, where: str, background: bool, now: bool, cwd: Path, reuse: bool = False) -> None:
+    if reuse and answer_from_receipt(job, cwd) is not None:
+        raise typer.Exit(0)
     job_id = new_job_id(job.name)
     sdir = JOBS_DIR / job_id
     sdir.mkdir(parents=True, exist_ok=True)
@@ -420,6 +445,7 @@ def run_local(job: JobSpec, job_id: str, sdir: Path, cwd: Path) -> int:
     print(f"running locally: {' '.join(job.cmd)}")
     proc = subprocess.run([sys.executable, str(Path(agent.__file__)), "exec", str(job_json)])
     status = agent.read_status(str(sdir)) or {}
+    receipts.seal(sdir, status, "local", cwd / "out")
     print_result(status)
     events.append("finished", job=job_id, worker="local", state=status.get("state"), exit_code=proc.returncode)
     return proc.returncode
@@ -434,6 +460,7 @@ def run_remote(worker: Worker, job: JobSpec, job_id: str, sdir: Path, cwd: Path)
         print("detached; the job continues on the worker")
         return 0
     status = engine.collect_remote(worker, job_id, rjob, sdir, cwd)
+    receipts.seal(sdir, status, worker.name, cwd / ".orchard-out" / job_id / "out")
     print_result(status)
     events.append(
         "finished",
@@ -1162,6 +1189,11 @@ def selftest(
         print(f"selftest: FAILED ({', '.join(failures)})")
         raise typer.Exit(1)
     print("selftest: all good")
+
+
+# Agent-native commands (receipt, consensus, fork, speculate, replica, live)
+# register themselves on `app` when imported.
+from . import cli_agentic  # noqa: E402,F401
 
 
 def main() -> None:

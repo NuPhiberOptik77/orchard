@@ -18,7 +18,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from . import agent, engine, env, events, placement
+from . import agent, engine, env, events, placement, receipts
 from .config import ORCHARD_HOME, QUEUE_DIR, STATE_DIR, Worker, load_workers
 from .job import JobSpec
 
@@ -976,6 +976,8 @@ def finish(entry: dict, status: dict, worker_map: dict[str, Worker]) -> list[str
                 Path(entry["cwd"]),
             )
             _keep_final_status(Path(entry["sdir"]), status)
+    out_dir = Path(entry["cwd"]) / (f".orchard-out/{job_id}/out" if worker_name != "local" else "out")
+    receipts.seal(Path(entry["sdir"]), status, worker_name, out_dir)
     entry.update(
         state="done" if state == "succeeded" else "failed",
         note=f"{state} (exit {status.get('exit_code')})",
