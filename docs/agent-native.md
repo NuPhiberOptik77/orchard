@@ -6,9 +6,8 @@ check, reads the failure, edits again, dozens of times an hour, and most of
 those checks are ones it (or the fleet) has already run on an identical tree.
 This document designs seven features that turn the fleet from "somewhere else
 to run a command" into machines that cooperate on one agent's work. They are
-listed in build order: each one leans on the ones before it. Features 1 to 6
-are built, as are two pieces of 7 that stand on their own (cross-OS proof,
-and shared sight in section 5); the rest of 7 is a proposal.
+listed in build order: each one leans on the ones before it. All seven are
+built, except one piece of 7, one train of thought, which section 7 explains.
 
 | # | Feature | Command | Leans on |
 | --- | --- | --- | --- |
@@ -18,7 +17,7 @@ and shared sight in section 5); the rest of 7 is a proposal.
 | 4 | Speculative runs | `orchard speculate` | receipts (reuse is the payoff) |
 | 5 | Living replicas, shared sight | `orchard replica`, `--sight` | receipts, speculation, consensus |
 | 6 | Checking alongside the AI | `orchard live` | replicas, speculation |
-| 7 | One mind | `orchard prove`, `-t os:proven` (built); `orchard mind` (proposed) | all of the above |
+| 7 | One mind | `orchard mind`, `orchard prove`, `-t os:proven` | all of the above |
 
 Everything here is opt-in. A plain `orchard run`, `build`, `offload` or a
 queued job behaves exactly as before; the only change on those paths is that
@@ -453,7 +452,7 @@ each completed edit.
 interruption, on the same task set.
 
 
-## 7. One mind (proposed, built after 1 to 6)
+## 7. One mind
 
 **The image.** Three people walking together who no longer notice they are
 three, because their understanding is so complete that all any of them
@@ -463,73 +462,172 @@ machine name appears unless you ask. From the inside, no machine keeps a list
 of "the others": each one plans over the same set of bodies, itself
 included, with no special case for self.
 
-**Journey.** Nobody asks "who takes this?", nobody waits for an answer, and
-when one body goes quiet the rest already know exactly what it was doing.
-The Mac and the Windows laptop are not two kinds of machine to choose
-between; there is one fleet that has learned what each part of it can do.
+**Journey.** In a project directory:
 
-**Why not a team that talks.** Messages are slow, can be lost, and every
-"I'll take this" / "no, I've got it" exchange is a chance to disagree. No
-machine can learn a new fact before the bits reach it, so the aim is not to
-beat that limit. It is to make sure that the only thing that ever travels is
-a new fact, never coordination.
+```
+$ orchard mind run --step "python3 a.py" --step "python3 t.py"
+mind: launched dd37eba5f6ae gen 1 on local
+mind: succeeded dd37eba5f6ae gen 1 on local
+mind: launched f0718894ad5e gen 1 on local
+mind: succeeded f0718894ad5e gen 1 on local
+mind: goal b7eed33ab2f0, 2 step(s)
+  f0718894ad5e passed       0.5s  python3 a.py  body d271d55d
+  dd37eba5f6ae passed       0.5s  python3 t.py  body d271d55d
+mind: all passed. 0 coordination messages, 0 recoveries
 
-**Mechanism.**
+$ orchard mind run --step "python3 a.py" --step "python3 t.py"
+mind: goal b7eed33ab2f0, 2 step(s), from memory
+  f0718894ad5e passed       0.5s  python3 a.py  body d271d55d (memory)
+  dd37eba5f6ae passed       0.5s  python3 t.py  body d271d55d (memory)
+mind: all passed. 0 coordination messages, 0 recoveries
+```
 
-- **One memory.** Receipts, consensus verdicts and file digests are
-  replicated to every machine (they are small, signed and append-only, so
-  merging is a union). Any machine answers "has this been done, and did it
-  pass?" from its own disk.
-- **One will.** The plan is a pure function of (shared memory, goal). Every
-  machine runs the same planner on the same memory and gets the identical
-  assignment, so each knows its own part and everyone else's without being
-  told. This is deterministic lockstep, as in strategy games and
-  deterministic databases: only inputs travel, and every copy computes the
-  same state. Two machines can never claim the same work, because there is
-  no claiming.
-- **One body sense.** Each machine sends a heartbeat of a few bytes (load,
-  heat, which step of the plan it is on) a few times a second. The planner
-  folds heartbeats into memory, so a machine that stops beating has its step
-  reassigned by every copy at once, identically.
-- **One self across Mac and Windows.** Today the wall between them is a
-  rule, not the hardware: a job with no `os:` tag is treated as a Mac job,
-  because Orchard cannot tell whether it would behave the same on the
-  laptop's Linux. The rule stays the default, so existing jobs place exactly
-  as before. Learning removes it where it is safe: `orchard prove -- <cmd>`
-  runs a check on every reachable machine whatever its OS, and each pass is
-  a sealed receipt. A job tagged `-t os:proven` may then go to macOS or to
-  any OS whose latest sealed run of the same command in the same project
-  passed; a newer failure there takes that OS away again. The answer is
-  fixed when the job is submitted, so the dispatcher's later checks agree
-  with it, and it never changes the job's work key. When the OSes
-  disagree, consensus labels it platform-only and remembers why (a
-  case-sensitive path, a missing tool), so the difference becomes knowledge
-  instead of a wall. What cannot merge is physical: Xcode, iOS simulators
-  and Apple frameworks run only on macOS on Apple hardware. One mind still
-  lets each body do what it is able to, the way a hand does what an eye
-  can't, and routes that work to the Mac without being told. Windows-native
-  work (PowerShell, `.exe` builds) could join through WSL interop as an
-  `os:windows` capability; not in this cut.
-- **One train of thought** for local models. The Air holds the large model.
-  The other machines run small drafts of the same model family that predict
-  its next tokens and prepare the checks it will want (features 4 and 6).
-  The large model accepts whole runs of predicted tokens in one pass, and
-  only token ids cross the network.
+That is a real run on one machine with no workers configured. With workers,
+the same command spreads the steps across them and names each one only by
+its body id. What happens:
+
+1. **Plan from disk first.** Orchard hashes the tree and builds each step
+   exactly as `orchard run` would, so a step's work key is the one receipts
+   already use. The goal id comes from the tree, the steps, their timeouts,
+   the trusted keys and the install that wrote it. If memory already holds a
+   pass or a failure for every step, Orchard answers from this machine's own
+   disk without a single network call, as the second run above did.
+2. **Survey once.** Every body it can reach, this Mac included, gets one
+   **fit** record: which steps it can run, and for the rest a fixed problem
+   code (`missing tags: ...`, `worker OS is ...`, `platform resolve failed`).
+   A step tagged `-t x86_64` fits only a body with that tag, exactly as
+   placement decides today.
+3. **Launch.** Each body runs at most one mind step at a time, and every step
+   is an ordinary `orchard run -w <target>` child, so it uploads, runs,
+   collects and seals a normal receipt. Just before a remote launch, Orchard
+   checks the owner's idle hold and placement again with fresh numbers.
+4. **Watch and recover.** One SSH call per body every 15 seconds covers every
+   step on it. A body that stays silent for `--quiet-after` seconds (default
+   600, the replicas' lost window; at least 60) loses its step, and the next
+   generation goes to another capable body in the same tick. After six
+   generations a step is stranded, and `orchard mind retry` reopens it.
+5. **Detach and pick up.** Ctrl-C detaches. Launched steps keep running in
+   their own process sessions, and running the same command again adopts
+   them instead of starting them twice.
+
+`mind run` exits 0 when everything passed, 1 on a failure, 2 on a usage
+error (including "no body has reported yet"), 3 when a step is stranded, 4
+when the tree changed underneath the goal, and 130 when detached.
+
+**Mechanism, as built.**
+
+- **One memory.** Facts are signed records of eight kinds: goal, fit,
+  launch, result, lost, retry, verdict and refute. They live in write-once
+  segment files named by their own sha256 under `~/.orchard/mind/segments/`,
+  so merging two memories is a union and a file can't be half-written under
+  its final name. `orchard mind sync` swaps segments with the same folder on
+  each worker over SSH. Workers are only relays: Orchard trusts nothing
+  because of where it came from. `export` and `import` do the same through a
+  file.
+- **One will.** `plan()` is a pure function of (records, goal id), written for
+  Python 3.9 with no imports; a test parses it and fails on any clock, file
+  or network call. Any session holding the same records prints the same plan
+  digest. It places the longest steps first, each on the body predicted to
+  finish it soonest, from measured run times and each body's benchmark.
+  Nobody asks "who takes this?": each copy of the planner already knows.
+- **One launch per step.** Within one install, two sessions on the same goal
+  (two terminals, or an agent that crashed and came back) launch each step
+  once: a claim file per step and generation is created with `os.link`, and
+  exactly one session wins. A claim whose holder is dead (checked by boot
+  id, pid and process start time) is adopted. If its launcher is still
+  alive, the adopter only watches it. If not, the adopter collects and seals
+  the job itself, or records it lost.
+- **One body sense.** Each machine gets a random body id the first time it
+  is sensed, in `~/.orchard/body.id`. The id isn't derived from the hostname,
+  so it can't be reversed. A machine that is both this home and a configured
+  worker is one body.
+- **No names in memory.** Records carry body ids, digests and integers.
+  Worker names, paths, env values and a resolver's error text never go in;
+  holds and placement problems are stored as fixed codes, such as
+  `held: owner active` or `held: on battery`. Printed output hides worker
+  names too, unless you pass `--bodies`.
+- **Trust.** Every record carries an HMAC under the install's receipt key.
+  This install's own records verify. Tampered ones are kept and refuted, so
+  every copy drops them the same way. Records from another install are
+  "unverifiable", because an HMAC can't be checked without the key. They are
+  shown, but never complete, launch or move a step unless you pass
+  `--trust <key id>` (the other install's `orchard mind key`). A goal names
+  its author, and only that install launches it.
+- **One self across Mac and Linux.** Steps keep today's OS rules. A step with
+  no `os:` tag is a Mac step. `-t os:proven` lets a step go to any OS where
+  `orchard prove` sealed a pass of the same command in the same project, and
+  a newer failure there takes that OS away again. Xcode, iOS simulators and
+  Apple frameworks stay on macOS: one mind lets each body do what it can,
+  the way a hand does what an eye can't.
+
+| Command | What it does | Network |
+| --- | --- | --- |
+| `orchard mind run [-- CMD] [--step TEXT]... [--speculate]` | Build the goal, answer from memory if possible, otherwise run it to an end. Also takes `-t`, `--env`, `--timeout`, `--quiet-after`, `--trust`, `--reuse`, `--fresh`, `--plan-only`, `--sync`, `--bodies` and `--json` | survey, sense, launch; sync with `--sync` |
+| `orchard mind plan [GOAL]` | The plan and its digest, from memory | none |
+| `orchard mind status` | This project's goals and their states | none |
+| `orchard mind why STEP` | Per body: whether it fits or why not; each generation's launches, results and losses | none |
+| `orchard mind memory` | Record counts by kind, key, status and how they arrived | none |
+| `orchard mind sync [WORKER]` | Swap segments with each worker | SSH only |
+| `orchard mind export FILE`, `import FILE` | Move memory through a file; import checks every segment | none |
+| `orchard mind retry STEP` | Reopen a failed or stranded step at the next generation | none |
+| `orchard mind key` | This install's key id, for another install's `--trust` | none |
+
+`--plan-only` writes nothing and reaches nothing; it doesn't even create the
+receipt key. `--reuse` lifts sealed passing receipts from before one mind,
+and stays opt-in like `run --reuse`. `--fresh` reruns every step even when
+memory has the answer.
+
+**What is not built, and why.**
+
+- **One train of thought.** The idea was for small local models on the
+  other machines to draft tokens for a large one on the Air. It is not
+  built: no local model runtime is installed, and one of the bodies is an
+  8 GB Intel Mac, which can't hold a useful draft model next to its real
+  work. Splitting a model across machines over Wi-Fi is slow even where it
+  exists.
+- **Sub-second heartbeats.** Orchard opens no listeners and sends no UDP, by
+  rule. An SSH probe every 15 seconds and a quiet window of 60 to 600
+  seconds is what that allows, so recovery is measured in minutes, not
+  milliseconds.
+- **Claims across installs.** Two installs that run the same step at the
+  same moment may both run it. That costs time, never correctness: results
+  are unioned and a pass wins. Preventing it needs a shared arbiter, which
+  this cut doesn't add.
+- **Workers planning for themselves.** That needs a resident process on each
+  worker, and Orchard has no daemon there. `plan()` stays Python 3.9 and
+  import-free, so a later cut could run it inside an ordinary job.
+- **Late passes from a lost generation.** When a step moves on, the old
+  launcher is stopped and the remote job is ended once its body answers
+  again. A pass that job had already reached is not collected.
+- **Queue integration.** Mind steps are foreground children, so `orchard
+  queue` and `orchard cancel` don't list them. Mind applies the owner's
+  idle hold itself, because foreground runs skip the dispatcher's.
+- **Compaction.** Segments are a few KB per goal, and nothing compacts them
+  yet. The workers' garbage collection leaves `~/.orchard/mind/` alone.
 
 **Prior art.** Making many machines look like one is old: single-system-image
 clusters (MOSIX, OpenSSI, Kerrighed) migrated processes inside the Linux
 kernel, between identical machines on a wired network, and Plan 9 gave a
-whole network one namespace. Splitting one model's layers across machines exists (exo,
-llama.cpp RPC) and is slow over Wi-Fi with an 8 GB Intel machine in the
-mix. Speculative decoding exists inside one machine. Lockstep planning
-exists in games and databases. The new part is combining them across
-different operating systems over Wi-Fi, without kernel changes, with the
-fleet learning from signed evidence what each body can do, so a home fleet
-shares one memory, one plan and one train of thought.
+whole network one namespace. Lockstep planning, where every copy computes
+the same state from the same inputs, is how strategy games and deterministic
+databases avoid arguing. The new part here is the combination: one signed
+memory shared across macOS and Linux over Wi-Fi, a pure planner every copy
+runs identically, and a fleet that learns from sealed evidence what each body
+can do, with no kernel changes and no daemon.
 
-**Measure.** Coordination messages per task (target: zero), time to recover
-a dead machine's step, and tokens per second for the local model with and
-without drafting machines.
+**Measure.**
+
+- **Coordination messages per task.** Target zero, and zero in every test and
+  in the run above. Every network call goes through one ledger, by purpose
+  (survey, sense, launch, sync), and `--json` prints it, so a coordination
+  message would show up as a number.
+- **Time to recover a dead body's step.** In the tests, a quiet body's step
+  moves in the same tick its quiet window ends. On real machines that makes
+  recovery the quiet window plus up to a second, plus the new launch. It
+  hasn't been timed on the real fleet yet, because the first real run writes
+  a body id file on each worker, and that waits for the owner's go-ahead.
+- **Duplicate launches.** Zero in the test where two sessions meet at the
+  same claim at the same instant.
 
 ---
 

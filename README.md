@@ -147,6 +147,7 @@ also leaves a receipt.
 | `orchard speculate` | Run likely checks before anyone asks for them |
 | `orchard replica` | A warm copy of the project on each machine; `--sight` labels a failure across them |
 | `orchard live -- <check>` | Check a file each time a function in it is finished, while the model is still writing it |
+| `orchard mind run -- <cmd>` | One memory, one plan, every machine: answer from shared memory, or run each step on the body that finishes it soonest and move it if a body goes quiet |
 
 `contrib/live_check_agent.py` is a reference Claude API harness for
 `orchard live`. [docs/agent-native.md](docs/agent-native.md) is the design:
