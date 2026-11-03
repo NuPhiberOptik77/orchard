@@ -628,7 +628,7 @@ def live_cmd(
     prints one JSON line per check, and exits 1 at the first failure."""
     cmd = _need_cmd(cmd)
     try:
-        code = live.serve(cmd, Path.cwd(), timeout=timeout, links=link, speculate_on=not no_speculate)
+        code = live.serve(cmd, Path.cwd(), timeout=timeout or None, links=link, speculate_on=not no_speculate)
     except ValueError as exc:  # the project is over the shipping size cap
         typer.echo(f"orchard live: {exc}", err=True)
         code = 2

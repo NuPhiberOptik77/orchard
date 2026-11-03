@@ -22,6 +22,7 @@ too many turns).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import queue
 import re
@@ -38,6 +39,9 @@ FALLBACK_BETA = "server-side-fallback-2026-07-01"
 TAIL_CHARS = 4000
 SHOWN_CHARS = 8000
 RETRIES = 2
+CHECK_TIMEOUT = 300  # seconds before `orchard live` kills one check
+CLOSE_GRACE = 30     # and how much longer the last check may take to report
+_GOES_ON = ("end_turn", "tool_use", "pause_turn", "stop_sequence")  # anything else: stop
 
 TOOLS = [
     {
@@ -213,23 +217,34 @@ def _inside(root: Path, rel) -> Path | None:
 class _Live:
     """One `orchard live` process for one model reply."""
 
-    def __init__(self, orchard: list[str], check: str, root: Path):
-        self.proc = subprocess.Popen([*orchard, "live", "--", *shlex.split(check)], cwd=root,
-                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
-                                     encoding="utf-8", bufsize=1)
+    def __init__(self, orchard: list[str], check: str, root: Path, timeout: int = CHECK_TIMEOUT):
+        self.argv = [*orchard, "live", "--timeout", str(timeout), "--", *shlex.split(check)]
+        self.root, self.timeout = root, timeout
+        self._start()
+
+    def _start(self) -> None:
+        self.proc = subprocess.Popen(self.argv, cwd=self.root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     text=True, encoding="utf-8", errors="replace", bufsize=1)
         self.events: queue.Queue = queue.Queue()
         self.failure: dict | None = None
         self.results: dict[str, dict] = {}  # path -> its check on the finished file
-        self.pump = threading.Thread(target=self._pump, daemon=True)
+        self.seen = 0  # events read, to tell a slow check from a stuck one
+        self.pump = threading.Thread(target=self._pump, args=(self.proc, self.events), daemon=True)
         self.pump.start()
 
-    def _pump(self) -> None:
-        for line in self.proc.stdout:
+    def restart(self) -> None:
+        """A fresh process: what the declined model wrote, and its failure, are gone."""
+        self.stop()
+        self._start()
+
+    def _pump(self, proc, events: queue.Queue) -> None:
+        for line in proc.stdout:
+            self.seen += 1
             try:
-                self.events.put(json.loads(line))
+                events.put(json.loads(line))
             except ValueError:
                 pass
-        self.events.put(None)
+        events.put(None)
 
     def send(self, item: dict) -> None:
         if self.failure is not None or self.proc.poll() is not None:
@@ -264,7 +279,15 @@ class _Live:
             self.proc.stdin.close()
         except OSError:
             pass
-        code = self.proc.wait()
+        while True:
+            seen = self.seen
+            try:
+                code = self.proc.wait(timeout=self.timeout + CLOSE_GRACE)
+                break
+            except subprocess.TimeoutExpired:
+                if self.seen == seen:  # not even a check has ended: stuck
+                    self.stop()
+                    raise RuntimeError("orchard live stopped answering") from None
         self.pump.join(timeout=5)
         failure = self.poll()
         if code not in (0, 1) or (code == 1 and failure is None):
@@ -290,7 +313,7 @@ def _on_event(event, blocks: dict, live: _Live, root: Path, out) -> None:
         if block.type == "tool_use" and block.name == "write_file":
             info.update(fields=_Fields(), path=None, sent=0)
         elif block.type == "fallback":
-            live.results.clear()  # the declined model's files are written again
+            live.restart()  # the declined model's files, and any failure in them, are written again
         blocks[event.index] = info
     elif kind == "content_block_delta":
         delta, info = event.delta, blocks.get(event.index, {})
@@ -348,7 +371,7 @@ def _stream(client, system: str, messages: list, effort: str, live: _Live, root:
 
 
 def _written(blocks: dict, path: str) -> str:
-    for info in blocks.values():
+    for info in reversed(list(blocks.values())):  # after a fallback, the newest copy
         if info.get("path") == path:
             return info["fields"].values.get("contents", "")
     return ""
@@ -423,7 +446,7 @@ def _run_tool(block, root: Path, live: _Live, streamed: dict) -> dict:
 
 
 def run(task: str, root, check: str, client=None, orchard: list[str] | None = None,
-        effort: str = "medium", max_turns: int = 20, out=None) -> int:
+        effort: str = "medium", max_turns: int = 20, out=None, timeout: int = CHECK_TIMEOUT) -> int:
     root = Path(root).resolve()
     out = out or sys.stdout
     client = client or make_client()
@@ -432,13 +455,13 @@ def run(task: str, root, check: str, client=None, orchard: list[str] | None = No
     messages: list = [{"role": "user", "content": task}]
     for _ in range(max_turns):
         for attempt in range(RETRIES + 1):
-            live = _Live(orchard, check, root)
+            live = _Live(orchard, check, root, timeout)
             try:
                 msg, failure, blocks = _stream(client, system, messages, effort, live, root, out)
                 break
-            except ValueError:  # the SDK could not parse a streamed tool input
+            except ValueError as exc:  # the SDK could not parse a streamed tool input
                 live.stop()
-                if attempt == RETRIES:
+                if attempt == RETRIES or isinstance(exc, UnicodeError):  # ours, not the SDK's: retrying won't help
                     raise
             except BaseException:
                 live.stop()
@@ -448,7 +471,7 @@ def run(task: str, root, check: str, client=None, orchard: list[str] | None = No
             out.write(f"\n[check failed in {failure.get('path')} line {failure.get('line')}; asking for a fix]\n")
             _add_user_text(messages, _failure_text(failure, check, blocks))
             continue
-        if msg.stop_reason in ("refusal", "max_tokens"):
+        if msg.stop_reason not in _GOES_ON:  # refusal, max_tokens, a full context window...
             live.stop()
             out.write(f"\n[stopped: {msg.stop_reason}]\n")
             return 1
@@ -477,9 +500,12 @@ def main(argv=None) -> int:
     ap.add_argument("--orchard", default="orchard", help="how to start orchard (default: orchard)")
     ap.add_argument("--effort", default="medium", choices=["low", "medium", "high", "xhigh", "max"])
     ap.add_argument("--max-turns", type=int, default=20)
+    ap.add_argument("--timeout", type=int, default=CHECK_TIMEOUT, help="seconds before one check is killed")
     args = ap.parse_args(argv)
+    with contextlib.suppress(AttributeError, ValueError):
+        sys.stdout.reconfigure(errors="replace")  # a model's text the terminal can't show
     return run(args.task, args.root, args.check, orchard=shlex.split(args.orchard),
-               effort=args.effort, max_turns=args.max_turns)
+               effort=args.effort, max_turns=args.max_turns, timeout=args.timeout)
 
 
 if __name__ == "__main__":

@@ -400,15 +400,24 @@ finishing a 300-line file built on a broken first function.
 - The check may use `{path}` and `{unit}` (the file, and the function that
   just closed). The same values are in `ORCHARD_LIVE_PATH` and
   `ORCHARD_LIVE_UNIT`, and `ORCHARD_LIVE_FINAL` is 1 for the finished file.
-  `--timeout <s>` kills a check that hangs (its whole process group).
+  `--timeout <s>` kills a check that hangs (its whole process group); 0
+  means no limit. When a check exits, anything it left running in the
+  background is killed too, so it can't hold up the next one. The shadow
+  comes first on `PYTHONPATH`, so a check imports the copy being written,
+  not an installed copy of the project.
 - While an existing `.py` file is rewritten, the definitions the new text
   has not reached yet are taken from the old file, so a test suite still
-  imports. Brace languages get no such fill-in, so give them checks scoped
-  to the file (`{path}`) rather than the whole suite.
+  imports. That includes the rest of a class whose first methods are being
+  rewritten. A name the new text defines is never overwritten by an old
+  import or definition. Brace languages get no such fill-in, so give them
+  checks scoped to the file (`{path}`) rather than the whole suite. Braces
+  inside strings, comments, text blocks, JS regex literals and Rust char
+  literals don't count.
 - One JSON line per check goes to stdout: `{"event": "check", "path",
   "line", "unit", "final", "ok", "exit", "seconds"}`, plus `tail` (the last
   30 lines of output) and `why` on a failure. Bad input gets an `error`
-  event and is skipped. At the end of input it prints `{"event": "done",
+  event and is skipped, and so does a write to a path outside the project,
+  including through a link. At the end of input it prints `{"event": "done",
   "checks": n}` and exits 0. The first failure exits 1: the caller's signal
   to stop the model and hand it the failure. Exit 2 means no check command
   was given.

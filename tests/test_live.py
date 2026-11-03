@@ -8,6 +8,7 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -115,6 +116,59 @@ def test_fill_keeps_old_definitions_the_new_text_has_not_reached():
     assert ns["a"]() == 10 and ns["b"]() == 2
 
 
+def test_braces_in_char_regex_and_text_block_literals_are_not_code():
+    assert _boundaries("a.rs", "fn is_close(c: char) -> bool {\n    c == '}'\n}\n") == [(3, "is_close")]
+    assert _boundaries("a.js", 'function f(s) {\n  return s.replace(/}/g, "");\n}\n') == [(3, "f")]
+    assert _boundaries("a.js", "const half = n / 2;\nfunction g() {\n  return 1 / 2 / 3;\n}\n") == [(4, "g")]
+    assert _boundaries("A.java", 'class A {\n  String s = """\n    }\n  """;\n}\n') == [(5, "A")]
+
+
+def test_a_callback_argument_is_not_the_end_of_the_statement():
+    js = "setTimeout(() => {\n  run();\n},\n1000);\n"
+    assert [n for n, _ in _boundaries("a.js", js)] == [4]
+
+
+def test_brace_units_name_arrow_functions_and_generic_impls():
+    assert live._brace_unit("const add = (a, b) => ") == "add"
+    assert live._brace_unit("export const handler = async (event) => ") == "handler"
+    assert live._brace_unit("impl<T: Clone> Stack<T> ") == "Stack"
+    assert live._brace_unit("impl<T> Display for Wrapper<T> ") == "Wrapper"
+
+
+def test_fill_never_rebinds_a_name_the_new_text_defines():
+    original = "import os\nfrom json import loads\n\ndef other():\n    return os.sep\n"
+    filled = live._fill("import os.path\n\ndef loads(s):\n    return s\n", original)
+    assert "from json import loads" not in filled and "import os\n" in filled and "def other" in filled
+    ns = {}
+    exec(compile(filled, "m.py", "exec"), ns)
+    assert ns["loads"]("x") == "x" and ns["other"]() == os.sep
+
+
+def test_fill_counts_lines_the_way_ast_does():
+    original = "import os\n\x0c\ndef a():\n    return 1\n\n\ndef b():\n    return 2\n"
+    ns = {}
+    exec(compile(live._fill("def a():\n    return 10\n", original), "m.py", "exec"), ns)
+    assert ns["b"]() == 2
+
+
+def test_fill_keeps_the_rest_of_a_class_being_rewritten(tmp_path):
+    (tmp_path / "mod.py").write_text("class C:\n    def one(self):\n        return 1\n\n"
+                                     "    def two(self):\n        return 2\n")
+    check = [PY, "-c", "import mod; assert mod.C().one() == 10 and mod.C().two() == 2"]
+    with _session(tmp_path, check) as (lv, out):
+        _feed(lv, "mod.py", "class C:\n    def one(self):\n        return 10\n\n    def three(self):\n")
+    first = _events(out)[0]
+    assert first["ok"] and first["unit"] == "one"
+
+
+def test_a_parser_that_gives_up_is_no_boundary_not_a_crash(monkeypatch):
+    def give_up(*a, **k):
+        raise RecursionError("too deep")
+    monkeypatch.setattr(live.ast, "parse", give_up)
+    assert live._fill("x = 1\n", "y = 2\n") == "x = 1\n"
+    assert _boundaries("m.py", "def a():\n    pass\n\nx = 1\n") == []
+
+
 # --- checks -------------------------------------------------------------------
 
 def test_first_failing_function_stops_with_its_output(tmp_path):
@@ -170,6 +224,40 @@ def test_timeout_is_a_failure_with_a_reason(tmp_path):
     assert not ev["ok"] and ev["why"] == "timed out after 1s" and ev["line"] == 1
 
 
+def test_a_background_child_holding_the_pipe_does_not_stretch_the_check(tmp_path):
+    with _session(tmp_path, ["sh", "-c", "sleep 6 & exit 0"], timeout=2) as (lv, out):
+        lv.apply({"path": "notes.txt", "text": "hi"})
+        lv.apply({"path": "notes.txt", "done": True})
+        t0 = time.monotonic()
+        assert lv.check_ready() == 0
+        assert time.monotonic() - t0 < 4
+    (ev,) = _events(out)
+    assert ev["ok"]
+
+
+def test_checks_import_the_shadow_not_the_real_project(tmp_path, monkeypatch):
+    root = tmp_path / "proj"
+    (root / "src" / "pkg").mkdir(parents=True)
+    (root / "src" / "pkg" / "__init__.py").write_text("")
+    monkeypatch.setenv("PYTHONPATH", str(root / "src"))  # as an editable install would
+    check = [PY, "-c", "import os, sys, pkg; "
+             "sys.exit(0 if os.path.realpath(pkg.__file__).startswith(os.path.realpath(os.getcwd())) else 1)"]
+    with _session(root, check) as (lv, out):
+        lv.apply({"path": "notes.txt", "text": "hi"})
+        lv.apply({"path": "notes.txt", "done": True})
+        assert lv.check_ready() == 0
+    assert _events(out)[0]["ok"]
+
+
+def test_cli_timeout_zero_means_no_timeout(tmp_path):
+    env = dict(os.environ, PYTHONPATH=SRC, HOME=str(tmp_path / "home"))
+    lines = json.dumps({"path": "n.txt", "text": "hi"}) + "\n" + json.dumps({"path": "n.txt", "done": True}) + "\n"
+    p = subprocess.run([PY, "-m", "orchard", "live", "--timeout", "0", "--no-speculate", "--", PY, "-c", "pass"],
+                       cwd=tmp_path, env=env, input=lines, capture_output=True, text=True, timeout=60)
+    evs = [json.loads(x) for x in p.stdout.splitlines()]
+    assert p.returncode == 0 and evs[0]["ok"], p.stdout + p.stderr
+
+
 def _git(root, *args):
     subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
 
@@ -180,7 +268,7 @@ def test_serve_rejects_bad_lines_and_outside_paths(tmp_path, monkeypatch):
     root = tmp_path / "proj"
     root.mkdir()
     lines = ["not json", "[1]", json.dumps({"path": "../x.py", "text": "a"}),
-             json.dumps({"path": "/etc/x.py", "text": "a"}),
+             json.dumps({"path": "../x.py", "done": True}), json.dumps({"path": "/etc/x.py", "text": "a"}),
              json.dumps({"path": "ok.txt", "text": "hi"}), json.dumps({"path": "ok.txt", "done": True})]
     out = io.StringIO()
     rc = live.serve([PY, "-c", "pass"], root, inp=io.StringIO("\n".join(lines) + "\n"), out=out,
@@ -189,10 +277,53 @@ def test_serve_rejects_bad_lines_and_outside_paths(tmp_path, monkeypatch):
     evs = _events(out)
     whys = [e.get("why") for e in evs if e["event"] == "error"]
     bad = "path is not a plain relative path inside the project"
-    assert whys == ["not JSON: not json", "each line must be a JSON object", bad, bad]
+    assert whys == ["not JSON: not json", "each line must be a JSON object", bad, bad, bad]
     assert [e for e in evs if e["event"] == "check"][0]["ok"]
     assert evs[-1] == {"event": "done", "checks": 1}
     assert os.listdir(tmp_path / "tmp") == []  # an escape from the shadow would have left tmp/x.py
+
+
+def test_input_that_cannot_be_decoded_ends_serve_instead_of_hanging(tmp_path):
+    raw = io.TextIOWrapper(io.BytesIO(b'{"path": "a.txt", "text": "\xff"}\n'), encoding="utf-8")
+    out = io.StringIO()
+    assert live.serve([PY, "-c", "pass"], tmp_path, inp=raw, out=out, speculate_on=False) == 0
+    evs = _events(out)
+    assert evs[0]["event"] == "error" and evs[0]["why"].startswith("could not read input")
+    assert evs[-1]["event"] == "done"
+
+
+def test_a_project_file_linked_outside_is_never_read_or_written(tmp_path):
+    private = tmp_path / "private"
+    private.mkdir()
+    (private / "conf.py").write_text("TOKEN = 'outside-secret'\n")
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / "link.py").symlink_to(private / "conf.py")
+    check = [PY, "-c", "import sys; print(open(sys.argv[1]).read()); sys.exit(1)", "{path}"]
+    lines = [{"path": "link.py", "text": "def a():\n    pass\n\nx = 1\n"}, {"path": "link.py", "done": True}]
+    out = io.StringIO()
+    rc = live.serve(check, root, inp=io.StringIO("".join(json.dumps(x) + "\n" for x in lines)), out=out,
+                    speculate_on=False)
+    assert rc == 0 and "outside-secret" not in out.getvalue()
+    assert [e["event"] for e in _events(out)] == ["error", "error", "done"]
+    assert (private / "conf.py").read_text() == "TOKEN = 'outside-secret'\n"
+
+
+def test_sigterm_during_cleanup_still_removes_the_shadow(tmp_path, monkeypatch):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
+    (tmp_path / "tmp").mkdir()
+    real = shutil.rmtree
+
+    def interrupted(path, *a, **k):
+        if Path(path).name.startswith("orchard-live-"):
+            os.kill(os.getpid(), signal.SIGTERM)
+        return real(path, *a, **k)
+    monkeypatch.setattr(live.shutil, "rmtree", interrupted)
+    lines = json.dumps({"path": "n.txt", "text": "hi"}) + "\n" + json.dumps({"path": "n.txt", "done": True}) + "\n"
+    with pytest.raises(SystemExit) as stopped:
+        live.serve([PY, "-c", "pass"], tmp_path, inp=io.StringIO(lines), out=io.StringIO(), speculate_on=False)
+    assert stopped.value.code == 128 + signal.SIGTERM
+    assert os.listdir(tmp_path / "tmp") == []
 
 
 def test_paths_that_could_become_options_or_shell_code_are_refused(tmp_path):
@@ -255,8 +386,9 @@ def test_tracked_folder_replaced_by_a_link_is_not_copied_through(tmp_path, monke
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
     (tmp_path / "tmp").mkdir()
     root, elsewhere = tmp_path / "proj", tmp_path / "elsewhere"
-    (root / "pkg").mkdir(parents=True)
+    (root / "pkg" / "sub").mkdir(parents=True)
     (root / "pkg" / "a.py").write_text("x = 1\n")
+    (root / "pkg" / "sub" / "b.py").write_text("z = 3\n")
     _git(root, "init", "-q")
     _git(root, "add", ".")
     shutil.rmtree(root / "pkg")
@@ -267,6 +399,7 @@ def test_tracked_folder_replaced_by_a_link_is_not_copied_through(tmp_path, monke
     try:
         assert (shadow / "pkg").is_symlink()
         assert sorted(os.listdir(elsewhere)) == ["a.py"] and (elsewhere / "a.py").read_text() == "y = 2\n"
+        assert not (elsewhere / "sub").exists()
     finally:
         shutil.rmtree(shadow)
 
@@ -295,7 +428,7 @@ def test_sigterm_kills_the_running_check_and_removes_the_shadow(tmp_path):
 def test_backticked_registered_check_is_speculated_once(tmp_path, monkeypatch):
     check = {"cmd": ["make", "test"], "tags": [], "env": {}, "timeout": None}
     submitted = []
-    monkeypatch.setattr(speculate, "load", lambda root: [check])
+    _gate(monkeypatch, check)
     monkeypatch.setattr(speculate, "submit", lambda root, c: (submitted.append(c), ("job123", None))[1])
     lines = [{"think": "I will run `make"}, {"think": " test` now, then `make test` again and `make lint`"}]
     out = io.StringIO()
@@ -303,6 +436,29 @@ def test_backticked_registered_check_is_speculated_once(tmp_path, monkeypatch):
                     out=out)
     assert rc == 0 and submitted == [check]
     assert {"event": "speculate", "cmd": ["make", "test"], "job": "job123"} in _events(out)
+
+
+def _gate(monkeypatch, check, state="to queue", job=None, in_flight=0):
+    row = {"state": state, **({"job": job} if job else {})}
+    monkeypatch.setattr(speculate, "load", lambda root: [check])
+    monkeypatch.setattr(speculate, "_locked", lambda root: contextlib.nullcontext())
+    monkeypatch.setattr(speculate, "survey", lambda root, checks: ([(row, checks[0])], []))
+    monkeypatch.setattr(speculate, "own_entries", lambda root: [{}] * in_flight)
+
+
+@pytest.mark.parametrize("state,job,in_flight,expect", [
+    ("answered", "old1", 0, {"state": "answered", "job": "old1"}),
+    ("in flight", "run2", 0, {"state": "in flight", "job": "run2"}),
+    ("to queue", None, 3, {"state": "held", "why": "3 speculative jobs already in flight"}),
+])
+def test_speculate_from_live_keeps_the_dedupe_and_the_cap(tmp_path, monkeypatch, state, job, in_flight, expect):
+    check = {"cmd": ["make", "test"], "tags": [], "env": {}, "timeout": None}
+    _gate(monkeypatch, check, state, job, in_flight)
+    monkeypatch.setattr(speculate, "submit", lambda root, c: pytest.fail("submitted"))
+    out = io.StringIO()
+    live.serve([PY, "-c", "pass"], tmp_path, inp=io.StringIO(json.dumps({"think": "run `make test`"}) + "\n"),
+               out=out)
+    assert {"event": "speculate", "cmd": ["make", "test"], **expect} in _events(out)
 
 
 # --- the Claude harness -------------------------------------------------------
@@ -472,8 +628,60 @@ def test_harness_drops_what_came_before_a_fallback(tmp_path):
 
 def test_harness_never_runs_tools_from_a_truncated_or_refused_reply(tmp_path):
     agent = _agent()
-    for reason in ("max_tokens", "refusal"):
+    for reason in ("max_tokens", "refusal", "model_context_window_exceeded"):
         client = _Client(_Stream(_write(0, "t1", "a.txt", "x"),
                                  NS(stop_reason=reason, content=[_tool("t1", "a.txt", "x")])))
         assert agent.run("x", tmp_path, "true", client=client, orchard=QUIET, out=io.StringIO()) == 1
         assert not (tmp_path / "a.txt").exists()
+
+
+def test_harness_written_text_is_the_newest_copy_of_a_file():
+    agent = _agent()
+    blocks = {1: {"path": "a.py", "fields": NS(values={"contents": "old"})},
+              3: {"path": "a.py", "fields": NS(values={"contents": "new"})}}
+    assert agent._written(blocks, "a.py") == "new"
+
+
+def test_harness_restarts_orchard_live_at_a_fallback(tmp_path):
+    agent = _agent()
+    mark = tmp_path / "started"
+    fake = [PY, "-c", "import json, os, sys\n"
+            f"m = {str(mark)!r}\n"
+            "if not os.path.exists(m):\n"
+            "    open(m, 'w').close()\n"
+            "    print(json.dumps({'event': 'check', 'ok': False, 'path': 'a.py', 'final': True}), flush=True)\n"
+            "for _ in sys.stdin: pass"]
+    lv = agent._Live(fake, "true", tmp_path, timeout=7)
+    assert lv.argv[len(fake):len(fake) + 4] == ["live", "--timeout", "7", "--"]
+    deadline = time.monotonic() + 15
+    while lv.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    first = lv.proc
+    assert lv.failure and lv.results
+    agent._on_event(_start(2, "fallback"), {}, lv, tmp_path, io.StringIO())
+    assert lv.proc is not first and lv.failure is None and lv.results == {}
+    assert lv.close() is None
+
+
+def test_harness_gives_up_on_an_orchard_live_that_stops_answering(tmp_path, monkeypatch):
+    agent = _agent()
+    monkeypatch.setattr(agent, "CLOSE_GRACE", 0)
+    lv = agent._Live([PY, "-c", "import time; time.sleep(60)"], "true", tmp_path, timeout=1)
+    t0 = time.monotonic()
+    with pytest.raises(RuntimeError, match="stopped answering"):
+        lv.close()
+    assert time.monotonic() - t0 < 15 and lv.proc.poll() is not None
+
+
+def test_harness_does_not_retry_its_own_encoding_errors(tmp_path):
+    agent = _agent()
+
+    class Broken(_Stream):
+        def __iter__(self):
+            raise UnicodeEncodeError("ascii", "\u2603", 0, 1, "terminal can't show it")
+            yield
+
+    client = _Client(Broken([], None), Broken([], None))
+    with pytest.raises(UnicodeEncodeError):
+        agent.run("x", tmp_path, "true", client=client, orchard=QUIET, out=io.StringIO())
+    assert len(client.requests) == 1
