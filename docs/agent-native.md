@@ -6,7 +6,9 @@ check, reads the failure, edits again, dozens of times an hour, and most of
 those checks are ones it (or the fleet) has already run on an identical tree.
 This document designs seven features that turn the fleet from "somewhere else
 to run a command" into machines that cooperate on one agent's work. They are
-listed in build order: each one leans on the ones before it.
+listed in build order: each one leans on the ones before it. Features 1 to 6
+are built, as are two pieces of 7 that stand on their own (cross-OS proof,
+and shared sight in section 5); the rest of 7 is a proposal.
 
 | # | Feature | Command | Leans on |
 | --- | --- | --- | --- |
@@ -14,9 +16,9 @@ listed in build order: each one leans on the ones before it.
 | 2 | Machine consensus | `orchard consensus` | receipts |
 | 3 | Many worlds | `orchard fork` | receipts, consensus runner |
 | 4 | Speculative runs | `orchard speculate` | receipts (reuse is the payoff) |
-| 5 | Living replicas | `orchard replica` | receipts, speculation |
+| 5 | Living replicas, shared sight | `orchard replica`, `--sight` | receipts, speculation, consensus |
 | 6 | Checking alongside the AI | `orchard live` | replicas, speculation |
-| 7 | One mind | `orchard mind` (proposed) | all of the above |
+| 7 | One mind | `orchard prove`, `-t os:proven` (built); `orchard mind` (proposed) | all of the above |
 
 Everything here is opt-in. A plain `orchard run`, `build`, `offload` or a
 queued job behaves exactly as before; the only change on those paths is that
@@ -377,19 +379,59 @@ finishing a 300-line file built on a broken first function.
 
 **Mechanism.**
 
-- `orchard live` reads a stream of edits as JSON lines on stdin
-  (`{"path": ..., "text": ...}` chunks for a file being written). It keeps a
-  shadow copy of the tree, finds **syntactic boundaries** in the text so far
-  (Python: the prefix parses; brace languages: depth back to zero after a
-  closing brace), writes the complete prefix into the shadow copy and runs
-  the check there. It prints one JSON line per check and exits non-zero at
-  the first failure, which is the signal to interrupt the model.
-- Checks the model *mentions* in its reasoning (a registered check command
-  in backticks) are started speculatively before it asks for them.
-- `contrib/live_check_agent.py` is a reference harness on the Claude API: it
-  streams a `write_file` tool call, feeds the partial input to `orchard
-  live`, and on a failure stops the stream and sends the failure back as the
-  next user turn.
+- `orchard live -- <check>` reads JSON lines on stdin:
+
+  ```
+  {"path": "src/a.py", "reset": true}   start (or restart) writing a file
+  {"path": "src/a.py", "text": "..."}   the next piece of it
+  {"path": "src/a.py", "done": true}    the file is finished
+  {"think": "..."}                      the model's reasoning or prose
+  ```
+
+- It keeps a shadow copy of the project (the files a job would ship, with
+  `.venv`, `venv` and `node_modules` linked in; `--link <dir>` adds more).
+  It finds **syntactic boundaries** in the text so far: in Python, a `def`
+  or `class` (methods too) is closed when the text so far parses and the
+  next code line is indented no deeper than it; in brace languages (C
+  family, Go, Java, JS/TS, Kotlin, Rust, Swift and others), a block returns
+  to depth 0. At each boundary it writes the finished part into the shadow
+  copy and runs the check there. A burst of boundaries is coalesced into
+  one check of the latest, and `done` always gets a final check.
+- The check may use `{path}` and `{unit}` (the file, and the function that
+  just closed). The same values are in `ORCHARD_LIVE_PATH` and
+  `ORCHARD_LIVE_UNIT`, and `ORCHARD_LIVE_FINAL` is 1 for the finished file.
+  `--timeout <s>` kills a check that hangs (its whole process group).
+- While an existing `.py` file is rewritten, the definitions the new text
+  has not reached yet are taken from the old file, so a test suite still
+  imports. Brace languages get no such fill-in, so give them checks scoped
+  to the file (`{path}`) rather than the whole suite.
+- One JSON line per check goes to stdout: `{"event": "check", "path",
+  "line", "unit", "final", "ok", "exit", "seconds"}`, plus `tail` (the last
+  30 lines of output) and `why` on a failure. Bad input gets an `error`
+  event and is skipped. At the end of input it prints `{"event": "done",
+  "checks": n}` and exits 0. The first failure exits 1: the caller's signal
+  to stop the model and hand it the failure. Exit 2 means no check command
+  was given.
+- Checks the model *names* in backticks, in its prose or reasoning, that
+  match a registered `orchard speculate` check are queued once on an idle
+  machine, so their answer may be waiting (`speculate` events;
+  `--no-speculate` turns it off).
+- `contrib/live_check_agent.py` is a reference harness on the Claude API
+  (`pip install anthropic`, `ANTHROPIC_API_KEY`):
+
+  ```sh
+  python contrib/live_check_agent.py --root . --check "python -m pytest -x -q" \
+      "Add a slugify() helper to src/text.py, with tests"
+  ```
+
+  It streams `write_file` tool calls (with eager input streaming, so the
+  file arrives as it is written), feeds the partial contents to `orchard
+  live`, and on a failure closes the stream, discards that reply and sends
+  the failure (file, line, function, output tail) back as the next user
+  turn. A check that fails after the reply is complete goes into the tool
+  result instead. It turns on the server-side refusal fallback; that rescues
+  refusals only, not overloads. Exit 0 when the model finishes, 1 when it
+  stops early.
 
 **Prior art and limits.** Research on execution-guided decoding checks
 partial programs during generation, mostly at the token level inside the

@@ -131,6 +131,27 @@ tells the agent to send them through `orchard offload` instead:
 }
 ```
 
+### Agent-native commands (optional)
+
+These help an agent that edits and checks in a loop. All are opt-in; plain
+`run`, `build` and `offload` behave as before, except that a finished job
+also leaves a receipt.
+
+| Command | What it does |
+| --- | --- |
+| `orchard receipt <job>` | Sealed record of what ran, where, on which exact inputs |
+| `orchard run --reuse -- <cmd>` | Answer from a passing receipt for the same work instead of running again |
+| `orchard consensus -- <cmd>` | Rerun a failure across machines: pass, flaky, real, load-sensitive, platform-only or machine-only |
+| `orchard fork` | Try several patches at once, each in its own copy of the tree; name the first that passes |
+| `orchard prove -- <cmd>` | Run on every reachable machine whatever its OS; afterwards `-t os:proven` may place it on any OS where it passed |
+| `orchard speculate` | Run likely checks before anyone asks for them |
+| `orchard replica` | A warm copy of the project on each machine; `--sight` labels a failure across them |
+| `orchard live -- <check>` | Check a file each time a function in it is finished, while the model is still writing it |
+
+`contrib/live_check_agent.py` is a reference Claude API harness for
+`orchard live`. [docs/agent-native.md](docs/agent-native.md) is the design:
+how each one works, its limits, and how to measure it.
+
 ## Menu-bar apps (optional)
 
 - `./app/menubar/build.sh` builds the controller app: queue and worker status,
