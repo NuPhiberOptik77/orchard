@@ -1,4 +1,4 @@
-"""Agent-native commands: receipt, consensus, fork, speculate, replica, live.
+"""Agent-native commands: receipt, consensus, fork, speculate, replica, mind, live.
 
 They live apart from cli.py so the original commands stay readable; importing
 this module registers them on the same Typer app. See docs/agent-native.md.
@@ -7,16 +7,18 @@ this module registers them on the same Typer app. See docs/agent-native.md.
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 import subprocess
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Optional
 
 import typer
 
-from . import consensus, fleet, live, placement, receipts, replica, speculate, transport, worlds
+from . import consensus, fleet, live, mind, placement, receipts, replica, speculate, transport, worlds
 from .job import slugify
 from .cli import app, find_jobs
 
@@ -613,6 +615,295 @@ def replica_role(
 def replica_down(name: str = typer.Argument(..., help="replica's worker name")) -> None:
     """Remove a replica's copy from its body and forget it here."""
     _replica_call(replica.down, Path.cwd(), name)
+
+
+# ---------------------------------------------------------------- mind: one memory, one plan, every body
+# Opt-in: nothing above reads or writes mind's memory. Output names a body by
+# the first 8 hex of its id; --bodies adds which worker each id is here.
+
+mind_app = typer.Typer(no_args_is_help=True,
+                       help="One mind: one memory, one plan, every body. Opt-in; nothing else changes.")
+app.add_typer(mind_app, name="mind")
+
+
+def _mind_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except mind.MindError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise typer.Exit(2)
+    except (transport.RemoteError, subprocess.TimeoutExpired) as exc:
+        print(f"error: a body went quiet ({exc})", file=sys.stderr)
+        raise typer.Exit(2)
+
+
+def _mind_json(obj, bodies: bool = False) -> None:
+    ids = mind.body_ids(mind.load_records())
+    out = mind.public(obj, ids)
+    if bodies and isinstance(out, dict):
+        out["bodies"] = mind.bodies_view(ids)
+    print(json.dumps(out, indent=2, sort_keys=True))
+
+
+def _ms(ms) -> str:
+    return "-" if ms is None else f"{ms / 1000:.1f}s"
+
+
+def _body(b) -> str:
+    return f"body {b[:8]}" if b else ""
+
+
+def _print_bodies() -> None:
+    for b, target in sorted(mind.bodies_view(mind.body_ids(mind.load_records())).items()):
+        print(f"  body {b} = {target}")
+
+
+_MIND_ENDS = {
+    "failed": "failed. `orchard mind why <step>` says why; `orchard mind retry <step>` reopens it",
+    "stranded": "stranded: no body can run a step. `orchard mind why <step>` says why",
+    "usage": "no body has reported for this goal yet. Check `orchard workers`, then run again",
+    "tree_changed": "the tree changed under this goal. Run again for the new tree",
+    "detached": "detached. Launched steps keep running; the next `orchard mind run` adopts them",
+}
+
+
+def _print_run(out: dict, bodies: bool) -> None:
+    head = "plan only, nothing written" if out["plan_only"] else ("from memory" if out["from_memory"] else "")
+    print(f"mind: goal {out['goal'][:12]}, {len(out['steps'])} step(s){', ' + head if head else ''}")
+    why = {st["step"]: st["why"] for st in out["plan"]["steps"]}
+    for s in out["steps"]:
+        note = "(memory)" if s["from_memory"] else ""
+        print(f"  {s['step'][:12]} {s['state']:8} {_ms(s['elapsed_ms']):>8}  {s['cmd']}  {_body(s['body'])} {note}"
+              .rstrip())
+        if s["state"] in ("pending", "stranded", "failed"):
+            for w in why.get(s["step"], []):
+                print(f"      {w}")
+    if out.get("sync"):
+        for when, t in out["sync"].items():
+            print(f"mind: sync {when}: pulled {t['pulled']}, pushed {t['pushed']}, bad {t['bad']}, "
+                  f"unreachable {t['unreachable']}")
+    if bodies:
+        _print_bodies()
+    state = out["state"]
+    if out["plan_only"]:
+        print(f"mind: plan only: {state}. Nothing was written and no body was reached")
+    elif state == "passed":
+        print(f"mind: all passed. {out['coord_msgs']} coordination messages, {len(out['recover_s'])} recoveries")
+    else:
+        print(f"mind: {_MIND_ENDS.get(state, state)}")
+
+
+@mind_app.command("run")
+def mind_run(
+    cmd: Optional[list[str]] = typer.Argument(None, help="command to run (after --)"),
+    step: list[str] = typer.Option([], "--step", help="another step, one shell-quoted string (repeatable)"),
+    use_speculate: bool = typer.Option(False, "--speculate", help="add this project's speculate checks as steps"),
+    tag: list[str] = typer.Option([], "--tag", "-t", help="required worker capability tag (repeatable)"),
+    env_names: list[str] = typer.Option([], "--env", help="forward this env var to every step (repeatable)"),
+    timeout: int = typer.Option(mind.DEFAULT_TIMEOUT_S, "--timeout", min=1, help="seconds before a step is killed"),
+    quiet_after: int = typer.Option(mind.QUIET_DEFAULT_S, "--quiet-after",
+                                    help=f"seconds a body may stay silent before its step counts as lost "
+                                         f"(at least {mind.QUIET_MIN_S})"),
+    trust: list[str] = typer.Option([], "--trust", help="also accept results under this key id (repeatable; "
+                                                         "see `orchard mind key`)"),
+    reuse: bool = typer.Option(False, "--reuse", help="lift sealed passing receipts for this exact tree and check"),
+    fresh: bool = typer.Option(False, "--fresh", help="run every step again, even ones memory already answers"),
+    plan_only: bool = typer.Option(False, "--plan-only", help="show the plan from memory; write and reach nothing"),
+    sync_too: bool = typer.Option(False, "--sync", help="swap memory with every worker before and after"),
+    bodies: bool = typer.Option(False, "--bodies", help="also show which worker each body id is here"),
+    as_json: bool = typer.Option(False, "--json", help="print the session summary as JSON"),
+) -> None:
+    """Run a goal (one or more steps) across every body until it passes, fails or strands.
+
+    Exits 0 passed, 1 failed, 2 usage, 3 stranded, 4 tree changed, 130 detached."""
+    workers = _mind_call(mind.workers_here)
+
+    def say(msg: str) -> None:
+        line = msg if bodies else mind.hide_names(msg, workers)
+        print(f"mind: {line}", file=sys.stderr if as_json else sys.stdout, flush=True)
+
+    out = _mind_call(mind.run_goal, Path.cwd(), cmd, step, use_speculate=use_speculate, tags=tag,
+                     env_names=env_names, timeout=timeout, quiet_s=quiet_after, trust=trust, reuse=reuse,
+                     fresh=fresh, plan_only=plan_only, sync_too=sync_too, say=say, workers=workers)
+    by_worker = out.pop("sync_workers", None)
+    if as_json:
+        if bodies and by_worker is not None:
+            out["sync_workers"] = by_worker
+        _mind_json(out, bodies)
+    else:
+        _print_run(out, bodies)
+    raise typer.Exit(out["exit"])
+
+
+@mind_app.command("plan")
+def mind_plan(
+    goal: Optional[str] = typer.Argument(None, help="goal id or prefix (default: this project's newest)"),
+    bodies: bool = typer.Option(False, "--bodies", help="also show which worker each body id is here"),
+    as_json: bool = typer.Option(False, "--json", help="print the plan as JSON"),
+) -> None:
+    """Show the plan memory gives a goal right now. Reads only; writes nothing."""
+    gid = _mind_call(mind.resolve_goal, Path.cwd(), goal)
+    records = mind.load_records()
+    p = mind.plan(records, gid)
+    if as_json:
+        _mind_json(p, bodies)
+        return
+    g = mind.goal_of(records, gid)
+    cmds = {s["step_id"]: shlex.join(s["cmd"]) for s in (g["body"]["steps"] if g else [])}
+    print(f"mind: goal {gid[:12]} {p['state']} (plan {p['digest'][:12]})")
+    for st in p["steps"]:
+        print(f"  {st['step'][:12]} {st['state']:8} gen {st['gen']}  {cmds.get(st['step'], '?')}  "
+              f"{_body(st['body'])}".rstrip())
+        for w in st["why"]:
+            print(f"      {w}")
+    for b, queue in sorted(p["queues"].items()):
+        print(f"  next on body {b[:8]}: {', '.join(s[:12] for s in queue)}")
+    if bodies:
+        _print_bodies()
+
+
+@mind_app.command("status")
+def mind_status(as_json: bool = typer.Option(False, "--json", help="print the goals as JSON")) -> None:
+    """This project's goals in memory here, newest first, and whether a session is working on each."""
+    rows = _mind_call(mind.status_rows, Path.cwd())
+    if as_json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+        return
+    if not rows:
+        print("mind: no goal for this project in memory here")
+        return
+    for r in rows:
+        counts = ", ".join(f"{n} {s}" for s, n in r["steps"].items())
+        notes = [n for n, on in (("watched", r["watching"]), ("this tree", r["this_tree"])) if on]
+        print(f"  {r['goal'][:12]} {r['state']:8} {r['total']} step(s): {counts}  {'; '.join(notes)}".rstrip())
+
+
+@mind_app.command("why")
+def mind_why(
+    step: str = typer.Argument(..., help="step id prefix, or the step's command text"),
+    goal: Optional[str] = typer.Option(None, "--goal", help="goal id or prefix (default: this project's newest)"),
+    bodies: bool = typer.Option(False, "--bodies", help="also show which worker each body id is here"),
+    as_json: bool = typer.Option(False, "--json", help="print the explanation as JSON"),
+) -> None:
+    """Why a step is where it is: what each body can run, and every attempt so far."""
+    gid = _mind_call(mind.resolve_goal, Path.cwd(), goal)
+    ex = _mind_call(mind.explain, gid, step)
+    if as_json:
+        _mind_json(ex, bodies)
+        return
+    print(f"mind: step {ex['step'][:12]} {ex['state']} at gen {ex['gen']}: {ex['cmd']}")
+    for w in ex["why"]:
+        print(f"  {w}")
+    for b in ex["bodies"]:
+        fit = "can run it" if b["fits"] else "cannot run it: " + "; ".join(b["problems"])
+        print(f"  body {b['body'][:8]} (bench {b['bench']}) {fit}")
+    for h in ex["history"]:
+        line = f"  gen {h['gen']} {h['kind']}"
+        if h["kind"] == "lost":
+            line += f" on {_body(h['body'])}: {h['why']}" + (" (held)" if h["hold"] else "")
+        elif h["kind"] == "result":
+            line += f" {h['state']} in {_ms(h['elapsed_ms'])} on {_body(h['body'])}"
+        elif h["kind"] == "launch":
+            line += f" on {_body(h['body'])}"
+        print(line)
+    for u in ex["untrusted"]:
+        print(f"  gen {u['gen']} {u['state']} under key {u['key']} ({u['status']}); not trusted by this goal")
+    if bodies:
+        _print_bodies()
+
+
+@mind_app.command("memory")
+def mind_memory(
+    records: bool = typer.Option(False, "--records", help="list every record with its status and sources"),
+    as_json: bool = typer.Option(False, "--json", help="print as JSON"),
+) -> None:
+    """What memory holds here: segments, records by kind, status and key, and how they arrived."""
+    v = _mind_call(mind.memory_view, records)
+    if as_json:
+        print(json.dumps(v, indent=2, sort_keys=True))
+        return
+    kinds = ", ".join(f"{n} {k}" for k, n in v["kinds"].items()) or "none"
+    status = ", ".join(f"{n} {s}" for s, n in v["status"].items()) or "none"
+    arrivals = ", ".join(f"{n} {s}" for s, n in v["arrivals"].items()) or "none"
+    print(f"mind: {v['segments']} segment(s), {v['records']} record(s): {kinds}")
+    print(f"  status: {status}")
+    print(f"  arrived by: {arrivals}")
+    for k in v["by_key"]:
+        print(f"  key {k['key']}: {k['records']} record(s){' (this install)' if k['mine'] else ''}")
+    for e in v.get("entries", []):
+        print(f"  {e['id'][:12]} {e['kind']:7} key {e['key'][:8]} {e['status']:12} {','.join(e['sources'])}")
+
+
+@mind_app.command("sync")
+def mind_sync(
+    worker: Optional[str] = typer.Argument(None, help="only this worker (default: every worker)"),
+    bodies: bool = typer.Option(False, "--bodies", help="also show each worker's own counts"),
+    as_json: bool = typer.Option(False, "--json", help="print the counts as JSON"),
+) -> None:
+    """Swap memory segments with workers. Workers only relay: nothing on them is trusted."""
+    workers = _mind_call(mind.workers_here)
+    if worker is not None:
+        if worker not in workers:
+            print(f"error: no worker named {worker!r}; see `orchard workers`", file=sys.stderr)
+            raise typer.Exit(2)
+        workers = {worker: workers[worker]}
+    res = _mind_call(mind.sync, workers, Counter())
+    totals = mind.sync_totals(res)
+    if as_json:
+        out = {"workers": len(res), "totals": totals}
+        if bodies:
+            out["by_worker"] = res
+        print(json.dumps(out, indent=2, sort_keys=True))
+    else:
+        print(f"mind: synced with {len(res)} worker(s): pulled {totals['pulled']}, pushed {totals['pushed']}, "
+              f"bad {totals['bad']}, unreachable {totals['unreachable']}")
+        if bodies:
+            for name, got in res.items():
+                print(f"  {name}: " + ", ".join(f"{k} {n}" for k, n in got.items()))
+    raise typer.Exit(1 if totals["unreachable"] else 0)
+
+
+@mind_app.command("export")
+def mind_export(
+    file: Path = typer.Argument(..., help="file to write (an existing directory gets one file per segment)"),
+) -> None:
+    """Write every memory segment into one file another install can import."""
+    n = _mind_call(mind.export_memory if file.is_dir() else mind.export_file, file)
+    print(f"mind: exported {n} segment(s) to {file}")
+
+
+@mind_app.command("import")
+def mind_import(
+    file: Path = typer.Argument(..., help="file from `orchard mind export` (or a directory of segments)"),
+    as_json: bool = typer.Option(False, "--json", help="print the counts as JSON"),
+) -> None:
+    """Store the segments of an export here. A segment whose bytes do not match its name is rejected;
+    a record under this install's key that does not verify is kept as forged and never trusted."""
+    res = _mind_call(mind.import_memory if file.is_dir() else mind.import_file, file)
+    rejected = res.get("rejected", res.get("skipped", 0))
+    if as_json:
+        print(json.dumps(res, indent=2, sort_keys=True))
+    else:
+        print(f"mind: imported {res['segments']} segment(s), {res['new']} new; {rejected} rejected; "
+              f"{res['forged']} forged record(s)")
+    raise typer.Exit(1 if rejected else 0)
+
+
+@mind_app.command("retry")
+def mind_retry(
+    step: str = typer.Argument(..., help="step id prefix, or the step's command text"),
+    goal: Optional[str] = typer.Option(None, "--goal", help="goal id or prefix (default: this project's newest)"),
+) -> None:
+    """Reopen a failed or stranded step; the next `orchard mind run` of the same goal runs it again."""
+    gid = _mind_call(mind.resolve_goal, Path.cwd(), goal)
+    res = _mind_call(mind.retry_step, gid, step)
+    print(f"mind: step {res['step'][:12]} reopened at gen {res['gen']} ({res['state']})")
+
+
+@mind_app.command("key")
+def mind_key() -> None:
+    """Print this install's key id, for another install's `mind run --trust`."""
+    print(_mind_call(mind.key_id))
 
 
 @app.command("live")
