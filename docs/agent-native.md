@@ -618,16 +618,28 @@ can do, with no kernel changes and no daemon.
 **Measure.**
 
 - **Coordination messages per task.** Target zero, and zero in every test and
-  in the run above. Every network call goes through one ledger, by purpose
+  on the real fleet. Every network call goes through one ledger, by purpose
   (survey, sense, launch, sync), and `--json` prints it, so a coordination
   message would show up as a number.
+- **First real-fleet run (2026-11-03).** Four CPU steps tagged
+  `-t x86_64 -t os:any`, on two Intel bodies: d94f5fd2 (macOS, Python
+  3.12.15) and 53a3a3b9 (Linux under WSL2, Python 3.12.3). The planner gave
+  two steps to each. All four passed with identical output hashes in 20.5
+  seconds of wall time, with 0 coordination messages and 0 recoveries. The
+  Apple Silicon body, 89851448, was left out as it should be:
+  `missing tags: x86_64`.
+- **Answer from memory.** The same command run again answered in 0.10
+  seconds, with an empty network ledger.
+- **Duplicate launches.** Zero in the test where two sessions meet at the
+  same claim at the same instant. On the real fleet, two sessions started
+  together on a three-step goal: one launched two steps on 53a3a3b9, the
+  other launched the third on d94f5fd2, each step launched exactly once, and
+  both printed the same final table, in 14 seconds.
 - **Time to recover a dead body's step.** In the tests, a quiet body's step
   moves in the same tick its quiet window ends. On real machines that makes
   recovery the quiet window plus up to a second, plus the new launch. It
-  hasn't been timed on the real fleet yet, because the first real run writes
-  a body id file on each worker, and that waits for the owner's go-ahead.
-- **Duplicate launches.** Zero in the test where two sessions meet at the
-  same claim at the same instant.
+  hasn't been timed on the real fleet yet: that means taking a machine off
+  the network in the middle of a step, which needs someone at it.
 
 ---
 
