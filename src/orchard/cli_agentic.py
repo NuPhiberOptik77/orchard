@@ -16,7 +16,7 @@ from typing import Optional
 
 import typer
 
-from . import consensus, fleet, placement, receipts, replica, speculate, transport, worlds
+from . import consensus, fleet, live, placement, receipts, replica, speculate, transport, worlds
 from .job import slugify
 from .cli import app, find_jobs
 
@@ -613,3 +613,23 @@ def replica_role(
 def replica_down(name: str = typer.Argument(..., help="replica's worker name")) -> None:
     """Remove a replica's copy from its body and forget it here."""
     _replica_call(replica.down, Path.cwd(), name)
+
+
+@app.command("live")
+def live_cmd(
+    cmd: Optional[list[str]] = typer.Argument(None, help="check to run (after --); {path} and {unit} are filled in"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", help="seconds before a check is killed"),
+    link: list[str] = typer.Option([], "--link", help="ignored folder to link into the shadow copy (repeatable; .venv, venv and node_modules always are)"),
+    no_speculate: bool = typer.Option(False, "--no-speculate", help="never queue the registered checks the model names"),
+) -> None:
+    """Check a file each time a function in it is finished, while an AI is still writing it.
+
+    Reads JSON lines on stdin ({"path", "text"}, {"path", "reset"}, {"path", "done"}, {"think"}),
+    prints one JSON line per check, and exits 1 at the first failure."""
+    cmd = _need_cmd(cmd)
+    try:
+        code = live.serve(cmd, Path.cwd(), timeout=timeout, links=link, speculate_on=not no_speculate)
+    except ValueError as exc:  # the project is over the shipping size cap
+        typer.echo(f"orchard live: {exc}", err=True)
+        code = 2
+    raise typer.Exit(code)
