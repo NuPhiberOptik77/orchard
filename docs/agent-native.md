@@ -154,18 +154,46 @@ exists.
 - Each project has a list of likely checks: added by hand
   (`orchard speculate add -- npm test`) or learned from receipts
   (`orchard speculate learn` takes the commands most often run in this
-  project).
+  project). Learning counts only verified receipts of plain `run` jobs with
+  the same requirements a speculative run would have, and never counts
+  speculation's own jobs, so it cannot feed on itself. It adds only checks
+  that are new and keeps any timeout already set.
 - `orchard speculate run` computes the tree's work keys and queues, in the
-  background, every check that has no receipt yet. `orchard speculate watch`
-  does that each time the tree settles after a change, and cancels its own
-  speculative jobs that went stale (never anyone else's jobs).
+  background, every check that has neither a receipt nor a job on it. At
+  most 3 speculative jobs per project are in flight at once (`--max`); the
+  rest are held. A submit that fails takes no slot.
+- It cancels only jobs speculation itself queued: their ids are recorded per
+  project when they are queued, and a job is never judged by its name. A
+  stale run (its tree has moved on) and a second job on the same check both
+  go.
+- If the newest receipt for a check on this exact tree failed, the check
+  shows `failed` and is not run again until the tree changes.
+- Speculative jobs run with `--no-local`, so they never run on this Mac:
+  not at placement, not when a held job falls back, and not when a job that
+  lost contact is requeued. They exist to use idle machines, not the one
+  being typed on. `--no-local` is an ordinary `orchard run` option too;
+  it changes where a job may run, not what it computes, so it is not part
+  of the job's receipt key.
+- Runs for one project take a lock, so two `run` or `watch` calls cannot
+  queue the same check twice.
+- `orchard speculate watch` runs once at start and again each time the tree
+  changes and then holds still for a few seconds (`--settle`). It retries
+  held checks, and any error, once per settle period even if nothing
+  changed, and an error never ends the watch. The tree fingerprint covers
+  each file's path, mode, size and modification time.
+- A queued job ships the tree as it is when it starts, so only running jobs
+  can go stale.
 - Speculative jobs carry a `spec-` name prefix so they are easy to tell
   apart, and use the normal queue: a worker runs them only when it is idle.
+- Check lists and the record of queued ids live in the Orchard state dir,
+  one per project, never in the project itself. `orchard speculate list`
+  shows each check's state without queueing anything.
 
 **Modules.** New `speculate.py`.
 
-**Measure.** Hit rate (speculated checks later asked for) and wasted CPU
-(speculated checks never asked for).
+**Measure.** `orchard speculate stats`: hit rate (speculated checks later
+asked for), wait saved (their run time, once per reuse) and wasted CPU
+(speculated checks never asked for). Only recorded speculative jobs count.
 
 ## 5. Living replicas
 
@@ -326,7 +354,7 @@ without drafting machines.
   Mitigation: reuse is opt-in, the work key covers env values, and
   `orchard receipt` shows exactly what was hashed.
 - **Speculation crowding out real work.** Speculative jobs queue like any
-  other. Mitigation: they are cancelled when stale, and `speculate run` caps
-  how many it queues at once.
+  other. Mitigation: they are cancelled when stale, and each project has at
+  most 3 in flight at once.
 - **Replica drift.** A replica edited by hand on the worker. Mitigation:
   `replica up --verify` rebuilds the manifest from disk before diffing.

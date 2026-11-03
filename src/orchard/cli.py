@@ -178,6 +178,7 @@ def run(
     tag: list[str] = typer.Option([], "--tag", "-t", help="required worker capability tag (repeatable)"),
     env_names: list[str] = typer.Option([], "--env", help="forward this env var to the job (repeatable)"),
     reuse: bool = typer.Option(False, "--reuse", help="answer from a verified receipt for this exact work, if any"),
+    no_local: bool = typer.Option(False, "--no-local", help="never run on this Mac, not even as a fallback"),
 ) -> None:
     """Submit a job: `orchard run -- python train.py`."""
     cwd = Path.cwd()
@@ -207,6 +208,8 @@ def run(
     if not job.cmd:
         print("error: provide a command after -- or --file", file=sys.stderr)
         raise typer.Exit(2)
+    if no_local:
+        job.requires = {**(job.requires or {}), "remote_only": True}
 
     if job.kind == "run":
         if job.requirements_file:

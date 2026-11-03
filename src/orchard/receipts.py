@@ -29,8 +29,9 @@ from .config import ORCHARD_HOME, STATE_DIR
 from .job import JobSpec
 
 KEY_PATH = ORCHARD_HOME / "receipt.key"
-# Evidence attached to a job at submit; it changes with history, not with the work.
-EVIDENCE_KEYS = ("proven_os",)
+# Evidence attached to a job at submit, and where it may run: these change with
+# history or placement, not with the work.
+EVIDENCE_KEYS = ("proven_os", "remote_only")
 INDEX_DIR = STATE_DIR / "receipts"
 VERSION = 1
 

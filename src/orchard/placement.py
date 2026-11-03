@@ -81,28 +81,35 @@ def choose(job: JobSpec, candidates: list[Candidate], where: str = "auto", backg
     if not candidates:
         raise ValueError("no candidates to place the job on")
     local = next((c for c in candidates if c.kind == "local"), candidates[0])
+    no_local = bool(job.requires.get("remote_only"))
 
     if where != "auto":
         forced = (local if where in ("local", local.name)
                   else next((c for c in candidates if c.name == where or c.kind == where), None))
         if forced is None:
             raise ValueError(f"unknown worker: {where}")
+        if no_local and forced is local:
+            raise ValueError("this job never runs on this Mac (--no-local)")
         issues = problems(job, forced.caps)
         reasons = [f"forced to {forced.name}"]
         reasons += [f"warning: {p}" for p in issues]
         return Decision(candidate=forced, reasons=reasons)
 
-    usable = [c for c in candidates if not problems(job, c.caps)]
+    usable = [c for c in candidates if not problems(job, c.caps) and not (no_local and c is local)]
     if not background:
         if local in usable:
             return Decision(candidate=local, reasons=["interactive job runs locally"])
         reasons = [f"local ineligible: {p}" for p in problems(job, local.caps)]
+        if no_local:
+            reasons.append("local excluded: --no-local")
         if usable:
             best = max(usable, key=_score)
             reasons.append(f"best eligible worker: {best.name}")
             return Decision(candidate=best, reasons=reasons)
         if job.tags:
             raise ValueError(f"no worker with required tags: {', '.join(job.tags)}")
+        if no_local:
+            raise ValueError("no eligible remote worker, and this job never runs on this Mac (--no-local)")
         return Decision(candidate=local, reasons=reasons + ["no eligible worker; proceeding on local with warnings"])
 
     remotes = [c for c in usable if c.kind != "local"]
@@ -115,6 +122,8 @@ def choose(job: JobSpec, candidates: list[Candidate], where: str = "auto", backg
         return Decision(candidate=best, reasons=reasons)
     if job.tags:
         raise ValueError(f"no worker with required tags: {', '.join(job.tags)}")
+    if no_local:
+        raise ValueError("no eligible remote worker, and this job never runs on this Mac (--no-local)")
     reasons = [f"no eligible worker: {'; '.join(problems(job, local.caps)) or 'worker unavailable'}"]
     reasons.append("background job falls back to local")
     return Decision(candidate=local, reasons=reasons)

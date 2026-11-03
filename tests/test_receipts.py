@@ -167,3 +167,10 @@ def test_receipt_command(tmp_path):
     assert bad.exit_code == 1
     assert "DOES NOT VERIFY" in bad.output
     assert runner.invoke(cli.app, ["receipt", "nope"]).exit_code == 1
+
+
+def test_where_a_job_may_run_is_not_part_of_its_work():
+    plain = JobSpec(name="j", cmd=["pytest"], requires={"mem_gb": 2})
+    remote_only = JobSpec(name="j", cmd=["pytest"], requires={"mem_gb": 2, "remote_only": True})
+    assert receipts.work_fields(remote_only) == receipts.work_fields(plain)
+    assert receipts.work_fields(JobSpec(name="j", cmd=["pytest"]))["requires"] == {}

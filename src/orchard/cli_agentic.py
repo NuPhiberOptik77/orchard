@@ -15,7 +15,7 @@ from typing import Optional
 
 import typer
 
-from . import consensus, fleet, placement, receipts, worlds
+from . import consensus, fleet, placement, receipts, speculate, worlds
 from .job import slugify
 from .cli import app, find_jobs
 
@@ -330,3 +330,149 @@ def prove(
     if not done:
         raise typer.Exit(2)
     raise typer.Exit(1 if failing else 0)
+
+
+speculate_app = typer.Typer(no_args_is_help=True, help="Run likely checks before anyone asks for them.")
+app.add_typer(speculate_app, name="speculate")
+
+
+def _check_line(c: dict) -> str:
+    extra = [f"-t {t}" for t in c["tags"]] + [f"--env {e}" for e in c["env"]]
+    if c.get("timeout"):
+        extra.append(f"--timeout {c['timeout']}")
+    return " ".join(c["cmd"]) + (f"  ({' '.join(extra)})" if extra else "")
+
+
+def _print_report(report: dict) -> None:
+    if report.get("error"):
+        print(f"  error      {report['error']} (will retry)")
+    for row in report["checks"]:
+        detail = row.get("job") or row.get("why") or ""
+        print(f"  {row['state']:10} {' '.join(row['cmd'])}  {detail}".rstrip())
+    for job in report["cancelled"]:
+        print(f"  cancelled  {job} (stale)")
+
+
+@speculate_app.command("add")
+def speculate_add(
+    cmd: Optional[list[str]] = typer.Argument(None, help="check to speculate (after --)"),
+    tag: list[str] = typer.Option([], "--tag", "-t", help="required worker capability tag (repeatable)"),
+    env_names: list[str] = typer.Option([], "--env", help="forward this env var to the job (repeatable)"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", help="seconds before the run is killed"),
+) -> None:
+    """Add a check this project is likely to be asked for."""
+    if not cmd:
+        print("error: provide a command after --", file=sys.stderr)
+        raise typer.Exit(2)
+    check = speculate.make_check(cmd, tag, env_names, timeout)
+    print(f"speculate: {speculate.add(Path.cwd(), check)} {_check_line(check)}")
+
+
+@speculate_app.command("remove")
+def speculate_remove(cmd: Optional[list[str]] = typer.Argument(None, help="command to stop speculating")) -> None:
+    """Stop speculating a command (every tag and env variant of it)."""
+    if not cmd:
+        print("error: provide a command after --", file=sys.stderr)
+        raise typer.Exit(2)
+    n = speculate.remove(Path.cwd(), cmd)
+    print(f"speculate: removed {n} check{'s' if n != 1 else ''}")
+    raise typer.Exit(0 if n else 1)
+
+
+@speculate_app.command("list")
+def speculate_list(json_out: bool = typer.Option(False, "--json", help="machine-readable output")) -> None:
+    """Show this project's checks and whether the tree as it is now is answered."""
+    cwd = Path.cwd()
+    checks = speculate.load(cwd)
+    rows, stale = speculate.survey(cwd, checks) if checks else ([], [])
+    if json_out:
+        print(json.dumps({"checks": [{**c, **r} for r, c in rows], "stale": [e["id"] for e in stale]}, indent=2))
+        return
+    if not checks:
+        print("no checks yet: orchard speculate add -- <cmd>, or orchard speculate learn")
+        return
+    for row, c in rows:
+        print(f"  {row['state']:10} {_check_line(c)}  {row.get('job') or ''}".rstrip())
+    if stale:
+        print(f"  {len(stale)} stale speculative job(s); orchard speculate run cancels them")
+
+
+@speculate_app.command("learn")
+def speculate_learn(
+    top: int = typer.Option(3, "--top", help="how many of the most-run checks to take"),
+    json_out: bool = typer.Option(False, "--json", help="machine-readable output"),
+) -> None:
+    """Add the checks most often run in this project, read from receipts."""
+    cwd = Path.cwd()
+    found = speculate.learn(cwd, top)
+    have = speculate.load(cwd)
+    for check in found:
+        check = {k: v for k, v in check.items() if k != "runs"}
+        if not any(speculate._same(old, check) for old in have):  # keep a timeout already set
+            speculate.add(cwd, check)
+    if json_out:
+        print(json.dumps(found, indent=2))
+        return
+    if not found:
+        print("speculate: no receipts for this project yet; run some checks first")
+        return
+    for check in found:
+        print(f"  learned  {_check_line(check)}  ({check['runs']} runs)")
+
+
+@speculate_app.command("run")
+def speculate_run(
+    limit: int = typer.Option(speculate.MAX_IN_FLIGHT, "--max", help="most speculative jobs in flight for this project"),
+    json_out: bool = typer.Option(False, "--json", help="machine-readable output"),
+) -> None:
+    """Queue every check the tree as it is now has no receipt for, and cancel
+    this project's speculative jobs that went stale. Never touches other jobs."""
+    cwd = Path.cwd()
+    if not speculate.load(cwd):
+        print("error: no checks yet: orchard speculate add -- <cmd>, or orchard speculate learn", file=sys.stderr)
+        raise typer.Exit(2)
+    report = speculate.run(cwd, limit=limit)
+    if json_out:
+        print(json.dumps(report, indent=2))
+    else:
+        _print_report(report)
+    raise typer.Exit(1 if any(r["state"] == "not queued" for r in report["checks"]) else 0)
+
+
+@speculate_app.command("watch")
+def speculate_watch(
+    settle: float = typer.Option(5.0, "--settle", min=0, help="seconds the tree must hold still before a run"),
+    interval: float = typer.Option(1.0, "--interval", min=0.1, help="seconds between looks at the tree"),
+    limit: int = typer.Option(speculate.MAX_IN_FLIGHT, "--max", help="most speculative jobs in flight for this project"),
+) -> None:
+    """Speculate now, then each time the tree settles after a change. Ctrl-C stops."""
+    cwd = Path.cwd()
+    if not speculate.load(cwd):
+        print("error: no checks yet: orchard speculate add -- <cmd>, or orchard speculate learn", file=sys.stderr)
+        raise typer.Exit(2)
+
+    def say(report: dict) -> None:
+        print(time.strftime("%H:%M:%S"), "speculate:")
+        _print_report(report)
+        sys.stdout.flush()
+
+    try:
+        speculate.watch(cwd, settle, interval, limit, say=say)
+    except KeyboardInterrupt:
+        print("speculate: stopped")
+
+
+@speculate_app.command("stats")
+def speculate_stats(json_out: bool = typer.Option(False, "--json", help="machine-readable output")) -> None:
+    """How often speculation paid off in this project, and what it cost."""
+    s = speculate.stats(Path.cwd())
+    if json_out:
+        print(json.dumps(s, indent=2))
+        return
+    if not s["speculated"]:
+        print("speculate: no speculative runs have finished in this project yet")
+        return
+    print(f"speculate: {s['asked_for']} of {s['speculated']} speculative runs were asked for "
+          f"(hit rate {s['hit_rate']:.0%})")
+    print(f"  agent wait saved: {s['saved_s']}s; CPU spent on runs nobody asked for (yet): {s['wasted_s']}s")
+

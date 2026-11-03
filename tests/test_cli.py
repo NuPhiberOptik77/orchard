@@ -382,3 +382,12 @@ def test_doctor_flags_a_job_held_long_behind_a_preempted_run(tmp_path, monkeypat
     monkeypatch.setattr(cli.store, "BLOB_DIR", tmp_path / "blobs")
     result = CliRunner().invoke(cli.app, ["doctor"])
     assert "warn  demo-p held " in result.output, result.output
+
+
+def test_run_no_local_marks_the_job_remote_only(monkeypatch, tmp_path):
+    seen = []
+    monkeypatch.setattr(cli, "submit", lambda job, **kw: seen.append(job))
+    monkeypatch.chdir(tmp_path)
+    assert CliRunner().invoke(cli.app, ["run", "--no-local", "--", "true"]).exit_code == 0
+    assert CliRunner().invoke(cli.app, ["run", "--", "true"]).exit_code == 0
+    assert seen[0].requires == {"remote_only": True} and seen[1].requires == {}

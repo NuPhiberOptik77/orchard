@@ -178,3 +178,21 @@ def test_linux_job_picks_linux_worker_or_raises():
     assert decision.candidate.name == "laptop"
     with pytest.raises(ValueError, match="required tags"):
         choose(tagged_job("os:linux"), [local, pro], background=True)
+
+
+def test_no_local_job_never_places_on_this_mac():
+    remote_only = job(remote_only=True)
+    pro = Candidate("pro", "remote", caps(), 0.2)
+    candidates = [Candidate("local", "local", caps()), pro]
+    interactive = choose(remote_only, candidates)
+    assert interactive.candidate is pro and "local excluded: --no-local" in interactive.reasons
+    assert choose(remote_only, candidates, background=True).candidate is pro
+    assert choose(remote_only, candidates, where="pro").candidate is pro
+    with pytest.raises(ValueError, match="never runs on this Mac"):
+        choose(remote_only, candidates, where="local")
+    unfit = [Candidate("local", "local", caps()), Candidate("pro", "remote", caps(platform_ok=False, note="x"), 0.2)]
+    for background in (False, True):
+        with pytest.raises(ValueError, match="--no-local"):
+            choose(remote_only, unfit, background=background)
+    # Without the flag the same job still falls back here.
+    assert choose(job(), unfit, background=True).candidate.kind == "local"

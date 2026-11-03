@@ -448,6 +448,8 @@ def idle_hold(caps: dict, cfg: dict) -> str | None:
 
 
 def _local_fallback(job: JobSpec) -> tuple[bool, str]:
+    if (job.requires or {}).get("remote_only"):
+        return False, "never runs on this Mac (--no-local)"
     caps = agent.collect_caps(env.ensure_bench_python())
     caps["platform_ok"] = True
     probs = placement.problems(job, caps)

@@ -104,8 +104,13 @@ def result_of(sdir: Path, target: str | None = None) -> dict:
 
 
 def child_argv(target: str, name: str, cmd: list[str], tags: list[str] | None = None,
-               env_names: list[str] | None = None, timeout: int | None = None) -> list[str]:
+               env_names: list[str] | None = None, timeout: int | None = None,
+               background: bool = False, no_local: bool = False) -> list[str]:
     argv = [sys.executable, "-m", "orchard", "run", "-w", target, "--name", name]
+    if background:
+        argv.append("-b")
+    if no_local:
+        argv.append("--no-local")
     if timeout:
         argv += ["--timeout", str(timeout)]
     for tag in tags or []:
@@ -115,18 +120,23 @@ def child_argv(target: str, name: str, cmd: list[str], tags: list[str] | None = 
     return argv + ["--", *cmd]
 
 
+def child_env() -> dict[str, str]:
+    """This environment, with PYTHONPATH set so a child imports this same
+    Orchard however this one was started."""
+    out = dict(os.environ)
+    src = str(Path(__file__).resolve().parent.parent)
+    out["PYTHONPATH"] = os.pathsep.join(p for p in (src, out.get("PYTHONPATH")) if p)
+    return out
+
+
 def run_on(target: str, cmd: list[str], cwd: Path, name: str, tags: list[str] | None = None,
            env_names: list[str] | None = None, timeout: int | None = None) -> dict:
     """Run cmd on target (a worker name, "local" or "auto") and wait for it."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     child_log = LOG_DIR / f"{slugify(name)}.log"
-    child_env = dict(os.environ)
-    # The child must import this same Orchard, however this one was started.
-    src = str(Path(__file__).resolve().parent.parent)
-    child_env["PYTHONPATH"] = os.pathsep.join(p for p in (src, child_env.get("PYTHONPATH")) if p)
     with open(child_log, "wb") as out:
         proc = subprocess.run(child_argv(target, name, cmd, tags, env_names, timeout),
-                              cwd=cwd, stdout=out, stderr=subprocess.STDOUT, env=child_env)
+                              cwd=cwd, stdout=out, stderr=subprocess.STDOUT, env=child_env())
     sdir = find_job(name)
     if sdir is None:
         lines = child_log.read_text(errors="replace").strip().splitlines()

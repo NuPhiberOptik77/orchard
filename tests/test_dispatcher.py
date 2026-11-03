@@ -1544,3 +1544,11 @@ def test_orphan_whose_group_is_gone_is_settled_even_if_its_folder_cannot_be_writ
     entry = dispatcher.load_entries()[0]
     assert entry["orphan"] is None and "no-op" in entry["note"]
     assert other == [] and not missing.exists()
+
+
+def test_local_fallback_refuses_a_no_local_job(monkeypatch):
+    from orchard.job import JobSpec
+
+    monkeypatch.setattr(dispatcher.agent, "collect_caps", lambda *a: pytest.fail("must not probe this Mac"))
+    ok, why = dispatcher._local_fallback(JobSpec(name="j", cmd=["true"], requires={"remote_only": True}))
+    assert not ok and "--no-local" in why
