@@ -4,18 +4,19 @@ Orchard started as spillover: a job the Air doesn't need to run goes to a free
 machine. AI coding agents change what "a job" is. An agent edits, runs a
 check, reads the failure, edits again, dozens of times an hour, and most of
 those checks are ones it (or the fleet) has already run on an identical tree.
-This document designs six features that turn the fleet from "somewhere else
+This document designs seven features that turn the fleet from "somewhere else
 to run a command" into machines that cooperate on one agent's work. They are
 listed in build order: each one leans on the ones before it.
 
 | # | Feature | Command | Leans on |
 | --- | --- | --- | --- |
 | 1 | Receipts | `orchard receipt`, `run --reuse` | — |
-| 2 | Machine consensus | `orchard consensus`, `run --consensus` | receipts |
+| 2 | Machine consensus | `orchard consensus` | receipts |
 | 3 | Many worlds | `orchard fork` | receipts, consensus runner |
 | 4 | Speculative runs | `orchard speculate` | receipts (reuse is the payoff) |
 | 5 | Living replicas | `orchard replica` | receipts, speculation |
 | 6 | Checking alongside the AI | `orchard live` | replicas, speculation |
+| 7 | One mind | `orchard mind` (proposed) | all of the above |
 
 Everything here is opt-in. A plain `orchard run`, `build`, `offload` or a
 queued job behaves exactly as before; the only change on those paths is that
@@ -66,6 +67,12 @@ the job's required tags. Reuse assumes the command is a function of its
 inputs. Commands that read the network, the clock or files outside the tree
 can still differ, which is why reuse is a flag, not a default.
 
+**Known gaps.** Inputs are hashed when the job launches, not when it is
+submitted, so a queued job hashes the tree as it is at launch. A local job
+runs in the project folder and writes `out/` there, which changes the tree
+digest unless `out/` is in `.gitignore`. A queued job that the dispatcher
+collects as an orphan (after a restart) is not sealed.
+
 **Modules.** New `receipts.py`; hooks in `engine.launch_remote`,
 `engine.prepare_local_job`, `cli.run_local`, `cli.run_remote` and
 `dispatcher.finish`. The agent adds `machine` and `os_family` to its status
@@ -86,12 +93,20 @@ on the same machine and on every other capable one, and prints one label:
 - `flaky`: the same machine passed on a rerun.
 - `platform-only`: it fails only on one architecture or OS.
 - `load-sensitive`: it failed on a busy machine and passed on idle ones.
+- `machine-only`: it fails on one machine and passes on another of the same
+  platform that was not busier (a broken cache or a local config file).
+
+`orchard consensus --job <id>` uses a job that already failed as the first
+run. The exit code is 0 for `pass`, 1 for `real` and 2 for anything that is
+not plainly the code, so an agent can branch on it. "Busy" means a load
+average per core of 0.75 or more when the run started.
 
 **Fleet memory.** Each verdict is stored with a **failure signature** (the
 last error-looking line of the log, with numbers, paths and hex ids
 normalised). When the same signature comes back, the verdict says how it was
 labelled before ("seen 3 times, flaky each time"), so agents stop chasing a
-known flake, and repeat offenders become a list worth fixing.
+known flake, and repeat offenders become a list worth fixing
+(`orchard consensus --offenders`).
 
 **Modules.** New `consensus.py` (the classifier and memory are pure
 functions) and `fleet.py` (runs a command on a chosen machine as a child
@@ -214,6 +229,53 @@ each completed edit.
 
 **Measure.** Rounds, tokens and minutes to a green fix with and without
 interruption, on the same task set.
+
+
+## 7. One mind (proposed, built after 1 to 6)
+
+**Journey.** Three machines stop behaving like three workers that message
+each other and start behaving like one mind with three bodies. Nobody asks
+"who takes this?", nobody waits for an answer, and when one machine goes
+quiet the other two already know exactly what it was doing.
+
+**Why not a team that talks.** Messages are slow, can be lost, and every
+"I'll take this" / "no, I've got it" exchange is a chance to disagree. No
+machine can learn a new fact before the bits reach it, so the aim is not to
+beat that limit. It is to make sure that the only thing that ever travels is
+a new fact, never coordination.
+
+**Mechanism.**
+
+- **One memory.** Receipts, consensus verdicts and file digests are
+  replicated to every machine (they are small, signed and append-only, so
+  merging is a union). Any machine answers "has this been done, and did it
+  pass?" from its own disk.
+- **One will.** The plan is a pure function of (shared memory, goal). Every
+  machine runs the same planner on the same memory and gets the identical
+  assignment, so each knows its own part and everyone else's without being
+  told. This is deterministic lockstep, as in strategy games and
+  deterministic databases: only inputs travel, and every copy computes the
+  same state. Two machines can never claim the same work, because there is
+  no claiming.
+- **One body sense.** Each machine sends a heartbeat of a few bytes (load,
+  heat, which step of the plan it is on) a few times a second. The planner
+  folds heartbeats into memory, so a machine that stops beating has its step
+  reassigned by every copy at once, identically.
+- **One train of thought** for local models. The Air holds the large model.
+  The other machines run small drafts of the same model family that predict
+  its next tokens and prepare the checks it will want (features 4 and 6).
+  The large model accepts whole runs of predicted tokens in one pass, and
+  only token ids cross the network.
+
+**Prior art.** Splitting one model's layers across machines exists (exo,
+llama.cpp RPC) and is slow over Wi-Fi with an 8 GB Intel machine in the
+mix. Speculative decoding exists inside one machine. Lockstep planning
+exists in games and databases. Combining them, so a home fleet shares one
+memory, one plan and one train of thought, is the new part.
+
+**Measure.** Coordination messages per task (target: zero), time to recover
+a dead machine's step, and tokens per second for the local model with and
+without drafting machines.
 
 ---
 
