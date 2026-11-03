@@ -35,7 +35,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import dispatcher, engine, env, events, fleet, placement, receipts, speculate, transport
+from . import consensus, dispatcher, engine, env, events, fleet, placement, receipts, speculate, transport
 from .config import JOBS_DIR, STATE_DIR, Worker, load_workers
 from .job import JobSpec, agent_job_payload, capture_env, new_job_id, slugify
 
@@ -688,11 +688,14 @@ def _write_result(result_file: Path | None, result: dict) -> None:
 def run(cmd: list[str], cwd: Path, worker_name: str | None = None, tags: list[str] | None = None,
         env_names: list[str] | None = None, timeout: int | None = None, reuse: bool = False,
         as_is: bool = False, bless: bool = False, no_local: bool = False,
-        target_file: Path | None = None, result_file: Path | None = None, pooled: bool = False) -> int:
+        target_file: Path | None = None, result_file: Path | None = None, pooled: bool = False,
+        sight: bool = False) -> int:
     key = project_key(cwd)
     reg = load_registry(key)
     if not reg["replicas"]:
         raise ReplicaError("no replicas yet: orchard replica up -w <worker>")
+    if sight and (as_is or target_file is not None):
+        raise ReplicaError("--sight looks at your tree on other bodies, so it cannot use --as-is")
     if as_is and not worker_name:
         raise ReplicaError("--as-is needs -w: it runs on one body's copy as that body holds it")
     if worker_name and worker_name == dusk_of(reg) and not as_is:
@@ -733,7 +736,12 @@ def run(cmd: list[str], cwd: Path, worker_name: str | None = None, tags: list[st
             except (transport.RemoteError, subprocess.TimeoutExpired) as exc:
                 print(f"succession: {w.name} went quiet ({exc})")
                 continue
-            return _finish(w, key, cwd, job, reg, launched, bless and not as_is and target_file is None, result_file)
+            rc, result = _finish(w, key, cwd, job, reg, launched, bless and not as_is and target_file is None,
+                                 result_file)
+            if sight and result and result.get("state") == "failed":
+                return _sight_run(cwd, key, reg, cmd, result, tags, env_names, timeout, no_local,
+                                  bool(worker_name) and not pooled, result_file)
+            return rc
 
     if target_file is not None or no_local or as_is:
         raise ReplicaError("no replica is free to take it")
@@ -741,30 +749,35 @@ def run(cmd: list[str], cwd: Path, worker_name: str | None = None, tags: list[st
     result = fleet.run_on("local", cmd, cwd, fleet.job_name("replica", fleet.new_token(), "local"),
                           tags, env_names, timeout)
     print(f"result: {result['state']} on this Mac ({result.get('job') or result.get('why')})")
-    _write_result(result_file, {**result, "replica": None, "role": None, "drifted": [], "tree": tree})
+    first = {**result, "replica": None, "role": None, "drifted": [], "tree": tree}
+    _write_result(result_file, first)
     ok = result["state"] == "succeeded"
     if bless and ok:
         advance_dusk(cwd, key, tree, f"{result.get('job')} on this Mac", job.env)
+    if sight and result["state"] == "failed":
+        return _sight_run(cwd, key, reg, cmd, first, tags, env_names, timeout, no_local, False, result_file)
     return 0 if ok else 1
 
 
 def _finish(w: Worker, key: str, cwd: Path, job: JobSpec, reg: dict, launched: tuple, bless: bool,
-            result_file: Path | None) -> int:
+            result_file: Path | None) -> tuple[int, dict | None]:
+    """Watch the launched job to its end: (exit code, the result written)."""
     job_id, rjob, sdir, tree, sent = launched
     print(f"job: {job_id} on {w.name} (replica)")
     try:
         status = engine.watch_remote(w, rjob, lost_after=LOST_AFTER_S)
     except KeyboardInterrupt:
         print(f"detached: {job_id} keeps running on {w.name}")
-        return 130
+        return 130, None
     if status is None:
         # Succession: a pool hands the work to another body; a lone run reports it.
         why = f"{w.name} went quiet mid-run; {job_id} may still finish there"
         print(f"succession: {why}")
         events.append("finished", job=job_id, worker=w.name, state="unavailable", exit_code=None)
-        _write_result(result_file, {"state": "unavailable", "why": why, "job": job_id, "target": w.name,
-                                    "replica": w.name, "tree": tree})
-        return 1
+        result = {"state": "unavailable", "why": why, "job": job_id, "target": w.name, "replica": w.name,
+                  "tree": tree}
+        _write_result(result_file, result)
+        return 1, result
     status = engine.collect_remote(w, job_id, rjob, sdir, cwd) or status
     drifted = _hygiene(w, key, tree, sent, sdir, job_id)
     _release(w, key, job_id)
@@ -773,12 +786,12 @@ def _finish(w: Worker, key: str, cwd: Path, job: JobSpec, reg: dict, launched: t
     print(f"result: {status.get('state')} in {status.get('elapsed_s')}s (exit {status.get('exit_code')})")
     events.append("finished", job=job_id, worker=w.name, state=status.get("state"), exit_code=status.get("exit_code"))
     role = reg["replicas"].get(w.name, {}).get("role", "day")
-    _write_result(result_file, {**fleet.result_of(sdir, w.name), "replica": w.name, "role": role,
-                                "drifted": drifted, "tree": tree})
+    result = {**fleet.result_of(sdir, w.name), "replica": w.name, "role": role, "drifted": drifted, "tree": tree}
+    _write_result(result_file, result)
     ok = status.get("state") == "succeeded"
     if bless and ok:
         advance_dusk(cwd, key, tree, f"{job_id} on {w.name}", job.env)
-    return 0 if ok else 1
+    return (0 if ok else 1), result
 
 
 # --- Dusk ----------------------------------------------------------------------------------
@@ -913,10 +926,19 @@ def _usable_days(key: str, reg: dict) -> tuple[list[str], dict]:
     return usable, probes
 
 
+def _tree_of(result: dict) -> str | None:
+    """The tree a result ran on; a run on this Mac records it in its job inputs."""
+    tree = result.get("tree")
+    if tree is None and result.get("job"):
+        tree = _load_json(JOBS_DIR / result["job"] / "inputs.json", {}).get("tree")
+    return tree
+
+
 def check(cwd: Path, split: str | None = None, shards: int = 0, no_local: bool = False,
-          env_names: list[str] | None = None) -> int:
+          env_names: list[str] | None = None, sight: bool = False) -> int:
     """Every check at once, spread across the day bodies (each check borrows a
-    body that can run it). When all pass on one tree, the dusk moves to it."""
+    body that can run it). When all pass on one tree, the dusk moves to it.
+    With sight, each failure is looked at again (shared_sight), one at a time."""
     key = project_key(cwd)
     reg = load_registry(key)
     if split:
@@ -938,7 +960,7 @@ def check(cwd: Path, split: str | None = None, shards: int = 0, no_local: bool =
         can = {d for d in days if not placement.problems(job, _caps_for(probes[d], reg["replicas"][d], job))}
         if c["tags"] and can and len(can) < len(days):
             print(f"borrow: {' '.join(c['cmd'])} needs {', '.join(c['tags'])}: only {', '.join(sorted(can))} can run it")
-        tasks.append({"id": i, "check": c, "bodies": can})
+        tasks.append({"id": i, "check": c, "bodies": can, "can": set(can)})  # the pool empties bodies
     token = fleet.new_token()
     scratch = local_dir(key) / "check" / token
     scratch.mkdir(parents=True, exist_ok=True)
@@ -965,25 +987,173 @@ def check(cwd: Path, split: str | None = None, shards: int = 0, no_local: bool =
         print(f"check: {result['state']:10} {' '.join(c['cmd'])} on this Mac ({result.get('job') or result.get('why')})")
         results[task["id"]] = result
 
+    if sight:
+        for task in tasks:
+            r, c = results[task["id"]], task["check"]
+            if r.get("state") == "failed":
+                first = {**r, "tree": _tree_of(r)}
+                r["sight"] = shared_sight(cwd, key, reg, c["cmd"], first, c["tags"], c["env"], c.get("timeout"),
+                                          no_local, named=False, can=task["can"])
     print("checks:")
     for task in tasks:
         r = results[task["id"]]
         where = r.get("replica") or r.get("target") or "-"
-        print(f"  {r['state']:10} {' '.join(task['check']['cmd'])}  ({where})")
-    green = all(results[t["id"]]["state"] == "succeeded" for t in tasks)
-    if green:
-        trees = []
-        for t in tasks:
-            r = results[t["id"]]
-            tree = r.get("tree")
-            if tree is None and r.get("job"):
-                tree = _load_json(JOBS_DIR / r["job"] / "inputs.json", {}).get("tree")
-            trees.append(tree)
-        if all(t == start for t in trees):
+        seen = f"  sight: {r['sight']['word']}" if r.get("sight") else ""
+        print(f"  {r['state']:10} {' '.join(task['check']['cmd'])}  ({where}){seen}")
+    bad = [results[t["id"]] for t in tasks if results[t["id"]]["state"] != "succeeded"]
+    if not bad:
+        if all(_tree_of(results[t["id"]]) == start for t in tasks):
             advance_dusk(cwd, key, start, f"{len(tasks)} check(s) green", env_names)
         else:
             print("dusk: not advanced (the checks did not all run on the same tree)")
-    return 0 if green else 1
+        return 0
+    if sight and all((r.get("sight") or {}).get("word") in ("body", "chance") for r in bad):
+        return 2
+    return 1
+
+
+# --- shared sight -------------------------------------------------------------------------------
+
+SIGHT_EXIT = {"code": 1, "body": 2, "chance": 2, "unsure": 1}
+_RUN_FIELDS = ("target", "job", "state", "machine", "os_family", "load_per_core")
+
+
+def sight_verdict(first: dict, same: dict | None, other: dict | None) -> dict:
+    """What a failure on body a was, from a rerun on a (same) and a run on a
+    second body (other), both on the same tree: code (fix it), body (a is the
+    problem), chance (flaky) or unsure."""
+    a = first.get("target") or "?"
+    b = (other or {}).get("target") or "?"
+    same_ok = bool(same) and consensus.usable(same)
+    if same_ok and consensus.passed(same):
+        return {"word": "chance", "label": "flaky", "why": f"failed then passed on {a}: flaky"}
+    if not (other and consensus.usable(other)):
+        if other is None:
+            why = f"failed twice on {a}; no second body could look" if same_ok else "no second body could look"
+        else:
+            why = f"failed twice on {a}; the look on {b} did not finish" if same_ok else "neither look finished"
+        return {"word": "unsure", "label": None, "why": why}
+    if not consensus.passed(other):
+        why = (f"fails twice on {a} and on {b}: fix the code" if same_ok
+               else f"fails on {a} and on {b}: fix the code (the rerun on {a} did not finish)")
+        return {"word": "code", "label": "real", "why": why}
+    if not same_ok:
+        return {"word": "unsure", "label": None,
+                "why": f"passed on {b}, but the rerun on {a} did not finish: chance is not ruled out"}
+    label, reason = consensus.classify(first, [same, other])
+    return {"word": "body", "label": label, "why": f"{reason}: {a} is the problem, not your change"}
+
+
+def _second_bodies(key: str, reg: dict, a: str, job: JobSpec, no_local: bool, can: set[str] | None) -> list[str]:
+    """Who can take the second look, best first: free day bodies that can run
+    the job (in check, only those the check could borrow), then this Mac."""
+    days, probes = _usable_days(key, reg)
+    out = []
+    for d in days:
+        st = probes[d]
+        if d == a or (can is not None and d not in can):
+            continue
+        if st.get("busy") or (st.get("caps") or {}).get("busy_jobs"):
+            print(f"sight: {d} is busy")
+        elif not placement.problems(job, _caps_for(st, reg["replicas"][d], job)):
+            out.append(d)
+    if not no_local and a != "local":
+        out.append("local")
+    return out
+
+
+def shared_sight(cwd: Path, key: str, reg: dict, cmd: list[str], first: dict, tags: list[str] | None = None,
+                 env_names: list[str] | None = None, timeout: int | None = None, no_local: bool = False,
+                 named: bool = False, can: set[str] | None = None) -> dict:
+    """A failure on one body, looked at again by two: the same body (does it
+    pass now? chance) and a second body (does it pass there? the body). Looks
+    on two replicas run at once; a look on this Mac runs last, because a run
+    here works in place and its writes would change the tree a remote look
+    ships. A body that cannot start its look passes it to the next. A look
+    that ran on another tree does not count. Remembers the verdict with the
+    failure's signature, as consensus does."""
+    a = first.get("target") or "local"
+    sig = consensus.signature(first.get("log_tail") or "")
+    if consensus.known_noise(sig):
+        print("sight: this failure was called noise before; looking anyway")
+    tags, env_names = list(tags or []), list(env_names or [])
+    job = fleet.job_like_run(cmd, cwd, tags, env_names, timeout)
+    job.kind = "replica"
+    seconds = _second_bodies(key, reg, a, job, no_local, can)
+    b = seconds[0] if seconds else None
+    if b is None:
+        plan = f"on {a} (no second body)"
+    elif "local" in (a, b):
+        plan = f"on {b}, then on {a}" if a == "local" else f"on {a}, then on {b}"
+    else:
+        plan = f"on {a} and on {b} at once"
+    print(f"sight: failed on {a}; looking again {plan}")
+    token = fleet.new_token()
+    scratch = local_dir(key) / "sight" / token
+    scratch.mkdir(parents=True, exist_ok=True)
+
+    def look(body: str, i: int, extra: list[str]) -> dict:
+        try:
+            if body == "local":
+                result = fleet.run_on("local", cmd, cwd, fleet.job_name("sight", token, "local", i),
+                                      tags, env_names, timeout)
+                result["tree"] = _tree_of(result)  # recorded at launch, before the run wrote anything
+            else:
+                rf = scratch / f"{i}-{slugify(body)}.json"
+                result = _run_child(cwd, f"replica-sight-{token}-{i}-{body}",
+                                    _child_argv(body, cmd, tags, env_names, timeout, rf, extra), rf)
+        except Exception as exc:  # one look crashing must not lose the other
+            return {"target": body, "state": "unavailable", "why": f"{type(exc).__name__}: {exc}"}
+        result.setdefault("target", body)
+        if consensus.usable(result) and result.get("tree") != first.get("tree"):
+            result = {**result, "state": "unavailable", "why": "the tree changed since the first run"}
+        return result
+
+    def second(bodies: list[str], r: dict | None = None) -> dict | None:
+        for body in bodies:
+            if r is not None:
+                if r["state"] != "unavailable" or r.get("job"):
+                    break
+                print(f"sight: {r['target']} could not look ({r.get('why')}); trying {body}")
+            r = look(body, seconds.index(body) + 1, ["--no-local", "--pooled"])
+        return r
+
+    # A body you named looks again through its idle hold, as the first run did.
+    same_extra = ["--no-local"] + ([] if named else ["--pooled"])
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        same_f = pool.submit(look, a, 0, same_extra) if a != "local" else None
+        other_f = pool.submit(second, [d for d in seconds if d != "local"])
+        same, other = (same_f.result() if same_f else None), other_f.result()
+    if "local" in seconds:
+        other = second(["local"], other)
+    if a == "local":
+        same = look("local", 0, [])
+    for word, r in (("again", same), ("second", other)):
+        if r is not None:
+            detail = r.get("why") if r["state"] == "unavailable" else None
+            print(f"sight: {r['target']} {word}: {r['state']} ({detail or r.get('job') or r.get('why')})")
+
+    verdict = sight_verdict(first, same, other)
+    runs = [{k: r.get(k) for k in _RUN_FIELDS} for r in (first, same, other) if r is not None]
+    verdict.update(signature=sig, signature_id=consensus.signature_id(sig), runs=runs)
+    print(f"sight: {verdict['word']} ({verdict['why']})")
+    if sig:
+        print(f"sight: error: {sig}")
+    note = consensus.describe_memory(consensus.recall(sig))
+    if note:
+        print(f"sight: {note}")
+    if verdict["label"]:
+        consensus.remember({"label": verdict["label"], "reason": verdict["why"], "signature": sig,
+                            "signature_id": verdict["signature_id"], "cmd": list(cmd), "runs": runs, "via": "sight"})
+    return verdict
+
+
+def _sight_run(cwd: Path, key: str, reg: dict, cmd: list[str], first: dict, tags: list[str] | None,
+               env_names: list[str] | None, timeout: int | None, no_local: bool, named: bool,
+               result_file: Path | None) -> int:
+    verdict = shared_sight(cwd, key, reg, cmd, first, tags, env_names, timeout, no_local, named)
+    _write_result(result_file, {**first, "sight": verdict})
+    return SIGHT_EXIT[verdict["word"]]
 
 
 # --- asking the dusk ------------------------------------------------------------------------------

@@ -527,11 +527,12 @@ def replica_run(
     target_file: Optional[Path] = typer.Option(None, "--target-file", hidden=True),
     result_file: Optional[Path] = typer.Option(None, "--result-file", hidden=True),
     pooled: bool = typer.Option(False, "--pooled", hidden=True),
+    sight: bool = typer.Option(False, "--sight", help="when it fails, look again on the same body and on a second body: code, body or chance"),
 ) -> None:
     """Send only what changed to the nearest free replica and run there (Day)."""
     cmd = _need_cmd(cmd)
     raise typer.Exit(_replica_call(replica.run, cmd, Path.cwd(), worker, tag, env_names, timeout, reuse, as_is,
-                                   bless, no_local, target_file, result_file, pooled))
+                                   bless, no_local, target_file, result_file, pooled, sight))
 
 
 @replica_app.command("check")
@@ -540,10 +541,11 @@ def replica_check(
     shards: int = typer.Option(0, "--shards", min=0, help="how many shards --split makes"),
     no_local: bool = typer.Option(False, "--no-local", help="never fall back to running on this Mac"),
     env_names: list[str] = typer.Option([], "--env", help="forward this env var to every check (repeatable)"),
+    sight: bool = typer.Option(False, "--sight", help="when it fails, look again on the same body and on a second body: code, body or chance"),
 ) -> None:
     """Run every speculate check (or every shard) across the day replicas at once.
     When all pass on one tree, the dusk moves to it."""
-    raise typer.Exit(_replica_call(replica.check, Path.cwd(), split, shards, no_local, env_names))
+    raise typer.Exit(_replica_call(replica.check, Path.cwd(), split, shards, no_local, env_names, sight))
 
 
 @replica_app.command("compare")

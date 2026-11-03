@@ -840,3 +840,183 @@ def test_gc_spares_a_replica_used_today_even_on_low_disk(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_gc_free_gb", lambda: 1.0)
     assert agent.cmd_gc(["2", "50"]) == 0
     assert not reps["stale"].exists() and not reps["cooling"].exists() and reps["used"].exists()
+
+
+# --- shared sight -------------------------------------------------------------------------------
+
+@pytest.fixture
+def memory(tmp_path, monkeypatch):
+    from orchard import consensus
+    monkeypatch.setattr(consensus, "MEMORY_PATH", tmp_path / "consensus.jsonl")
+    return consensus
+
+
+SICK_PRO = sh('case "$(pwd)" in */remote/pro/*) echo "sick body" >&2; exit 1;; esac; exit 0')
+
+
+def test_sight_blames_the_body_when_the_second_body_passes(bodies, proj, memory, tmp_path, monkeypatch, capsys):
+    in_process_children(monkeypatch)
+    replica.up(proj, "pro")
+    replica.up(proj, "laptop")
+    capsys.readouterr()
+    rf = tmp_path / "result.json"
+    assert replica.run(SICK_PRO, proj, worker_name="pro", sight=True, result_file=rf) == 2
+    out = capsys.readouterr().out
+    assert "sight: failed on pro; looking again on pro and on laptop at once" in out
+    assert "sight: body (fails on pro but passes on laptop (same platform): pro is the problem" in out
+    seen = json.loads(rf.read_text())["sight"]
+    assert seen["word"] == "body" and seen["label"] == "machine-only"
+    assert [r["target"] for r in seen["runs"]] == ["pro", "pro", "laptop"]
+    remembered = json.loads(memory.MEMORY_PATH.read_text().splitlines()[0])
+    assert remembered["label"] == "machine-only" and remembered["via"] == "sight"
+
+
+def test_sight_calls_a_pass_on_the_rerun_chance(bodies, proj, memory, tmp_path, monkeypatch, capsys):
+    in_process_children(monkeypatch)
+    replica.up(proj, "pro")
+    replica.up(proj, "laptop")
+    once = tmp_path / "once"
+    flaky = sh(f'if [ -e "{once}" ]; then exit 0; fi; touch "{once}"; echo "error: boom" >&2; exit 1')
+    assert replica.run(flaky, proj, worker_name="pro", sight=True) == 2
+    assert "sight: chance (failed then passed on pro: flaky)" in capsys.readouterr().out
+    assert memory.known_noise(json.loads(memory.MEMORY_PATH.read_text())["signature"])
+
+
+def test_sight_calls_a_failure_everywhere_code(bodies, proj, memory, monkeypatch, capsys):
+    in_process_children(monkeypatch)
+    replica.up(proj, "pro")
+    replica.up(proj, "laptop")
+    assert replica.run(sh('echo "AssertionError: wrong" >&2; exit 1'), proj, sight=True, no_local=True) == 1
+    out = capsys.readouterr().out
+    assert "sight: code (fails twice on" in out and ": fix the code)" in out
+    assert "sight: error: " in out
+    assert json.loads(memory.MEMORY_PATH.read_text())["label"] == "real"
+    # A second failure with the same signature is remembered, and said so.
+    assert replica.run(sh('echo "AssertionError: wrong" >&2; exit 1'), proj, sight=True, no_local=True) == 1
+    assert "sight: seen 1 time before: real 1" in capsys.readouterr().out
+
+
+def test_sight_is_unsure_with_no_second_body(bodies, proj, memory, monkeypatch, capsys):
+    in_process_children(monkeypatch)
+    replica.up(proj, "pro")
+    assert replica.run(sh("exit 1"), proj, worker_name="pro", sight=True, no_local=True) == 1
+    out = capsys.readouterr().out
+    assert "looking again on pro (no second body)" in out
+    assert "sight: unsure (failed twice on pro; no second body could look)" in out
+    assert not memory.MEMORY_PATH.exists()
+    with pytest.raises(replica.ReplicaError, match="--sight"):
+        replica.run(["true"], proj, worker_name="pro", as_is=True, sight=True)
+
+
+def test_sight_does_not_count_a_look_at_another_tree(bodies, proj, memory, monkeypatch, capsys):
+    in_process_children(monkeypatch)
+    key = replica.project_key(proj)
+    replica.up(proj, "pro")
+    replica.up(proj, "laptop")
+    first = {"target": "pro", "state": "failed", "tree": "0" * 64, "log_tail": ""}
+    seen = replica.shared_sight(proj, key, replica.load_registry(key), ["true"], first, no_local=True)
+    assert seen["word"] == "unsure" and seen["why"] == "neither look finished"
+    assert capsys.readouterr().out.count("the tree changed since the first run") == 2
+
+
+def test_sight_verdicts_when_a_look_does_not_finish():
+    first = {"target": "pro", "state": "failed"}
+    ok, bad, gone = {"state": "succeeded"}, {"state": "failed"}, {"state": "unavailable"}
+    v = replica.sight_verdict(first, gone, {**ok, "target": "laptop"})
+    assert v["word"] == "unsure" and "chance is not ruled out" in v["why"]
+    v = replica.sight_verdict(first, gone, {**bad, "target": "laptop"})
+    assert v["word"] == "code" and "the rerun on pro did not finish" in v["why"]
+    v = replica.sight_verdict(first, bad, {**gone, "target": "laptop"})
+    assert v == {"word": "unsure", "label": None, "why": "failed twice on pro; the look on laptop did not finish"}
+    assert replica.sight_verdict(first, ok, None)["word"] == "chance"
+
+
+def test_check_with_sight_looks_at_each_failure(bodies, proj, memory, tmp_path, monkeypatch, capsys):
+    from orchard import cli_agentic
+    import inspect
+    in_process_children(monkeypatch)
+    replica.up(proj, "pro")
+    replica.up(proj, "laptop")
+    once = tmp_path / "once"
+    speculate.add(proj, speculate.make_check(["true"]))
+    speculate.add(proj, speculate.make_check(sh(f'if [ -e "{once}" ]; then exit 0; fi; touch "{once}"; exit 1')))
+    assert replica.check(proj, no_local=True, sight=True) == 2
+    out = capsys.readouterr().out
+    assert "sight: chance" in out and "dusk:" not in out
+    assert [ln for ln in out.splitlines() if ln.startswith("  failed")][0].endswith("sight: chance")
+    speculate.add(proj, speculate.make_check(sh("exit 1")))
+    assert replica.check(proj, no_local=True, sight=True) == 1
+    assert "sight: code" in capsys.readouterr().out
+    for fn in (cli_agentic.replica_run, cli_agentic.replica_check):
+        assert "sight" in inspect.signature(fn).parameters
+
+
+def fake_local(monkeypatch, jobs):
+    """fleet.run_on("local") as a real run here: records the tree at launch,
+    then runs in place, as a local job does."""
+    def run_on(target, cmd, cwd, name, tags=None, env_names=None, timeout=None):
+        sdir = jobs / name
+        sdir.mkdir(parents=True)
+        (sdir / "inputs.json").write_text(json.dumps({"tree": receipts.tree_digest(cwd)[0]}))
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+        return {"target": "local", "job": name, "state": "succeeded" if proc.returncode == 0 else "failed",
+                "exit_code": proc.returncode, "log_tail": proc.stderr}
+    monkeypatch.setattr(fleet, "run_on", run_on)
+
+
+def test_sight_hands_a_look_on_and_counts_a_look_here_that_writes(bodies, proj, memory, monkeypatch, capsys):
+    in_process_children(monkeypatch)
+    fake_local(monkeypatch, bodies.jobs)
+    replica.up(proj, "pro")
+    replica.up(proj, "laptop")
+    child = replica._run_child
+    monkeypatch.setattr(replica, "_run_child", lambda cwd, label, argv, rf: (
+        {"state": "unavailable", "why": "went quiet"} if "-laptop" in label else child(cwd, label, argv, rf)))
+    cmd = sh('mkdir -p out && echo seen > out/report.txt; '
+             'case "$(pwd)" in */remote/pro/*) echo "sick body" >&2; exit 1;; esac; exit 0')
+    assert replica.run(cmd, proj, worker_name="pro", sight=True) == 2
+    out = capsys.readouterr().out
+    assert "sight: failed on pro; looking again on pro and on laptop at once" in out
+    assert "sight: laptop could not look (went quiet); trying local" in out
+    assert "sight: body (" in out and "pro is the problem" in out
+    assert (proj / "out" / "report.txt").exists()
+
+
+def test_sight_skips_a_busy_body_and_a_stranded_check_borrows_one_that_can(bodies, proj, memory, tmp_path,
+                                                                            monkeypatch, capsys):
+    in_process_children(monkeypatch)
+    fake_local(monkeypatch, bodies.jobs)
+    replica.up(proj, "pro")
+    replica.up(proj, "laptop", augment=["gpu"])
+    capsys.readouterr()
+    busy = {"pro"}
+    probe = replica._probe_all
+
+    def probe_busy(names, key):
+        workers, probes = probe(names, key)
+        return workers, {n: ({**st, "busy": "job-x"} if st and n in busy else st) for n, st in probes.items()}
+    monkeypatch.setattr(replica, "_probe_all", probe_busy)
+    first = {"target": "local", "state": "failed", "tree": receipts.tree_digest(proj)[0], "log_tail": ""}
+    key = replica.project_key(proj)
+    seen = replica.shared_sight(proj, key, replica.load_registry(key), sh("exit 1"), first)
+    assert "sight: pro is busy" in capsys.readouterr().out
+    assert [r["target"] for r in seen["runs"]] == ["local", "local", "laptop"] and seen["word"] == "code"
+
+    # The check needs gpu, which only laptop has. laptop cannot start it in the
+    # pool, so it runs here and fails; its sight still borrows laptop, not pro.
+    busy.clear()
+    child = replica._run_child
+    refused = []
+
+    def refuse_once(cwd, label, argv, rf):
+        if "replica-check-" in label and not refused:
+            refused.append(label)
+            return {"state": "unavailable", "why": "went quiet"}
+        return child(cwd, label, argv, rf)
+    monkeypatch.setattr(replica, "_run_child", refuse_once)
+    speculate.add(proj, speculate.make_check(
+        sh('case "$(pwd)" in */remote/*) exit 0;; esac; echo "error: here" >&2; exit 1'), ["gpu"]))
+    assert replica.check(proj, sight=True) == 2
+    out = capsys.readouterr().out
+    assert "sight: failed on local; looking again on laptop, then on local" in out
+    assert [ln for ln in out.splitlines() if ln.startswith("  failed")][0].endswith("sight: body")

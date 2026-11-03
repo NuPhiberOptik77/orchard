@@ -312,6 +312,38 @@ opt-in ways around that; the placement guard itself is unchanged.
   tree that does not finish (a timeout, a body that went quiet) ends with no
   verdict rather than a wrong one.
 
+**Shared sight.** One run cannot tell a broken change from a sick machine or
+bad luck. With `--sight`, `replica run` and `replica check` look at a failure
+again straight away, with two pairs of eyes: a rerun on the same body and a
+run on a second body, both on the same tree. The second body is the first
+free day replica that can run the check (in `check`, one the check could
+borrow), else this Mac. A body that cannot start its look hands it to the
+next. Two replicas look at once; this Mac looks last, because a run here
+works in place and anything it writes would change the tree the other look
+ships. The verdict is one of three:
+
+- **code**: it fails on the second body too. "fails twice on pro and on
+  laptop: fix the code" (exit 1). This holds even when the rerun on the
+  same body did not finish.
+- **body**: it fails again on the same body but passes on the other. "fails
+  on pro but passes on laptop (same platform): pro is the problem, not your
+  change" (exit 2). The reason comes from consensus, so a load or platform
+  difference is named.
+- **chance**: the rerun on the same body passes, whatever the second body
+  says. "failed then passed on pro: flaky" (exit 2).
+
+Anything else is **unsure** (exit 1), never a guess: no second body was
+free, or a look the verdict needed did not finish (a body went quiet, or the
+tree changed since the first run). A check that writes into files that ship
+(an `out/` folder that is not gitignored, say) changes the tree, so keep
+outputs ignored. Verdicts go into consensus memory with the failure's
+signature, so the next time the same error shows up, sight says how it was
+called before. `replica check --sight` looks at each failure one at a time
+after the checks finish, adds `sight: <verdict>` to the summary, and exits 2
+when every failure was the body or chance. The dusk still moves only on
+green. `--sight` cannot be used with `--as-is`, because it looks at your
+tree.
+
 **Disk.** A body's normal `gc` removes a replica only when it has been idle
 for 14 days or more and nothing is running in it. When disk runs low, `gc`
 still spares any replica used in the last 24 hours. `orchard replica down
@@ -324,8 +356,8 @@ whether it holds your tree, drift and pending prep.
 - Resident watchers (a `tsc --watch` that never exits) and streaming edits as
   they are typed. Both need a long-lived process on the body; the replica
   layout is where they will live.
-- Self-healing from consensus memory: rerunning a failure whose signature was
-  labelled `flaky` before on another replica before reporting it.
+- Self-healing from consensus memory: running sight on its own, without
+  `--sight`, when a failure's signature was labelled `flaky` before.
 - **Dreaming.** An idle dusk could replay the day's red checks against small
   mixes of its green tree and the trees that failed, so that when the same
   failure signature comes back, blame is already known.
