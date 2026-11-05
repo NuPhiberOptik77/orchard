@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 import tarfile
@@ -311,3 +312,23 @@ def test_launch_local_drops_the_last_runs_status_first(monkeypatch, tmp_path):
                         lambda *a, **k: seen.append([(tmp_path / n).exists() for n in names]) or Proc())
     assert engine.launch_local(JobSpec(name="demo", cmd=["true"]), "j1", tmp_path, tmp_path) == (None, 4321)
     assert seen == [[False] * 4]
+
+
+@pytest.mark.parametrize("shell", ["/bin/bash", "/bin/sh", "/bin/zsh"])
+def test_start_command_returns_while_the_agent_runs(tmp_path, shell):
+    """Under bash a backgrounded list held the ssh channel open until the job ended, so launch timed out at 30 s."""
+    if not os.path.exists(shell):
+        pytest.skip(f"no {shell}")
+    rjob = tmp_path / "job"
+    rjob.mkdir()
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "orchard-agent.py").write_text("import time\ntime.sleep(8)\n")
+    (rjob / "status.json").write_text("{}")
+    proc = subprocess.run([shell, "-c", engine.start_command(str(tmp_path), str(rjob))], capture_output=True, text=True, timeout=5)
+    assert proc.returncode == 0 and proc.stdout.strip() == "started"
+    assert not (rjob / "status.json").exists()
+
+
+def test_start_command_fails_when_the_folder_is_missing(tmp_path):
+    proc = subprocess.run(["/bin/bash", "-c", engine.start_command(str(tmp_path / "gone"), str(tmp_path))], capture_output=True, text=True, timeout=5)
+    assert proc.returncode != 0 and "started" not in proc.stdout

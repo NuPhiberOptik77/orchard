@@ -211,6 +211,16 @@ def check_shipping_size(cwd: Path, kind: str) -> None:
         )
 
 
+def start_command(rroot: str, rjob: str) -> str:
+    """Start the agent detached. Only the agent goes to the background: a background list would leave a shell
+    holding the ssh channel open until the job ends, under a login shell that forks one for it, such as bash."""
+    return (
+        f'cd "{rroot}" && rm -f "{rjob}/status.json" "{rjob}/pid" "{rjob}/command.pid" "{rjob}/kill-requested" && '
+        f'{{ nohup /usr/bin/python3 "{rroot}/bin/orchard-agent.py" exec "{rjob}/job.json" '
+        f'> "{rjob}/agent.out" 2>&1 < /dev/null & }} && echo started'
+    )
+
+
 def launch_remote(
     worker: Worker,
     job: JobSpec,
@@ -282,11 +292,7 @@ def launch_remote(
     # An earlier attempt's files go first: a poll before the new agent writes
     # its own status finds nothing rather than how the last one ended, and a
     # `kill` before it writes its pid finds no stale pid (or kill request) to act on.
-    start = (
-        f'cd "{rroot}" && rm -f "{rjob}/status.json" "{rjob}/pid" "{rjob}/command.pid" "{rjob}/kill-requested" && nohup /usr/bin/python3 "{rroot}/bin/orchard-agent.py" exec "{rjob}/job.json" '
-        f'> "{rjob}/agent.out" 2>&1 & echo started'
-    )
-    transport.run_checked(worker, start, timeout=30)
+    transport.run_checked(worker, start_command(rroot, rjob), timeout=30)
     print(f"job started on {worker.name} (detached)")
     events.append("launched", job=job_id, worker=worker.name, kind=job.kind)
     return rhome, rjob
