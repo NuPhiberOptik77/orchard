@@ -1,4 +1,4 @@
-"""Agent-native commands: receipt, consensus, fork, speculate, replica, mind, live.
+"""Agent-native commands: receipt, consensus, fork, speculate, replica, mind, live, ab.
 
 They live apart from cli.py so the original commands stay readable; importing
 this module registers them on the same Typer app. See docs/agent-native.md.
@@ -7,6 +7,7 @@ this module registers them on the same Typer app. See docs/agent-native.md.
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import shutil
 import subprocess
@@ -18,7 +19,7 @@ from typing import Optional
 
 import typer
 
-from . import consensus, fleet, live, mind, placement, receipts, replica, speculate, transport, worlds
+from . import ab, consensus, fleet, live, mind, placement, receipts, replica, speculate, transport, worlds
 from .job import slugify
 from .cli import app, find_jobs
 
@@ -924,3 +925,71 @@ def live_cmd(
         typer.echo(f"orchard live: {exc}", err=True)
         code = 2
     raise typer.Exit(code)
+
+
+@app.command("ab")
+def ab_cmd(
+    cmd: Optional[list[str]] = typer.Argument(None, help="command to test (after --)"),
+    arm: list[str] = typer.Option([], "--arm", help="NAME or NAME:KEY=VAL,KEY=VAL; the first is the baseline (repeatable)"),
+    rounds: int = typer.Option(4, "--rounds", help="runs per arm, in mirrored order"),
+    metric: Optional[str] = typer.Option(None, "--metric", help="regex for the number to compare (last match, first group); default: wall seconds"),
+    higher_better: bool = typer.Option(False, "--higher-better", help="a bigger number is the better one"),
+    same: Optional[str] = typer.Option(None, "--same", help="regex for output every run must match exactly (first group), or the test stops"),
+    before: list[str] = typer.Option([], "--before", help="ARM=SHELL COMMAND to run before each of that arm's runs"),
+    after: list[str] = typer.Option([], "--after", help="ARM=SHELL COMMAND to run after each of that arm's runs, even on failure or a signal"),
+    watch: list[str] = typer.Option([], "--watch", help="worker name: a run another Orchard job overlapped there doesn't count (repeatable)"),
+    stop_if: Optional[str] = typer.Option(None, "--stop-if", help="shell command checked during each run; exit 0 stops the test"),
+    poll: int = typer.Option(30, "--poll", help="seconds between --stop-if checks"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", help="seconds before each run is killed"),
+    show: Optional[str] = typer.Option(None, "--show", help="show a finished test and check its seal and logs"),
+    list_tests: bool = typer.Option(False, "--list", help="list recent tests"),
+    json_out: bool = typer.Option(False, "--json", help="machine-readable output"),
+) -> None:
+    """Test whether a setting really helps: run a command under each arm in
+    mirrored order and keep the proof. Exit 0 proven, 1 not separated, 2 void."""
+    if list_tests:
+        for record in ab.recent():
+            verdicts = ", ".join(f"{c['arm']} {c['verdict']}" for c in record.get("comparisons") or [])
+            print(f"{record['id']}  {record['state']:<14} {verdicts or record.get('reason', '')}")
+        return
+    if show:
+        record = ab.find(show)
+        if record is None:
+            print(f"no test matching {show!r}", file=sys.stderr)
+            raise typer.Exit(1)
+        problems = ab.check(record)
+        if json_out:
+            print(json.dumps({"record": record, "verified": not problems, "problems": problems}, indent=2))
+        else:
+            for line in ab.report(record):
+                print(line)
+            print(f"  seal: {'verified' if not problems else 'DOES NOT VERIFY'}")
+            for problem in problems:
+                print(f"  problem: {problem}")
+        if problems:
+            raise typer.Exit(1)
+        return
+    try:
+        if not cmd:
+            raise ValueError("needs a command after --")
+        arms = ab.parse_arms(arm)
+        before_hooks, after_hooks = ab.parse_hooks(before, arms), ab.parse_hooks(after, arms)
+        for pattern in (metric, same):
+            if pattern:
+                re.compile(pattern)
+    except (ValueError, re.error) as exc:
+        print(f"ab: {exc}", file=sys.stderr)
+        raise typer.Exit(2)
+
+    def say(message: str) -> None:
+        print(message, file=sys.stderr if json_out else sys.stdout, flush=True)
+
+    record = ab.run_test(cmd, arms, rounds=rounds, metric=metric, same=same, lower_better=not higher_better,
+                         before=before_hooks, after=after_hooks, watch=watch, stop_if=stop_if, poll=poll,
+                         timeout=timeout, say=say)
+    if json_out:
+        print(json.dumps(record, indent=2))
+    else:
+        for line in ab.report(record):
+            print(line)
+    raise typer.Exit(ab.exit_code(record["state"]))

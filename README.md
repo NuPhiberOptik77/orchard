@@ -153,6 +153,9 @@ also leaves a receipt.
 `orchard live`. [docs/agent-native.md](docs/agent-native.md) is the design:
 how each one works, its limits, and how to measure it.
 
+`orchard ab` tests whether a setting really helps: it runs a command under each
+setting in mirrored order and keeps sealed proof. See [docs/ab.md](docs/ab.md).
+
 ## Menu-bar apps (optional)
 
 - `./app/menubar/build.sh` builds the controller app: queue and worker status,
