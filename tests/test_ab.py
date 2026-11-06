@@ -235,6 +235,14 @@ def test_overlapping_jobs_reads_the_queue_and_finished_jobs(tmp_path):
     assert ab.overlapping_jobs(["box"], 100, 200) == ["inside", "live", "spans"]
 
 
+def test_a_questions_own_hold_job_is_not_other_load(tmp_path):
+    dispatcher.QUEUE_DIR.mkdir(parents=True)
+    for job_id in ("ai-hold-20261106-062057-31b6", "real-job"):
+        (dispatcher.QUEUE_DIR / f"{job_id}.json").write_text(json.dumps(
+            {"id": job_id, "state": "running", "worker": "box", "created_at": 150}))
+    assert ab.overlapping_jobs(["box"], 100, 200) == ["real-job"]
+
+
 def test_cli_refuses_bad_input():
     assert invoke("--arm", "a", "--", "true").exit_code == 2
     assert invoke("--arm", "a", "--arm", "b").exit_code == 2

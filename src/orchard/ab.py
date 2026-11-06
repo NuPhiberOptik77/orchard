@@ -161,7 +161,8 @@ def overlapping_jobs(workers: list[str], start: float, end: float) -> list[str]:
             began, ended = status.get("started_at"), status.get("ended_at")
             if began and ended and began < end and ended > start:
                 hits.add(job.name)
-    return sorted(hits)
+    # A question's own hold job isn't other load: `orchard ai` starts one per run.
+    return sorted(hit for hit in hits if not hit.startswith("ai-hold-"))
 
 
 def _kill(proc: subprocess.Popen) -> None:

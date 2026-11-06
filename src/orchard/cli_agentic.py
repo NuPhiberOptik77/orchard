@@ -19,7 +19,7 @@ from typing import Optional
 
 import typer
 
-from . import ab, consensus, fleet, live, mind, placement, receipts, replica, speculate, transport, worlds
+from . import ab, ai, consensus, fleet, live, mind, placement, receipts, replica, speculate, transport, worlds
 from .job import slugify
 from .cli import app, find_jobs
 
@@ -925,6 +925,121 @@ def live_cmd(
         typer.echo(f"orchard live: {exc}", err=True)
         code = 2
     raise typer.Exit(code)
+
+
+ai_app = typer.Typer(no_args_is_help=True,
+                     help="Ask a large model spread across your own machines. Nothing leaves them.")
+app.add_typer(ai_app, name="ai")
+
+
+@ai_app.command("ask")
+def ai_ask(
+    question: str = typer.Argument(..., help="the question; - reads it from stdin"),
+    words: Optional[int] = typer.Option(None, "--words", envvar="ORCHARD_AI_WORDS", help="most words in the answer"),
+    threads: Optional[int] = typer.Option(None, "--threads", envvar="ORCHARD_AI_THREADS", help="engine threads"),
+    split: Optional[str] = typer.Option(None, "--split", envvar="ORCHARD_AI_SPLIT", help="how layers share out across devices, like 22,78"),
+    overrides: Optional[str] = typer.Option(None, "--overrides", envvar="ORCHARD_AI_OVERRIDES", help="which device holds which tensors"),
+    no_pause: bool = typer.Option(False, "--no-pause", envvar="ORCHARD_AI_NO_PAUSE", help="leave the sync apps running"),
+    no_hold: bool = typer.Option(False, "--no-hold", help="don't hold the machine in Orchard's queue"),
+    json_out: bool = typer.Option(False, "--json", help="machine-readable output"),
+) -> None:
+    """Put one question to the pool, put everything back, keep a sealed record.
+    Exit 0 answered, 1 the run failed, 2 refused, 3 stopped early."""
+    text = sys.stdin.read().strip() if question == "-" else question
+    if not text:
+        print("ai: an empty question", file=sys.stderr)
+        raise typer.Exit(2)
+    fence = {"open": False}
+
+    def echo(chunk: str) -> None:
+        fence["open"] = True
+        print(chunk, end="", flush=True)
+
+    def say(message: str) -> None:
+        print(f"ai: {message}", file=sys.stderr, flush=True)
+
+    try:
+        record = ai.ask(text, threads=threads, split=split, overrides=overrides, words=words,
+                        pause=not no_pause, hold=not no_hold, say=say, echo=None if json_out else echo)
+    except ai.ConfigError as exc:
+        print(f"ai: {exc}", file=sys.stderr)
+        raise typer.Exit(2)
+    if json_out:
+        print(json.dumps(record, indent=2))
+    else:
+        if fence["open"]:
+            print("\n--- end")
+        for line in ai.report(record):
+            print(line)
+    raise typer.Exit(ai.EXIT_CODES[record["state"]])
+
+
+@ai_app.command("setup")
+def ai_setup(json_out: bool = typer.Option(False, "--json", help="machine-readable output")) -> None:
+    """Check every machine in the settings, or write a settings file to fill in.
+    Reads only. Exit 0 all good, 1 something needs fixing, 2 settings to fill in."""
+    if ai.write_template():
+        print(f"wrote {ai.CONFIG_PATH}: fill it in and run this again. docs/ai.md explains it.")
+        raise typer.Exit(2)
+    try:
+        rows = ai.probe(ai.load_settings())
+    except ai.ConfigError as exc:
+        print(f"ai: {exc}", file=sys.stderr)
+        raise typer.Exit(2)
+    if json_out:
+        print(json.dumps(rows, indent=2))
+    else:
+        for row in rows:
+            print(f"{'ok ' if row['ok'] else 'NO '} {row['machine']}: {row['what']}: {row['detail']}")
+    raise typer.Exit(0 if all(row["ok"] for row in rows) else 1)
+
+
+@ai_app.command("resume")
+def ai_resume() -> None:
+    """Bring the sync apps back and confirm it. Safe at any time."""
+    try:
+        back = ai.resume_apps()
+    except ai.ConfigError as exc:
+        print(f"ai: {exc}", file=sys.stderr)
+        raise typer.Exit(2)
+    print("sync apps back" if back else "SYNC APPS NOT CONFIRMED BACK")
+    raise typer.Exit(0 if back else 1)
+
+
+@ai_app.command("show")
+def ai_show(
+    record_id: str = typer.Argument(..., help="record id or prefix"),
+    json_out: bool = typer.Option(False, "--json", help="machine-readable output"),
+) -> None:
+    """Show a kept answer and check its seal and files."""
+    record = ai.find(record_id)
+    if record is None:
+        print(f"no record matching {record_id!r}", file=sys.stderr)
+        raise typer.Exit(1)
+    problems = ai.check(record)
+    if json_out:
+        print(json.dumps({"record": record, "verified": not problems, "problems": problems}, indent=2))
+    else:
+        print(f"asked: {record['question']}")
+        if record.get("thinking"):
+            print(f"--- thinking\n{record['thinking']}")
+        print(f"--- answer\n{record.get('answer', '')}\n--- end")
+        for line in ai.report(record):
+            print(line)
+        print(f"seal: {'verified' if not problems else 'DOES NOT VERIFY'}")
+        for problem in problems:
+            print(f"problem: {problem}")
+    if problems:
+        raise typer.Exit(1)
+
+
+@ai_app.command("list")
+def ai_list() -> None:
+    """List recent questions."""
+    for record in ai.recent():
+        speed = (record.get("timings") or {}).get("ms_per_word")
+        print(f"{record['id']}  {record['state']:<9} {f'{speed:.0f} ms/word' if speed else '':<13} "
+              f"{record['question'][:60]}")
 
 
 @app.command("ab")

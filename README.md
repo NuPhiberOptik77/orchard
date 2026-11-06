@@ -156,6 +156,11 @@ how each one works, its limits, and how to measure it.
 `orchard ab` tests whether a setting really helps: it runs a command under each
 setting in mirrored order and keeps sealed proof. See [docs/ab.md](docs/ab.md).
 
+`orchard ai ask "question"` asks a large model spread across your own machines:
+it holds the machine, starts the GPU helper and its tunnel, pauses the sync apps,
+watches memory, and puts everything back however the run ends. The answer lands
+in a sealed record and nothing leaves your machines. See [docs/ai.md](docs/ai.md).
+
 ## Menu-bar apps (optional)
 
 - `./app/menubar/build.sh` builds the controller app: queue and worker status,
