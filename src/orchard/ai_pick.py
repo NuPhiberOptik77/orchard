@@ -9,8 +9,12 @@ goes through a dated list of open models and sorts them into three groups:
   (a mixture of experts), for background work
 - won't run here, and why
 
-Within each group the strongest come first, by a public leaderboard named with
-its date. The split preview says which machine would hold how much. Speeds are
+It asks what the model is for (coding, agents, chat and writing, reasoning and
+maths, reading pictures, or a bit of everything) and, within each group, puts
+the strongest at that first: by a public leaderboard for that task where the
+list has one, by a general one otherwise, each named with its date. Every model
+shows what it can do, how much it takes in at once and all its scores. The split
+preview says which machine would hold how much. Speeds are
 rough estimates from each machine's measured memory speed; a short test run
 gives the real number.
 
@@ -57,6 +61,23 @@ DISK_SHARE = 0.9
 COMFORT_WPS = 2.0
 # Squeezed below this many bits per weight, a model is weaker than its score says.
 FULL_BITS = 3.5
+# A rough rule for English text: three words to every four tokens.
+WORDS_PER_TOKEN = 0.75
+
+# What a model can be for, in the order the question lists them.
+USES = {
+    "coding": "coding",
+    "agents": "agents and tool use",
+    "chat": "chat and writing",
+    "reasoning": "reasoning and maths",
+    "vision": "reading pictures",
+    "general": "a bit of everything",
+}
+ALIASES = {"code": "coding", "agent": "agents", "tools": "agents", "tool": "agents", "writing": "chat",
+           "maths": "reasoning", "math": "reasoning", "images": "vision", "image": "vision",
+           "pictures": "vision", "everything": "general", "all": "general"}
+# How a task or a capability reads in a sentence.
+WORD = {"vision": "pictures"}
 
 # Read-only, and runs on Python 3.8, which an older Mac's command-line tools have.
 PROBE = r"""
@@ -190,6 +211,22 @@ def hf_files(repo: str) -> dict[str, int]:
             for item in data if item.get("type") == "file"}
 
 
+def picture_file(files: dict[str, int]) -> dict | None:
+    """The engine reads pictures through a separate small file in the model's
+    repo (its name has "mmproj" in it). F16 if there is one, else BF16, else the smallest."""
+    found = {path: size for path, size in files.items()
+             if "mmproj" in path.rsplit("/", 1)[-1].lower() and path.endswith(".gguf")}
+    if not found:
+        return None
+
+    def rank(path: str) -> tuple:
+        name = path.lower()
+        return (0 if name.endswith("-f16.gguf") else 1 if name.endswith("-bf16.gguf") else 2, found[path])
+
+    path = min(found, key=rank)
+    return {"file": path, "bytes": found[path]}
+
+
 def refresh(models: list[dict], get_files: Callable[[str], dict[str, int]] = hf_files) -> dict:
     """Check each listed file on Hugging Face and take its current size. A model
     whose files are gone is marked, not dropped. Returns what was checked."""
@@ -199,6 +236,8 @@ def refresh(models: list[dict], get_files: Callable[[str], dict[str, int]] = hf_
     def fetch(repo: str) -> None:
         try:
             found[repo] = get_files(repo)
+        except urllib.error.HTTPError as exc:
+            found[repo] = {} if exc.code in (401, 404) else None
         except (urllib.error.URLError, OSError, ValueError, KeyError):
             found[repo] = None
 
@@ -209,6 +248,8 @@ def refresh(models: list[dict], get_files: Callable[[str], dict[str, int]] = hf_
         files = found.get(model["repo"])
         if files is None:
             continue
+        if "vision" in (model.get("good_at") or []):
+            model["pictures"] = picture_file(files) or model.get("pictures")
         for quant in model["quants"]:
             sizes = [files.get(path) for path in quant["files"]]
             if all(size for size in sizes):
@@ -285,9 +326,10 @@ def estimate_words_per_second(model: dict, quant: dict, split: list[tuple[Machin
     return round(1 / per_word, 1) if per_word else 0.0
 
 
-def judge(model: dict, quant: dict, machines: list[Machine]) -> dict:
-    """Where one model fits: fast (memory), slow (disk) or not here, and why."""
-    need = round(need_gb(quant), 1)
+def judge(model: dict, quant: dict, machines: list[Machine], extra_gb: float = 0.0) -> dict:
+    """Where one model fits: fast (memory), slow (disk) or not here, and why.
+    `extra_gb` is memory for something loaded beside it, such as its picture file."""
+    need = round(need_gb(quant) + extra_gb, 1)
     out = {"model": model, "quant": quant, "need_gb": need}
     if quant.get("missing"):
         return out | {"group": "no", "why": "its files are no longer on Hugging Face under that name"}
@@ -295,6 +337,8 @@ def judge(model: dict, quant: dict, machines: list[Machine]) -> dict:
         return out | {"group": "no", "why": "the engine can't run this kind of model yet"}
     if model.get("llama_cpp") is None:
         return out | {"group": "no", "why": "the engine's support for this kind of model isn't confirmed yet"}
+    if not machines:
+        return out | {"group": "no", "why": "no machine answered, so nothing could be judged"}
     split = plan_memory(need, machines)
     if split:
         return out | {"group": "fast", "split": split, "words_per_second": estimate_words_per_second(model, quant, split)}
@@ -325,43 +369,170 @@ def squeezed(row: dict) -> bool:
     return bits is not None and bits < FULL_BITS
 
 
-def strength(model: dict, primary: str) -> float:
+def score_of(model: dict, source_id: str | None) -> float | None:
     for score in model.get("scores") or []:
-        if score.get("source") == primary and isinstance(score.get("score"), (int, float)):
+        if score.get("source") == source_id and isinstance(score.get("score"), (int, float)):
             return float(score["score"])
-    return float("-inf")
+    return None
 
 
-def pick(machines: list[Machine], catalogue: dict, good_at: str | None = None) -> dict:
-    """Every model judged, the strongest first in each group."""
-    ready = [m for m in machines if m.get("reachable")]
-    primary = catalogue.get("primary")
-    rows = []
-    for model in catalogue["models"]:
-        if good_at and good_at not in (model.get("good_at") or []):
-            continue
-        # The largest quantization that runs fast; otherwise the first that runs at all.
-        verdicts = [judge(model, quant, ready) for quant in model["quants"]]
-        order = {"fast": 0, "slow": 1, "no": 2}
-        verdicts.sort(key=lambda v: (order[v["group"]], -v["quant"]["bytes"]))
-        rows.append(verdicts[0])
-    rows.sort(key=lambda r: strength(r["model"], primary), reverse=True)
-    groups = {g: [r for r in rows if r["group"] == g] for g in ("fast", "slow", "no")}
+def strength(model: dict, primary: str) -> float:
+    score = score_of(model, primary)
+    return float("-inf") if score is None else score
+
+
+def resolve_use(text: str | None) -> str:
+    """'coding', '1', 'images' and the like, to one of USES. ValueError if unknown."""
+    word = (text or "").strip().lower()
+    if word.isdigit() and 1 <= int(word) <= len(USES):
+        return list(USES)[int(word) - 1]
+    word = ALIASES.get(word, word)
+    if word in USES:
+        return word
+    raise ValueError(f"'{text}' isn't one Orchard knows; pick one of: {', '.join(USES)}")
+
+
+def ask_use(read: Callable[[str], str], write: Callable[[str], None]) -> str:
+    """Ask what the model is for. Enter means a bit of everything."""
+    write("What will you use it for?")
+    for number, label in enumerate(USES.values(), 1):
+        write(f"  {number} {label}")
+    for _ in range(3):
+        try:
+            answer = read(f"Pick a number [{len(USES)}]: ")
+        except EOFError:
+            break
+        try:
+            return resolve_use(answer.strip() or str(len(USES)))
+        except ValueError as exc:
+            write(str(exc))
+    return "general"
+
+
+def ranking_source(catalogue: dict, use: str) -> dict | None:
+    """The leaderboard that ranks this use: the general one, or for a task the
+    independent one that scores the most listed models."""
+    sources = catalogue.get("sources", [])
+    if use == "general":
+        return next((s for s in sources if s["id"] == catalogue.get("primary")), None)
+
+    def reach(source: dict) -> tuple:
+        scored = sum(1 for m in catalogue["models"] if score_of(m, source["id"]) is not None)
+        return (scored > 0, not source.get("self_reported"), scored)
+
+    candidates = [s for s in sources if s.get("task") == use and reach(s)[0]]
+    return max(candidates, key=reach) if candidates else None
+
+
+def rank_key(model: dict, use: str, ranker: dict | None, primary: str | None) -> tuple:
+    """Higher is stronger. For a task: models with that task's score first, by it;
+    the rest after them, those made for the task first, then by general strength."""
+    general = strength(model, primary)
+    if use == "general":
+        return (general,)
+    task = score_of(model, ranker["id"]) if ranker else None
+    if task is None:
+        return (0, use in (model.get("good_at") or []), general)
+    return (1, task if ranker.get("higher_is_better", True) else -task, general)
+
+
+def _best(groups: dict) -> dict | None:
     comfortable = [r for r in groups["fast"] if r["words_per_second"] >= COMFORT_WPS]
     full = [r for r in comfortable if not squeezed(r)]
-    best = (full or comfortable or groups["fast"] or groups["slow"] or [None])[0]
-    return {"machines": machines, "groups": groups, "best": best, "primary": primary,
+    return (full or comfortable or groups["fast"] or groups["slow"] or [None])[0]
+
+
+def pick(machines: list[Machine], catalogue: dict, use: str = "general") -> dict:
+    """Every model judged, the strongest at `use` first in each group. Reading
+    pictures needs a model that can; any model can be asked to do the rest."""
+    ready = [m for m in machines if m.get("reachable")]
+    primary = catalogue.get("primary")
+    ranker = ranking_source(catalogue, use)
+    rows = []
+    for model in catalogue["models"]:
+        if use == "vision" and "vision" not in (model.get("good_at") or []):
+            continue
+        # The largest quantization that runs fast; else the copy you already have,
+        # then the largest that runs from disk; if none runs, the smallest, so the
+        # reason names the least it would take.
+        pictures = (model.get("pictures") or {}).get("bytes", 0) / GB if use == "vision" else 0.0
+        verdicts = [judge(model, quant, ready, pictures) for quant in model["quants"]]
+        order = {"fast": 0, "slow": 1, "no": 2}
+        verdicts.sort(key=lambda v: (order[v["group"]], v["group"] == "slow" and not v["quant"].get("owned"),
+                                     v["quant"]["bytes"] if v["group"] == "no" else -v["quant"]["bytes"]))
+        rows.append(verdicts[0])
+
+    def grouped(for_use: str) -> dict:
+        ranked = sorted(rows, key=lambda r: rank_key(r["model"], for_use, ranker, primary), reverse=True)
+        return {g: [r for r in ranked if r["group"] == g] for g in ("fast", "slow", "no")}
+
+    groups = grouped(use)
+    best = _best(groups)
+    # For a task, also the strongest overall, when it isn't the same model.
+    overall = _best(grouped("general")) if use != "general" else None
+    covered = sum(1 for r in rows if ranker and score_of(r["model"], ranker["id"]) is not None)
+    return {"machines": machines, "groups": groups, "best": best, "primary": primary, "use": use,
+            "ranker": ranker, "overall": None if overall is best else overall,
+            "covered": covered, "listed": len(rows),
             "sources": {s["id"]: s for s in catalogue.get("sources", [])}, "as_of": catalogue.get("as_of")}
 
 
 # Saying it.
 
-def _score_text(model: dict, sources: dict, primary: str | None) -> str:
-    for score in model.get("scores") or []:
-        if score.get("source") == primary:
-            source = sources.get(primary, {})
-            return f"{score['score']} on the {source.get('name', primary)} (read {source.get('read_on', '?')})"
-    return "not ranked yet"
+def _word(key: str) -> str:
+    return WORD.get(key, key)
+
+
+def _score_value(value: float, source: dict) -> str:
+    """A share of tasks solved reads as a percentage; anything else as it was published."""
+    return f"{value * 100:.1f}%" if source.get("scale") == "fraction" else f"{value:g}"
+
+
+def _scores_text(model: dict, sources: dict, use: str, ranker: dict | None) -> str:
+    """Every score the model has, the one it's ranked by first, each with its task."""
+    first = ranker["id"] if ranker else None
+    scores = sorted(model.get("scores") or [], key=lambda s: s.get("source") != first)
+    parts = []
+    for score in scores:
+        source = sources.get(score.get("source"), {})
+        name = source.get("short") or score.get("benchmark") or score.get("source")
+        parts.append(f"{_word(source.get('task') or 'general')} {_score_value(score['score'], source)} ({name})")
+    if use != "general" and ranker and score_of(model, ranker["id"]) is None:
+        parts.insert(0, f"no {_word(use)} score yet")
+    return ", ".join(parts) or "none yet"
+
+
+def _billions(value: float) -> str:
+    if value >= 1000:
+        return f"{value / 1000:.1f}T"
+    return f"{value:.0f}B" if value >= 10 else f"{value:.1f}B"
+
+
+def _abilities_text(model: dict) -> str:
+    """What it can do, how much it takes in at once, and how big it is."""
+    parts = []
+    can = [_word(tag) for tag in model.get("good_at") or []]
+    parts.append("made for " + (", ".join(can) if can else "general use"))
+    tokens = model.get("context")
+    if tokens:
+        size = f"{tokens / (1 << 20):g}M" if tokens >= 1 << 20 else f"{tokens / 1024:.0f}K"
+        words = tokens * WORDS_PER_TOKEN
+        about = f"{words / 1e6:.1f}M" if words >= 1e6 else f"{words / 1e3:.0f}K"
+        parts.append(f"takes in {size} tokens at once (about {about} words)")
+    if model.get("params_b"):
+        size = f"{_billions(model['params_b'])} parameters"
+        if model.get("active_b"):
+            size += f", {_billions(model['active_b'])} at work per word"
+        parts.append(size)
+    return "; ".join(parts)
+
+
+def _pictures_text(model: dict) -> str:
+    pictures = model.get("pictures")
+    if not pictures:
+        return "to read pictures it also needs its mmproj file from the same page"
+    return (f"to read pictures it also needs {pictures['file']} ({pictures['bytes'] / GB:.1f} GB) "
+            "from the same page, counted in the memory above")
 
 
 def _machine_line(m: Machine) -> str:
@@ -375,14 +546,14 @@ def _machine_line(m: Machine) -> str:
             f"reads memory at {m.speed_gbs} GB/s")
 
 
-def _row_lines(row: dict, sources: dict, primary: str | None) -> list[str]:
+def _row_lines(row: dict, result: dict) -> list[str]:
     model, quant = row["model"], row["quant"]
     size = round(quant["bytes"] / GB, 1)
     owned = ", already on your machines" if quant.get("owned") else ""
     bits = bits_per_weight(model, quant)
-    squeeze = f", squeezed to {bits} bits a weight: weaker than its score" if squeezed(row) else ""
+    squeeze = f", squeezed to {bits} bits a weight: weaker than its scores" if squeezed(row) else ""
     lines = [f"  {model['name']} ({quant['quant']}, {size} GB file{owned}{squeeze})",
-             f"    strength: {_score_text(model, sources, primary)}"]
+             f"    scores: {_scores_text(model, result['sources'], result['use'], result['ranker'])}"]
     if row["group"] == "fast":
         split = ", ".join(f"{m['name']} {share} GB" for m, share in row["split"])
         lines.append(f"    held in memory: {split}; about {row['words_per_second']} words a second (estimate)")
@@ -390,36 +561,58 @@ def _row_lines(row: dict, sources: dict, primary: str | None) -> list[str]:
         lines.append(f"    {row['why']}: the engine sits on {row['home']['name']}; expect seconds per word")
     else:
         lines.append(f"    {row['why']}")
-    good = ", ".join(model.get("good_at") or [])
-    lines.append(f"    good at {good or 'general use'}; licence {model.get('licence') or 'unknown'}"
+    lines.append(f"    {_abilities_text(model)}")
+    if result["use"] == "vision":
+        lines.append(f"    {_pictures_text(model)}")
+    lines.append(f"    licence {model.get('licence') or 'unknown'}"
                  + (", needs a sign-in to download" if model.get("gated") else "")
                  + f"; from huggingface.co/{model['repo']}")
     return lines
 
 
+def _why_best(best: dict, result: dict) -> str:
+    use, ranker = result["use"], result["ranker"]
+    comfortable = best["group"] == "fast" and best["words_per_second"] >= COMFORT_WPS
+    speed = (f" of those here that should answer at {COMFORT_WPS:.0f} or more words a second"
+             + ("" if squeezed(best) else f", kept at {FULL_BITS} or more bits a weight")) if comfortable else " here"
+    if use == "general":
+        return f"    the strongest{speed}"
+    if ranker and score_of(best["model"], ranker["id"]) is not None:
+        return f"    the strongest at {USES[use]} by {ranker.get('short') or ranker['name']}{speed}"
+    if ranker:
+        return (f"    none of the models that run well here has a {_word(use)} score yet, "
+                f"so this is the strongest of them in general")
+    return f"    no {_word(use)} leaderboard on the list yet, so this is the strongest made for it in general"
+
+
 def report(result: dict, online: dict | None, new: list[dict]) -> list[str]:
-    sources, primary = result["sources"], result["primary"]
+    sources, use, ranker = result["sources"], result["use"], result["ranker"]
     lines = ["Your machines"] + [_machine_line(m) for m in result["machines"]]
     ready = [m for m in result["machines"] if m.get("reachable")]
     lines.append(f"  Together: room for {round(sum(max(m.room_gb, 0) for m in ready), 1)} GB of model in memory.")
     lines.append("")
     best = result["best"]
     if best:
-        lines.append("Best pick")
-        lines += _row_lines(best, sources, primary)
-        if best["group"] == "fast" and best["words_per_second"] >= COMFORT_WPS:
-            lines.append(f"    the strongest here that should answer at {COMFORT_WPS:.0f} or more words a second"
-                         + ("" if squeezed(best) else f", kept at {FULL_BITS} or more bits a weight"))
+        lines.append("Best pick" + ("" if use == "general" else f" for {USES[use]}"))
+        lines += _row_lines(best, result)
+        why = _why_best(best, result)
+        if why:
+            lines.append(why)
+        overall = result.get("overall")
+        if overall:
+            lines += ["", "Strongest overall here, by general score"] + _row_lines(overall, result)
     else:
-        lines.append("Nothing on the list runs on these machines.")
+        lines.append("Nothing on the list runs on these machines"
+                     + ("" if use == "general" else f" for {USES[use]}") + ".")
+    shown = {id(best), id(result.get("overall"))}
     for group, title, limit in (("fast", "Also fits in memory here", 4),
                                 ("slow", "Strongest that run slowly from disk (background work)", 2),
                                 ("no", "Won't run here", 4)):
-        rows = [r for r in result["groups"][group] if r is not best][:limit]
+        rows = [r for r in result["groups"][group] if id(r) not in shown][:limit]
         if rows:
             lines += ["", title]
             for row in rows:
-                lines += _row_lines(row, sources, primary) if group != "no" else [
+                lines += _row_lines(row, result) if group != "no" else [
                     f"  {row['model']['name']} ({round(row['quant']['bytes'] / GB, 1)} GB): {row['why']}"]
     lines.append("")
     if new:
@@ -434,24 +627,47 @@ def report(result: dict, online: dict | None, new: list[dict]) -> list[str]:
                      + (f", {online['missing']} missing" if online["missing"] else "")
                      + (f"; {online['repos'] - online['reached']} repos unreachable" if online["reached"] < online["repos"] else "")
                      + ".")
-    source = sources.get(primary, {})
-    lines.append(f"Strength from {source.get('name', 'no source')} ({source.get('url', '')}), read {source.get('read_on', '?')}.")
+    if ranker:
+        rest = ("." if result["covered"] == result["listed"] else
+                "; the rest come after them" + ("" if use == "general" else ", those made for it first") + ".")
+        lines.append(f"Ranked for {USES[use]} by {ranker['name']}: {result['covered']} of the "
+                     f"{result['listed']} models have a score{rest}")
+    elif use != "general":
+        lines.append(f"No {_word(use)} leaderboard on the list yet: ranked by general strength, "
+                     "models made for it first.")
+    lines.append("Where the scores come from (higher is better unless it says otherwise):")
+    for source in sources.values():
+        notes = []
+        if source.get("higher_is_better") is False:
+            notes.append("lower is better")
+        if source.get("self_reported"):
+            notes.append("the makers' own numbers")
+        lines.append(f"  {_word(source.get('task') or 'general')}: {source['name']}, {source.get('url', '')}, "
+                     f"read {source.get('read_on', '?')}" + (f" ({'; '.join(notes)})" if notes else ""))
     lines.append("Speeds are rough estimates; a short test run gives the real number. Room keeps a quarter of each "
                  "machine's memory, at least 2 GB, for the machine itself.")
     return lines
 
 
 def as_json(result: dict, online: dict | None, new: list[dict]) -> dict:
+    ranker = result["ranker"]
+
     def row(r: dict | None) -> dict | None:
         if r is None:
             return None
-        out = {"id": r["model"]["id"], "name": r["model"]["name"], "repo": r["model"]["repo"],
+        model = r["model"]
+        out = {"id": model["id"], "name": model["name"], "repo": model["repo"],
                "owned": bool(r["quant"].get("owned")),
                "quant": r["quant"]["quant"], "files": r["quant"]["files"], "bytes": r["quant"]["bytes"],
-               "group": r["group"], "need_gb": r["need_gb"], "strength": strength(r["model"], result["primary"]),
-               "licence": r["model"].get("licence"), "gated": r["model"].get("gated", False)}
-        if out["strength"] == float("-inf"):
-            out["strength"] = None
+               "group": r["group"], "need_gb": r["need_gb"], "strength": score_of(model, result["primary"]),
+               "use_score": score_of(model, ranker["id"]) if ranker else None,
+               "scores": [dict(s, task=result["sources"].get(s.get("source"), {}).get("task", "general"))
+                          for s in model.get("scores") or []],
+               "good_at": model.get("good_at") or [], "context_tokens": model.get("context"),
+               "params_b": model.get("params_b"), "active_b": model.get("active_b"),
+               "licence": model.get("licence"), "gated": model.get("gated", False)}
+        if model.get("pictures"):
+            out["pictures"] = model["pictures"]
         if r["group"] == "fast":
             out["split"] = [{"machine": m["name"], "gb": share} for m, share in r["split"]]
             out["words_per_second_estimate"] = r["words_per_second"]
@@ -462,7 +678,11 @@ def as_json(result: dict, online: dict | None, new: list[dict]) -> dict:
         return out
 
     return {"machines": [dict(m, room_gb=m.room_gb if m.get("reachable") else None) for m in result["machines"]],
-            "best": row(result["best"]), "groups": {g: [row(r) for r in rows] for g, rows in result["groups"].items()},
+            "use": result["use"], "ranked_by": ranker["id"] if ranker else None,
+            "scored": result["covered"], "listed": result["listed"],
+            "best": row(result["best"]), "overall": row(result.get("overall")),
+            "groups": {g: [row(r) for r in rows] for g, rows in result["groups"].items()},
+            "sources": list(result["sources"].values()),
             "online": online, "new": new, "primary": result["primary"], "as_of": result["as_of"]}
 
 
@@ -481,7 +701,7 @@ def mark_owned(models: list[dict]) -> str | None:
     return None
 
 
-def run(offline: bool = False, good_at: str | None = None, only: list[str] | None = None,
+def run(offline: bool = False, use: str = "general", only: list[str] | None = None,
         say: Callable[[str], None] = lambda _: None) -> tuple[dict, dict | None, list[dict]]:
     catalogue = builtin_list()
     mark_owned(catalogue["models"])
@@ -494,4 +714,4 @@ def run(offline: bool = False, good_at: str | None = None, only: list[str] | Non
             online = refresh(catalogue["models"])
             new = new_models({m["repo"] for m in catalogue["models"]})
         machines = machines_job.result()
-    return pick(machines, catalogue, good_at), online, new
+    return pick(machines, catalogue, use), online, new

@@ -1,21 +1,84 @@
 {
- "about": "Open models Orchard's picker knows, with exact file sizes read from Hugging Face and strength from the named public index. Read on the date in as_of; `orchard ai pick` re-checks sizes online unless told not to. A model with no score was not in the index's top entries for its size, which doesn't mean it is weak.",
+ "about": "Open models Orchard's picker knows, with exact file sizes read from Hugging Face, general strength from the named public index, and scores for coding, agents, reasoning, chat and pictures from independent leaderboards that run every model the same way. Read on the date in as_of; `orchard ai pick` re-checks sizes online unless told not to. A model with no score on a leaderboard wasn't found there, which doesn't mean it is weak.",
  "as_of": "2026-11-14",
  "primary": "aa-progress",
  "sources": [
   {
    "id": "aa-progress",
+   "task": "general",
+   "short": "Progress Index",
    "name": "Artificial Analysis Progress Index v1",
    "url": "https://artificialanalysis.ai/models/open-source",
    "read_on": "2026-11-14",
-   "what": "Read from its open-source size-class pages. Item-response-theory estimate of general capability across AA evaluations; pages /small, /medium, /large, /tiny each showed only the top 12 models, so a missing model is unscored in my data, not necessarily low."
+   "what": "Read from its open-source size-class pages. Item-response-theory estimate of general capability across AA evaluations; pages /small, /medium, /large, /tiny each showed only the top 12 models, so a model missing from this list is unscored here, not necessarily low."
   },
   {
    "id": "aa-intel",
+   "task": "general",
+   "short": "Intelligence Index",
    "name": "Artificial Analysis Intelligence Index v5.0.1",
    "url": "https://artificialanalysis.ai/leaderboards/models",
    "read_on": "2026-11-14",
    "what": "Composite of several evaluations (v5 launched 27 Oct 2026, harsh: about 60% private test sets, so scores are low and not comparable with earlier versions). Whole numbers; no Coding/Agentic sub-index shown on pages read."
+  },
+  {
+   "id": "aa-scicode",
+   "task": "coding",
+   "short": "SciCode",
+   "name": "SciCode (Artificial Analysis)",
+   "url": "https://artificialanalysis.ai/leaderboards/models",
+   "read_on": "2026-11-14",
+   "scale": "fraction",
+   "higher_is_better": true,
+   "self_reported": false,
+   "what": "SciCode: writing working scientific code for research sub-problems, scored by hidden unit tests; run by Artificial Analysis with one harness for every model. Score is the fraction solved (0 to 1). For each model the highest-effort reasoning variant that AA lists was used. Read from the model table in the page."
+  },
+  {
+   "id": "aa-automationbench",
+   "task": "agents",
+   "short": "AutomationBench",
+   "name": "AutomationBench-AA (Artificial Analysis)",
+   "url": "https://artificialanalysis.ai/leaderboards/models",
+   "read_on": "2026-11-14",
+   "scale": "fraction",
+   "higher_is_better": true,
+   "self_reported": false,
+   "what": "AutomationBench-AA: multi-step business workflow automation across apps (Gmail, Sheets, Slack, Salesforce, Jira and others) using tool calls, run by Artificial Analysis with one harness. Score is the partial-credit completion score (0 to 1), key 'automationbench-aa' in the embedded table. Highest-effort reasoning variant per model."
+  },
+  {
+   "id": "aa-hle",
+   "task": "reasoning",
+   "short": "Humanity's Last Exam",
+   "name": "Humanity's Last Exam (Artificial Analysis)",
+   "url": "https://artificialanalysis.ai/leaderboards/models",
+   "read_on": "2026-11-14",
+   "scale": "fraction",
+   "higher_is_better": true,
+   "self_reported": false,
+   "what": "Humanity's Last Exam as run by Artificial Analysis: expert-level questions needing multi-step reasoning, same harness for all models. Score is the fraction correct (0 to 1), key 'humanitys-last-exam'. Hard, so small models score near 0.04 to 0.15. Chosen over GPQA Diamond because it covers 26 of the 29 models (GPQA covers 21 and omits several of the newest large models). Highest-effort reasoning variant per model."
+  },
+  {
+   "id": "arena-text",
+   "task": "chat",
+   "short": "Text Arena rating",
+   "name": "LMArena Text leaderboard (style control, overall)",
+   "url": "https://huggingface.co/datasets/lmarena-ai/leaderboard-dataset",
+   "read_on": "2026-11-14",
+   "higher_is_better": true,
+   "self_reported": false,
+   "what": "Human blind pairwise preference votes on chat prompts, turned into an Elo-style rating with style control, 'overall' category. Rows read from the public Hugging Face dataset, config text_style_control, split latest, leaderboard_publish_date 2026-11-11. Rating around 1100 to 1500."
+  },
+  {
+   "id": "aa-mmmu-pro",
+   "task": "vision",
+   "short": "MMMU-Pro",
+   "name": "MMMU-Pro (Artificial Analysis)",
+   "url": "https://artificialanalysis.ai/leaderboards/models",
+   "read_on": "2026-11-14",
+   "scale": "fraction",
+   "higher_is_better": true,
+   "self_reported": false,
+   "what": "MMMU-Pro: college-level multimodal questions with images, run by Artificial Analysis with one harness. Score is the fraction correct (0 to 1), key 'mmmu-pro'. Only models that accept images have a score. Highest-effort reasoning variant per model."
   }
  ],
  "models": [
@@ -48,6 +111,24 @@
      "source": "aa-progress",
      "benchmark": "Progress Index v1",
      "score": 242
+    },
+    {
+     "source": "aa-scicode",
+     "benchmark": "SciCode",
+     "score": 0.2199,
+     "entry": "K2 Horizon 3.7B"
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.147,
+     "entry": "K2 Horizon 3.7B"
+    },
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.1386,
+     "entry": "K2 Horizon 3.7B"
     }
    ],
    "notes": "Maker repo file names say 4B; AA lists 3.7B. Needs llama.cpp b11454 or newer (per repo README). params_b is HF GGUF metadata (5.06B, includes embeddings); AA lists 3.7B."
@@ -80,6 +161,24 @@
      "source": "aa-progress",
      "benchmark": "Progress Index v1",
      "score": 221
+    },
+    {
+     "source": "aa-scicode",
+     "benchmark": "SciCode",
+     "score": 0.2627,
+     "entry": "MiniCPM5-2B"
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.018,
+     "entry": "MiniCPM5-2B"
+    },
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.0894,
+     "entry": "MiniCPM5-2B"
     }
    ],
    "notes": ""
@@ -117,7 +216,24 @@
      "bytes": 1759997088
     }
    ],
-   "scores": [],
+   "pictures": {
+    "file": "mmproj-F16.gguf",
+    "bytes": 672423616
+   },
+   "scores": [
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.0992,
+     "entry": "Qwen3.5 4B (Reasoning)"
+    },
+    {
+     "source": "aa-mmmu-pro",
+     "benchmark": "MMMU-Pro",
+     "score": 0.6538,
+     "entry": "Qwen3.5 4B (Reasoning)"
+    }
+   ],
    "notes": "No AA score read (AA listing shows only the 2B of this family in its tiny top 12)."
   },
   {
@@ -153,7 +269,36 @@
      "bytes": 3545083008
     }
    ],
-   "scores": [],
+   "pictures": {
+    "file": "mmproj-F16.gguf",
+    "bytes": 990372672
+   },
+   "scores": [
+    {
+     "source": "aa-scicode",
+     "benchmark": "SciCode",
+     "score": 0.2442,
+     "entry": "Gemma 4 E4B (Reasoning)"
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.0046,
+     "entry": "Gemma 4 E4B (Reasoning)"
+    },
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.0375,
+     "entry": "Gemma 4 E4B (Reasoning)"
+    },
+    {
+     "source": "aa-mmmu-pro",
+     "benchmark": "MMMU-Pro",
+     "score": 0.5139,
+     "entry": "Gemma 4 E4B (Reasoning)"
+    }
+   ],
    "notes": "4.5B effective, 8B with embeddings (model card of the 12B repo family table). No AA score read."
   },
   {
@@ -189,7 +334,36 @@
      "bytes": 3649365216
     }
    ],
-   "scores": [],
+   "pictures": {
+    "file": "mmproj-F16.gguf",
+    "bytes": 918166080
+   },
+   "scores": [
+    {
+     "source": "aa-scicode",
+     "benchmark": "SciCode",
+     "score": 0.2951,
+     "entry": "Qwen3.5 9B (Reasoning)"
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.0105,
+     "entry": "Qwen3.5 9B (Reasoning)"
+    },
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.1492,
+     "entry": "Qwen3.5 9B (Reasoning)"
+    },
+    {
+     "source": "aa-mmmu-pro",
+     "benchmark": "MMMU-Pro",
+     "score": 0.6925,
+     "entry": "Qwen3.5 9B (Reasoning)"
+    }
+   ],
    "notes": "No AA score read."
   },
   {
@@ -226,7 +400,30 @@
      "bytes": 4213353280
     }
    ],
-   "scores": [],
+   "pictures": {
+    "file": "mmproj-F16.gguf",
+    "bytes": 175115840
+   },
+   "scores": [
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.0069,
+     "entry": "Gemma 4 12B (Reasoning)"
+    },
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.1566,
+     "entry": "Gemma 4 12B (Reasoning)"
+    },
+    {
+     "source": "aa-mmmu-pro",
+     "benchmark": "MMMU-Pro",
+     "score": 0.6965,
+     "entry": "Gemma 4 12B (Reasoning)"
+    }
+   ],
    "notes": "Model card lists 11.95B params. No AA score read."
   },
   {
@@ -261,7 +458,32 @@
      "bytes": 11468317888
     }
    ],
-   "scores": [],
+   "scores": [
+    {
+     "source": "aa-scicode",
+     "benchmark": "SciCode",
+     "score": 0.3889,
+     "entry": "gpt-oss-20b (High)"
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.0019,
+     "entry": "gpt-oss-20b (High)"
+    },
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.1098,
+     "entry": "gpt-oss-20b (High)"
+    },
+    {
+     "source": "arena-text",
+     "benchmark": "Text Arena rating",
+     "score": 1317.5,
+     "entry": "gpt-oss-20b"
+    }
+   ],
    "notes": "Model card: 21B params, 3.6B active. Older (Aug 2025 release; repo updated Dec 2025). No AA score read."
   },
   {
@@ -297,7 +519,42 @@
      "bytes": 10014755296
     }
    ],
-   "scores": [],
+   "pictures": {
+    "file": "mmproj-F16.gguf",
+    "bytes": 1193058784
+   },
+   "scores": [
+    {
+     "source": "aa-scicode",
+     "benchmark": "SciCode",
+     "score": 0.4005,
+     "entry": "Gemma 4 26B A4B (Reasoning)"
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.0194,
+     "entry": "Gemma 4 26B A4B (Reasoning)"
+    },
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.1932,
+     "entry": "Gemma 4 26B A4B (Reasoning)"
+    },
+    {
+     "source": "aa-mmmu-pro",
+     "benchmark": "MMMU-Pro",
+     "score": 0.6925,
+     "entry": "Gemma 4 26B A4B (Reasoning)"
+    },
+    {
+     "source": "arena-text",
+     "benchmark": "Text Arena rating",
+     "score": 1437.4,
+     "entry": "Gemma 4 26B A4B"
+    }
+   ],
    "notes": "Model card: 25.2B total, 3.8B active. No AA score read."
   },
   {
@@ -315,7 +572,8 @@
     "coding",
     "agents",
     "reasoning",
-    "chat"
+    "chat",
+    "vision"
    ],
    "quants": [
     {
@@ -333,6 +591,10 @@
      "bytes": 7206043648
     }
    ],
+   "pictures": {
+    "file": "mmproj-F16.gguf",
+    "bytes": 927607488
+   },
    "scores": [
     {
      "source": "aa-progress",
@@ -343,6 +605,36 @@
      "source": "aa-intel",
      "benchmark": "Intelligence Index v5.0.1",
      "score": 20
+    },
+    {
+     "source": "aa-scicode",
+     "benchmark": "SciCode",
+     "score": 0.4664,
+     "entry": "Qwen3.8 27B (Xhigh)"
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.4824,
+     "entry": "Qwen3.8 27B (Xhigh)"
+    },
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.3392,
+     "entry": "Qwen3.8 27B (Xhigh)"
+    },
+    {
+     "source": "aa-mmmu-pro",
+     "benchmark": "MMMU-Pro",
+     "score": 0.763,
+     "entry": "Qwen3.8 27B (Xhigh)"
+    },
+    {
+     "source": "arena-text",
+     "benchmark": "Text Arena rating",
+     "score": 1433.8,
+     "entry": "Qwen3.8-27B"
     }
    ],
    "notes": "Dense. Scores are AA 'Xhigh' reasoning variant. Unsloth quants are the UD (dynamic) ones."
@@ -383,6 +675,12 @@
      "source": "aa-progress",
      "benchmark": "Progress Index v1",
      "score": 306
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.5312,
+     "entry": "Nanbeige4.3-33B"
     }
    ],
    "notes": "Top of AA small-model Progress Index list. Dense llama architecture. Repo is bartowski's, not the maker's."
@@ -421,6 +719,10 @@
      "bytes": 10752820160
     }
    ],
+   "pictures": {
+    "file": "mmproj-F16.gguf",
+    "bytes": 1198957024
+   },
    "scores": [
     {
      "source": "aa-progress",
@@ -431,6 +733,36 @@
      "source": "aa-intel",
      "benchmark": "Intelligence Index v5.0.1",
      "score": 4
+    },
+    {
+     "source": "aa-scicode",
+     "benchmark": "SciCode",
+     "score": 0.4549,
+     "entry": "Gemma 4 31B (Reasoning)"
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.0493,
+     "entry": "Gemma 4 31B (Reasoning)"
+    },
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.2363,
+     "entry": "Gemma 4 31B (Reasoning)"
+    },
+    {
+     "source": "aa-mmmu-pro",
+     "benchmark": "MMMU-Pro",
+     "score": 0.7341,
+     "entry": "Gemma 4 31B (Reasoning)"
+    },
+    {
+     "source": "arena-text",
+     "benchmark": "Text Arena rating",
+     "score": 1451.8,
+     "entry": "Gemma 4 31B"
     }
    ],
    "notes": "Dense, 30.7B. AA scores are the Reasoning variant."
@@ -495,11 +827,39 @@
      "bytes": 11522702304
     }
    ],
+   "pictures": {
+    "file": "mmproj-F16.gguf",
+    "bytes": 899283680
+   },
    "scores": [
     {
      "source": "aa-progress",
      "benchmark": "Progress Index v1",
      "score": 261
+    },
+    {
+     "source": "aa-scicode",
+     "benchmark": "SciCode",
+     "score": 0.3657,
+     "entry": "Qwen3.6 35B A3B (Reasoning)"
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.0521,
+     "entry": "Qwen3.6 35B A3B (Reasoning)"
+    },
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.2224,
+     "entry": "Qwen3.6 35B A3B (Reasoning)"
+    },
+    {
+     "source": "aa-mmmu-pro",
+     "benchmark": "MMMU-Pro",
+     "score": 0.7503,
+     "entry": "Qwen3.6 35B A3B (Reasoning)"
     }
    ],
    "notes": "AA score is the Reasoning variant."
@@ -540,6 +900,24 @@
      "source": "aa-progress",
      "benchmark": "Progress Index v1",
      "score": 281
+    },
+    {
+     "source": "aa-scicode",
+     "benchmark": "SciCode",
+     "score": 0.4005,
+     "entry": "K2 Horizon MoVA 36B A4B"
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.261,
+     "entry": "K2 Horizon MoVA 36B A4B"
+    },
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.2345,
+     "entry": "K2 Horizon MoVA 36B A4B"
     }
    ],
    "notes": "Maker also publishes IFM/K2-Horizon-MoVA-36B-A4B-GGUF; bartowski used here for the quant spread."
@@ -573,6 +951,30 @@
      "source": "aa-intel",
      "benchmark": "Intelligence Index v5.0.1",
      "score": 6
+    },
+    {
+     "source": "aa-scicode",
+     "benchmark": "SciCode",
+     "score": 0.3206,
+     "entry": "Nemotron 3.5 Lightning"
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.0084,
+     "entry": "Nemotron 3.5 Lightning"
+    },
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.1057,
+     "entry": "Nemotron 3.5 Lightning"
+    },
+    {
+     "source": "arena-text",
+     "benchmark": "Text Arena rating",
+     "score": 1351.5,
+     "entry": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B (NVFP4)"
     }
    ],
    "notes": "AA Intelligence Index entry is 'Nemotron 3.5 Lightning'. Only Q4_0 and Q8_0 in this repo. Active 3B taken from the repo name (A3B)."
@@ -602,11 +1004,33 @@
      "bytes": 22018326528
     }
    ],
+   "pictures": {
+    "file": "mmproj-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf",
+    "bytes": 1733692736
+   },
    "scores": [
     {
      "source": "aa-progress",
      "benchmark": "Progress Index v1",
      "score": 269
+    },
+    {
+     "source": "aa-scicode",
+     "benchmark": "SciCode",
+     "score": 0.397,
+     "entry": "Nemotron 3.5 Bolt 74B-A9B"
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.1546,
+     "entry": "Nemotron 3.5 Bolt 74B-A9B"
+    },
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.2465,
+     "entry": "Nemotron 3.5 Bolt 74B-A9B"
     }
    ],
    "notes": "Native 2-bit quantisation built to fit 24 GB; single file is the only quant. AA score is for the model family entry 'Nemotron 3.5 Bolt 74B-A9B'. Model card: 74B total, 9B active."
@@ -647,6 +1071,24 @@
      "source": "aa-progress",
      "benchmark": "Progress Index v1",
      "score": 227
+    },
+    {
+     "source": "aa-scicode",
+     "benchmark": "SciCode",
+     "score": 0.3623,
+     "entry": "Qwen3 Coder Next"
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.0106,
+     "entry": "Qwen3 Coder Next"
+    },
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.1015,
+     "entry": "Qwen3 Coder Next"
     }
    ],
    "notes": "Older (March 2026). Coding specialist."
@@ -686,6 +1128,30 @@
      "source": "aa-intel",
      "benchmark": "Intelligence Index v5.0.1",
      "score": 4
+    },
+    {
+     "source": "aa-scicode",
+     "benchmark": "SciCode",
+     "score": 0.3403,
+     "entry": "gpt-oss-120b (High)"
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.002,
+     "entry": "gpt-oss-120b (High)"
+    },
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.196,
+     "entry": "gpt-oss-120b (High)"
+    },
+    {
+     "source": "arena-text",
+     "benchmark": "Text Arena rating",
+     "score": 1351.8,
+     "entry": "gpt-oss-120b"
     }
    ],
    "notes": "Native MXFP4 file, no other quant in the maker-run repo. AA entries are the High reasoning variant."
@@ -725,11 +1191,45 @@
      "bytes": 39148942528
     }
    ],
+   "pictures": {
+    "file": "mmproj-F16.gguf",
+    "bytes": 908724960
+   },
    "scores": [
     {
      "source": "aa-progress",
      "benchmark": "Progress Index v1",
      "score": 261
+    },
+    {
+     "source": "aa-scicode",
+     "benchmark": "SciCode",
+     "score": 0.397,
+     "entry": "Qwen3.5 122B A10B (Reasoning)"
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.0548,
+     "entry": "Qwen3.5 122B A10B (Reasoning)"
+    },
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.2521,
+     "entry": "Qwen3.5 122B A10B (Reasoning)"
+    },
+    {
+     "source": "aa-mmmu-pro",
+     "benchmark": "MMMU-Pro",
+     "score": 0.7497,
+     "entry": "Qwen3.5 122B A10B (Reasoning)"
+    },
+    {
+     "source": "arena-text",
+     "benchmark": "Text Arena rating",
+     "score": 1416.4,
+     "entry": "Qwen3.5-122B-A10B"
     }
    ],
    "notes": "AA score is the Reasoning variant."
@@ -748,7 +1248,8 @@
    "good_at": [
     "chat",
     "reasoning",
-    "agents"
+    "agents",
+    "vision"
    ],
    "quants": [
     {
@@ -768,11 +1269,39 @@
      "bytes": 37574987456
     }
    ],
+   "pictures": {
+    "file": "mmproj-F16.gguf",
+    "bytes": 857078496
+   },
    "scores": [
     {
      "source": "aa-intel",
      "benchmark": "Intelligence Index v5.0.1",
      "score": 4
+    },
+    {
+     "source": "aa-scicode",
+     "benchmark": "SciCode",
+     "score": 0.3877,
+     "entry": "Mistral Small 4 (Reasoning)"
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.0096,
+     "entry": "Mistral Small 4 (Reasoning)"
+    },
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.0987,
+     "entry": "Mistral Small 4 (Reasoning)"
+    },
+    {
+     "source": "aa-mmmu-pro",
+     "benchmark": "MMMU-Pro",
+     "score": 0.5682,
+     "entry": "Mistral Small 4 (Reasoning)"
     }
    ],
    "notes": "MoE with 128 experts, 4 active per token (model card); active parameter count not stated in the card text read, so null. AA entry is 'Mistral Small 4 Reasoning'."
@@ -790,7 +1319,8 @@
    "llama_cpp": true,
    "good_at": [
     "chat",
-    "agents"
+    "agents",
+    "vision"
    ],
    "quants": [
     {
@@ -810,11 +1340,45 @@
      "bytes": 34937742432
     }
    ],
+   "pictures": {
+    "file": "mmproj-F16.gguf",
+    "bytes": 5356846528
+   },
    "scores": [
     {
      "source": "aa-progress",
      "benchmark": "Progress Index v1",
      "score": 257
+    },
+    {
+     "source": "aa-scicode",
+     "benchmark": "SciCode",
+     "score": 0.4016,
+     "entry": "Mistral Medium 3.5"
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.063,
+     "entry": "Mistral Medium 3.5"
+    },
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.1376,
+     "entry": "Mistral Medium 3.5"
+    },
+    {
+     "source": "aa-mmmu-pro",
+     "benchmark": "MMMU-Pro",
+     "score": 0.6486,
+     "entry": "Mistral Medium 3.5"
+    },
+    {
+     "source": "arena-text",
+     "benchmark": "Text Arena rating",
+     "score": 1426.4,
+     "entry": "Mistral Medium 3.5"
     }
    ],
    "notes": "Dense (AA lists no active params). HF licence field says 'other'."
@@ -833,7 +1397,8 @@
    "good_at": [
     "coding",
     "agents",
-    "reasoning"
+    "reasoning",
+    "vision"
    ],
    "quants": [
     {
@@ -866,11 +1431,39 @@
      "bytes": 93672359738
     }
    ],
+   "pictures": {
+    "file": "mmproj-F16.gguf",
+    "bytes": 904004000
+   },
    "scores": [
     {
      "source": "aa-progress",
      "benchmark": "Progress Index v1",
      "score": 320
+    },
+    {
+     "source": "aa-scicode",
+     "benchmark": "SciCode",
+     "score": 0.5058,
+     "entry": "Qwen3.8-Flash-Next"
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.5591,
+     "entry": "Qwen3.8-Flash-Next"
+    },
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.3804,
+     "entry": "Qwen3.8-Flash-Next"
+    },
+    {
+     "source": "aa-mmmu-pro",
+     "benchmark": "MMMU-Pro",
+     "score": 0.7861,
+     "entry": "Qwen3.8-Flash-Next"
     }
    ],
    "notes": "Brand new (repo updated 2026-11-13); arch 'qwen4exp'. Unsloth says run it with llama.cpp. Not in AA Intelligence Index list read."
@@ -923,11 +1516,39 @@
      "bytes": 156822111200
     }
    ],
+   "pictures": {
+    "file": "mmproj-F16.gguf",
+    "bytes": 1128047296
+   },
    "scores": [
     {
      "source": "aa-progress",
      "benchmark": "Progress Index v1",
      "score": 319
+    },
+    {
+     "source": "aa-scicode",
+     "benchmark": "SciCode",
+     "score": 0.5162,
+     "entry": "GLM-5.3-Flash"
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.6037,
+     "entry": "GLM-5.3-Flash"
+    },
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.3985,
+     "entry": "GLM-5.3-Flash"
+    },
+    {
+     "source": "arena-text",
+     "benchmark": "Text Arena rating",
+     "score": 1475.3,
+     "entry": "GLM-5.3-Flash"
     }
    ],
    "notes": "Native multimodal. Repo README points to a llama.cpp pull request, which GitHub shows closed and not merged; a GLM5-next code path is mentioned in other open PRs, so mainline status is unclear."
@@ -945,7 +1566,8 @@
    "llama_cpp": false,
    "good_at": [
     "coding",
-    "agents"
+    "agents",
+    "vision"
    ],
    "quants": [
     {
@@ -982,11 +1604,39 @@
      "bytes": 249402105310
     }
    ],
+   "pictures": {
+    "file": "mmproj-BF16.gguf",
+    "bytes": 1735294720
+   },
    "scores": [
     {
      "source": "aa-progress",
      "benchmark": "Progress Index v1",
      "score": 318
+    },
+    {
+     "source": "aa-scicode",
+     "benchmark": "SciCode",
+     "score": 0.5336,
+     "entry": "MiniMax-M3.1-Flash"
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.7252,
+     "entry": "MiniMax-M3.1-Flash"
+    },
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.4796,
+     "entry": "MiniMax-M3.1-Flash"
+    },
+    {
+     "source": "aa-mmmu-pro",
+     "benchmark": "MMMU-Pro",
+     "score": 0.7913,
+     "entry": "MiniMax-M3.1-Flash"
     }
    ],
    "notes": "Repo says it needs a llama.cpp build with M3.1 support; a llama.cpp pull request 'add MiniMax-M3.1' was still open when read."
@@ -1005,7 +1655,8 @@
    "good_at": [
     "chat",
     "agents",
-    "reasoning"
+    "reasoning",
+    "vision"
    ],
    "quants": [
     {
@@ -1032,11 +1683,45 @@
      "bytes": 204969271289
     }
    ],
+   "pictures": {
+    "file": "mmproj-F16.gguf",
+    "bytes": 658223104
+   },
    "scores": [
     {
      "source": "aa-intel",
      "benchmark": "Intelligence Index v5.0.1",
      "score": 31
+    },
+    {
+     "source": "aa-scicode",
+     "benchmark": "SciCode",
+     "score": 0.5231,
+     "entry": "Inkling 2 Small"
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.4562,
+     "entry": "Inkling 2 Small"
+    },
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.4411,
+     "entry": "Inkling 2 Small"
+    },
+    {
+     "source": "aa-mmmu-pro",
+     "benchmark": "MMMU-Pro",
+     "score": 0.8156,
+     "entry": "Inkling 2 Small"
+    },
+    {
+     "source": "arena-text",
+     "benchmark": "Text Arena rating",
+     "score": 1411.8,
+     "entry": "Inkling 2 Small"
     }
    ],
    "notes": "594B total, 17B active (repo README). New 'inkling2' architecture: llama.cpp PRs / still open when read, so mainline cannot run it yet."
@@ -1107,6 +1792,24 @@
      "source": "aa-intel",
      "benchmark": "Intelligence Index v5.0.1",
      "score": 30
+    },
+    {
+     "source": "aa-scicode",
+     "benchmark": "SciCode",
+     "score": 0.5683,
+     "entry": "Ling 3.1 Flash 1019"
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.6755,
+     "entry": "Ling 3.1 Flash 1019"
+    },
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.4347,
+     "entry": "Ling 3.1 Flash 1019"
     }
    ],
    "notes": "Repo is bartowski's, quantised with llama.cpp b11913 (so mainline supports it)."
@@ -1125,7 +1828,8 @@
    "good_at": [
     "coding",
     "agents",
-    "reasoning"
+    "reasoning",
+    "vision"
    ],
    "quants": [
     {
@@ -1178,6 +1882,10 @@
      "bytes": 394736596867
     }
    ],
+   "pictures": {
+    "file": "mmproj-F16.gguf",
+    "bytes": 971004064
+   },
    "scores": [
     {
      "source": "aa-progress",
@@ -1188,9 +1896,33 @@
      "source": "aa-intel",
      "benchmark": "Intelligence Index v5.0.1",
      "score": 33
+    },
+    {
+     "source": "aa-scicode",
+     "benchmark": "SciCode",
+     "score": 0.559,
+     "entry": "DeepSeek V4.1 Flash 1017 (Max)"
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.6664,
+     "entry": "DeepSeek V4.1 Flash 1017 (Max)"
+    },
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.4333,
+     "entry": "DeepSeek V4.1 Flash 1017 (Max)"
+    },
+    {
+     "source": "aa-mmmu-pro",
+     "benchmark": "MMMU-Pro",
+     "score": 0.8064,
+     "entry": "DeepSeek V4.1 Flash 1017 (Max)"
     }
    ],
-   "notes": "unsloth/DeepSeek-V4.1-Flash-GGUF returned HTTP 401 (no such repo); the 1017 update repo is used. AA lists 552B total; HF GGUF metadata counts 748.5B (not reconciled). Repo README says use unsloth's llama.cpp PR or Unsloth Desktop; llama.cpp merged PRs mention DeepSeek-V4/V4.1 so mainline support is likely but unproven. Runs on the llama.cpp release Orchard's build script uses: Orchard's own runs of the UD-IQ2_XXS files, reading from disk on a 4 core laptop with a borrowed GPU, gave 3.1 to 4.1 s per word."
+   "notes": "unsloth/DeepSeek-V4.1-Flash-GGUF returned HTTP 401 (no such repo); the 1017 update repo is used. AA lists 552B total; HF GGUF metadata counts 748.5B (not reconciled). Repo README says use unsloth's llama.cpp PR or Unsloth Desktop; llama.cpp merged PRs mention DeepSeek-V4/V4.1 so mainline support is likely but unproven. Runs on the llama.cpp release Orchard's build script uses: Orchard's own runs of the UD-IQ2_XXS files, reading from disk on one 4 core machine, gave 3.1 to 4.1 s per word."
   },
   {
    "id": "glm-5.3",
@@ -1261,6 +1993,30 @@
      "source": "aa-intel",
      "benchmark": "Intelligence Index v5.0.1",
      "score": 32
+    },
+    {
+     "source": "aa-scicode",
+     "benchmark": "SciCode",
+     "score": 0.5903,
+     "entry": "GLM-5.3 (Max)"
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.622,
+     "entry": "GLM-5.3 (Max)"
+    },
+    {
+     "source": "aa-hle",
+     "benchmark": "Humanity's Last Exam",
+     "score": 0.4226,
+     "entry": "GLM-5.3 (Max)"
+    },
+    {
+     "source": "arena-text",
+     "benchmark": "Text Arena rating",
+     "score": 1481.6,
+     "entry": "GLM-5.3 (Max)"
     }
    ],
    "notes": "Model card calls it the most capable open-weights model for coding (maker's claim). Licence 'other'."
@@ -1319,6 +2075,18 @@
      "source": "aa-intel",
      "benchmark": "Intelligence Index v5.0.1",
      "score": 26
+    },
+    {
+     "source": "aa-automationbench",
+     "benchmark": "AutomationBench",
+     "score": 0.5783,
+     "entry": "Mistral Large 4 (High)"
+    },
+    {
+     "source": "arena-text",
+     "benchmark": "Text Arena rating",
+     "score": 1420.4,
+     "entry": "Mistral Large 4"
     }
    ],
    "notes": "Support merged: a llama.cpp pull request closed merged 2026-10-29. AA entry 'Mistral Large 4 (High)'. Even IQ2_XXS is ~298 GB."

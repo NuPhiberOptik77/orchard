@@ -3,7 +3,7 @@ import json
 import pytest
 from typer.testing import CliRunner
 
-from orchard import ai, ai_pick, cli
+from orchard import ai, ai_pick, cli, cli_agentic
 
 runner = CliRunner()
 GIB = 1024
@@ -36,8 +36,8 @@ def model(mid, score, gb, *, active=None, params=30.0, good_at=("coding",), quan
 
 def catalogue(*models):
     return {"as_of": "2026-11-14", "primary": "idx",
-            "sources": [{"id": "idx", "name": "Some Index", "url": "https://example.org", "read_on": "2026-11-14",
-                         "what": "general"}],
+            "sources": [{"id": "idx", "task": "general", "name": "Some Index", "url": "https://example.org",
+                         "read_on": "2026-11-14", "what": "general"}],
             "models": list(models)}
 
 
@@ -121,7 +121,7 @@ def test_only_models_good_at_what_was_asked():
     result = ai_pick.pick(fleet(), catalogue(model("coder", 60, 5.0), model("talker", 70, 5.0, good_at=("chat",))))
     assert result["best"]["model"]["id"] == "talker"
     result = ai_pick.pick(fleet(), catalogue(model("coder", 60, 5.0), model("talker", 70, 5.0, good_at=("chat",))),
-                          good_at="coding")
+                          use="coding")
     assert result["best"]["model"]["id"] == "coder"
 
 
@@ -201,7 +201,10 @@ def test_the_report_says_where_it_runs_and_where_the_numbers_come_from():
                                     [{"repo": "unsloth/New-GGUF", "downloads": 1200, "modified": ""}]))
     assert "Best pick\n  Strong (Q4_K_M, 18.0 GB file)" in text
     assert "held in memory: this Mac" in text and "(estimate)" in text
-    assert "60 on the Some Index (read 2026-11-14)" in text
+    assert "scores: general 60 (Index)" in text
+    assert "made for coding; takes in 32K tokens at once (about 25K words); 30B parameters, 3.0B at work per word" in text
+    assert "general: Some Index, https://example.org, read 2026-11-14" in text
+    assert "Ranked for a bit of everything by Some Index: 1 of the 1 models have a score." in text
     assert "Sizes checked on Hugging Face just now: 1 files" in text
     assert "huggingface.co/unsloth/New-GGUF (1,200 downloads in the last month)" in text
 
@@ -232,6 +235,16 @@ def test_the_built_in_list_is_complete_and_sourced():
             assert quant["files"] and quant["bytes"] > 0 and all(f.endswith(".gguf") for f in quant["files"]), m["id"]
         for score in m.get("scores") or []:
             assert score["source"] in sources and isinstance(score["score"], (int, float)), m["id"]
+        if "vision" in m["good_at"]:
+            assert m["pictures"]["file"].endswith(".gguf") and m["pictures"]["bytes"] > 0, m["id"]
+    for source in data["sources"]:
+        assert source["task"] in ai_pick.USES and source["url"].startswith("https://") and source["read_on"], source
+    # Every use but general has its own leaderboard, and it scores most of the list.
+    for use in ai_pick.USES:
+        ranker = ai_pick.ranking_source(data, use)
+        assert ranker and not ranker.get("self_reported"), use
+        if use != "vision":
+            assert sum(ai_pick.score_of(m, ranker["id"]) is not None for m in data["models"]) >= 12, use
 
 
 def test_the_best_pick_is_the_strongest_that_is_comfortable_to_use():
@@ -280,3 +293,160 @@ def test_a_squeezed_model_is_flagged_and_not_the_best_pick():
     text = "\n".join(ai_pick.report(result, None, []))
     assert "squeezed to 2.9 bits a weight: weaker than its score" in text
     assert ai_pick.pick(fleet(), catalogue(squeezed))["best"]["model"]["id"] == "squeezed"  # better than nothing
+
+
+# What it's for.
+
+def coding_catalogue(*models, higher_is_better=True):
+    cat = catalogue(*models)
+    cat["sources"].append({"id": "code", "task": "coding", "short": "CodeBench", "name": "CodeBench (someone)",
+                           "url": "https://example.org/code", "read_on": "2026-11-13", "scale": "fraction",
+                           "higher_is_better": higher_is_better})
+    return cat
+
+
+def with_score(m, source, score):
+    m["scores"].append({"source": source, "benchmark": source, "score": score})
+    return m
+
+
+def test_a_use_is_named_by_word_or_number():
+    assert ai_pick.resolve_use("1") == "coding" and ai_pick.resolve_use(" Images ") == "vision"
+    assert ai_pick.resolve_use("maths") == "reasoning" and ai_pick.resolve_use("everything") == "general"
+    for bad in ("7", "0", "cooking", ""):
+        with pytest.raises(ValueError):
+            ai_pick.resolve_use(bad)
+
+
+def test_the_question_takes_a_number_and_enter_means_everything():
+    said = []
+    answers = iter(["cooking\n", "3\n"])
+    assert ai_pick.ask_use(lambda prompt: next(answers), said.append) == "chat"
+    assert said[0] == "What will you use it for?" and "  5 reading pictures" in said and "isn't one Orchard knows" in said[-1]
+    assert ai_pick.ask_use(lambda prompt: "\n", said.append) == "general"
+
+    def closed(prompt):
+        raise EOFError
+
+    assert ai_pick.ask_use(closed, said.append) == "general"
+
+
+def test_a_task_ranks_by_its_own_leaderboard_and_says_who_has_no_score():
+    unscored = model("unscored", 90, 5.0)  # strongest in general, no coding score
+    weak = with_score(model("weak", 50, 5.0), "code", 0.4)
+    strong = with_score(model("strong", 70, 5.0, good_at=("chat",)), "code", 0.6)
+    result = ai_pick.pick(fleet(), coding_catalogue(unscored, weak, strong), use="coding")
+    assert [r["model"]["id"] for r in result["groups"]["fast"]] == ["strong", "weak", "unscored"]
+    assert result["best"]["model"]["id"] == "strong" and result["overall"]["model"]["id"] == "unscored"
+    text = "\n".join(ai_pick.report(result, None, []))
+    assert "Best pick for coding\n  Strong" in text
+    assert "scores: coding 60.0% (CodeBench), general 70 (Index)" in text
+    assert "the strongest at coding by CodeBench of those here that should answer at 2 or more words a second" in text
+    assert "Strongest overall here, by general score\n  Unscored" in text
+    assert "scores: no coding score yet, general 90 (Index)" in text
+    assert "Ranked for coding by CodeBench (someone): 2 of the 3 models have a score; the rest come after them" in text
+    assert "coding: CodeBench (someone), https://example.org/code, read 2026-11-13" in text
+    # Ranked generally, the same three go by their general score.
+    general = ai_pick.pick(fleet(), coding_catalogue(unscored, weak, strong))
+    assert general["best"]["model"]["id"] == "unscored" and general["overall"] is None
+
+
+def test_lower_is_better_leaderboards_rank_the_other_way():
+    first = with_score(model("first", 50, 5.0), "code", 2)
+    tenth = with_score(model("tenth", 90, 5.0), "code", 10)
+    result = ai_pick.pick(fleet(), coding_catalogue(first, tenth, higher_is_better=False), use="coding")
+    assert result["best"]["model"]["id"] == "first"
+    assert "(lower is better)" in "\n".join(ai_pick.report(result, None, []))
+
+
+def test_without_a_leaderboard_for_the_task_models_made_for_it_come_first():
+    result = ai_pick.pick(fleet(), catalogue(model("talker", 90, 5.0, good_at=("chat",)), model("coder", 60, 5.0)),
+                          use="coding")
+    assert result["best"]["model"]["id"] == "coder"
+    text = "\n".join(ai_pick.report(result, None, []))
+    assert "No coding leaderboard on the list yet: ranked by general strength, models made for it first." in text
+
+
+def test_pictures_need_a_model_that_reads_them_and_room_for_its_picture_file():
+    seer = model("seer", 60, 10.0, good_at=("chat", "vision"), pictures={"file": "mmproj-F16.gguf", "bytes": int(2e9)})
+    blind = model("blind", 90, 5.0)
+    result = ai_pick.pick(fleet(), catalogue(seer, blind), use="vision")
+    assert [r["model"]["id"] for g in result["groups"].values() for r in g] == ["seer"]
+    assert result["best"]["need_gb"] == 14.0  # 10 GB file, a tenth more, 1 GB working memory, 2 GB picture file
+    text = "\n".join(ai_pick.report(result, None, []))
+    assert "made for chat, pictures" in text
+    assert "to read pictures it also needs mmproj-F16.gguf (2.0 GB) from the same page, counted in the memory above" in text
+    assert ai_pick.pick(fleet(), catalogue(seer))["best"]["need_gb"] == 12.0  # not counted for other uses
+
+
+def test_the_picture_file_is_found_in_the_repo():
+    files = {"m-Q4.gguf": 9, "mmproj-F32.gguf": 4, "mmproj-BF16.gguf": 2, "mmproj-F16.gguf": 2, "x/mmproj-F16.gguf_file": 1}
+    assert ai_pick.picture_file(files) == {"file": "mmproj-F16.gguf", "bytes": 2}
+    assert ai_pick.picture_file({"mmproj-model.gguf": 3}) == {"file": "mmproj-model.gguf", "bytes": 3}
+    assert ai_pick.picture_file({"m-Q4.gguf": 9}) is None
+    seer = model("seer", 60, 10.0, good_at=("vision",))
+    ai_pick.refresh([seer], lambda repo: {"seer-Q4_K_M.gguf": 10, "mmproj-F16.gguf": 7})
+    assert seer["pictures"] == {"file": "mmproj-F16.gguf", "bytes": 7}
+
+
+# What the Checker found.
+
+def test_no_machine_answering_is_said_not_crashed():
+    gone = ai_pick.Machine(name="old-mac", target="old-mac", reachable=False, why="timed out")
+    for machines in ([], [gone]):
+        result = ai_pick.pick(machines, catalogue(model("mid", 50, 5.0), model("moe", 75, 45.0, params=300.0, active=13.0)))
+        assert result["best"] is None
+        assert all(r["why"] == "no machine answered, so nothing could be judged" for r in result["groups"]["no"])
+        assert "Nothing on the list runs on these machines." in "\n".join(ai_pick.report(result, None, []))
+
+
+def test_the_copy_you_have_runs_from_disk_and_a_model_that_wont_run_names_its_smallest_file():
+    big = model("big", 70, 0, params=700.0, active=16.0,
+                quants=[{"quant": "Q4", "files": ["q4"], "bytes": int(40e9)},
+                        {"quant": "IQ2", "files": ["iq2"], "bytes": int(30e9), "owned": True, "owned_on": "big-box"}])
+    assert ai_pick.pick(fleet(), catalogue(big))["best"]["quant"]["quant"] == "IQ2"
+    dense = model("dense", 70, 0, params=100.0,
+                  quants=[{"quant": "Q8", "files": ["a"], "bytes": int(100e9)}, {"quant": "Q4", "files": ["b"], "bytes": int(60e9)}])
+    row = ai_pick.pick(fleet(), catalogue(dense))["groups"]["no"][0]
+    assert row["quant"]["quant"] == "Q4" and "needs 67.0 GB of memory" in row["why"]
+
+
+def test_a_repo_hugging_face_says_is_gone_is_missing_not_unreachable():
+    import urllib.error
+
+    def get_files(repo):
+        raise urllib.error.HTTPError(repo, 401, "Unauthorized", {}, None)
+
+    models = [model("gone", 50, 5.0)]
+    assert ai_pick.refresh(models, get_files) == {"repos": 1, "reached": 1, "checked": 0, "missing": 1}
+    assert models[0]["quants"][0]["missing"] is True
+
+
+# The command, by use.
+
+def test_the_command_asks_what_it_is_for_when_someone_is_there(monkeypatch):
+    unscored = model("unscored", 90, 5.0)
+    strong = with_score(model("strong", 70, 5.0), "code", 0.6)
+    monkeypatch.setattr(ai_pick, "read_machines", lambda only=None: fleet())
+    monkeypatch.setattr(ai_pick, "builtin_list", lambda: coding_catalogue(unscored, strong))
+    monkeypatch.setattr(cli_agentic, "_can_ask", lambda: True)
+    result = runner.invoke(cli.app, ["ai", "pick", "--offline"], input="1\n")
+    assert result.exit_code == 0, result.output
+    assert "Best pick for coding\n  Strong" in result.stdout
+    result = runner.invoke(cli.app, ["ai", "pick", "--offline", "--for", "coding", "--json"])
+    data = json.loads(result.stdout)
+    assert data["use"] == "coding" and data["ranked_by"] == "code" and data["scored"] == 1 and data["listed"] == 2
+    assert data["best"]["id"] == "strong" and data["best"]["use_score"] == 0.6 and data["overall"]["id"] == "unscored"
+    assert {"source": "code", "benchmark": "code", "score": 0.6, "task": "coding"} in data["best"]["scores"]
+    assert data["best"]["context_tokens"] == 32768 and data["best"]["good_at"] == ["coding"]
+    monkeypatch.setattr(cli_agentic, "_can_ask", lambda: False)
+    assert "Best pick\n" in runner.invoke(cli.app, ["ai", "pick", "--offline"]).stdout  # no one to ask: everything
+    bad = runner.invoke(cli.app, ["ai", "pick", "--offline", "--for", "cooking"])
+    assert bad.exit_code == 2
+
+
+def test_the_command_says_when_no_machine_matches(monkeypatch):
+    monkeypatch.setattr(ai_pick.config, "load_workers", lambda: [])
+    monkeypatch.setattr(ai_pick, "builtin_list", lambda: catalogue(model("mid", 50, 5.0)))
+    result = runner.invoke(cli.app, ["ai", "pick", "--offline", "--for", "general", "--machines", "nobody"])
+    assert result.exit_code == 1 and "Nothing on the list runs" in result.stdout

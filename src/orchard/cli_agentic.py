@@ -996,25 +996,51 @@ def ai_serve(
     raise typer.Exit(code)
 
 
+def _can_ask() -> bool:
+    """Someone is at the keyboard to answer a question."""
+    try:
+        return sys.stdin.isatty() and sys.stderr.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
 @ai_app.command("pick")
 def ai_pick_cmd(
     offline: bool = typer.Option(False, "--offline", help="use Orchard's own list only; don't ask Hugging Face"),
-    good_at: Optional[str] = typer.Option(None, "--for", help="only models good at this: coding, agents, chat or reasoning"),
+    use: Optional[str] = typer.Option(None, "--for", help="what it's for: coding, agents, chat, reasoning, vision "
+                                      "(reading pictures) or general; asked when not given"),
     machines: Optional[str] = typer.Option(None, "--machines", help="only these machines, comma-separated ('this' is this one)"),
     json_out: bool = typer.Option(False, "--json", help="machine-readable output"),
 ) -> None:
     """Which of the strongest open models your machines can run, and how.
 
-    Reads each machine (memory, graphics, disk, memory speed), then sorts a dated
-    list of open models into fast (fits in memory), slow (runs from disk) and
-    won't run, strongest first, with the split across machines. Downloads nothing.
-    Unless --offline, file sizes are checked on Hugging Face; nothing about you is sent."""
+    Asks what it's for, reads each machine (memory, graphics, disk, memory speed),
+    then sorts a dated list of open models into fast (fits in memory), slow (runs
+    from disk) and won't run, the strongest at that use first, with every score,
+    what each can do and the split across machines. Downloads nothing. Unless
+    --offline, file sizes are checked on Hugging Face; nothing about you is sent.
+    Exit 0 with a best pick, 1 nothing runs, 2 an unknown --for."""
     def say(message: str) -> None:
         if not json_out:
             print(f"ai: {message}", file=sys.stderr, flush=True)
 
+    def read(prompt: str) -> str:
+        print(prompt, end="", file=sys.stderr, flush=True)
+        line = sys.stdin.readline()
+        if not line:
+            raise EOFError
+        return line
+
+    if use is not None:
+        try:
+            use = ai_pick.resolve_use(use)
+        except ValueError as exc:
+            print(f"ai: --for {exc}", file=sys.stderr)
+            raise typer.Exit(2)
+    elif not json_out and _can_ask():
+        use = ai_pick.ask_use(read, lambda line: print(line, file=sys.stderr))
     only = [name.strip() for name in machines.split(",")] if machines else None
-    result, online, new = ai_pick.run(offline=offline, good_at=good_at, only=only, say=say)
+    result, online, new = ai_pick.run(offline=offline, use=use or "general", only=only, say=say)
     if json_out:
         print(json.dumps(ai_pick.as_json(result, online, new), indent=2))
     else:

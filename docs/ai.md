@@ -76,7 +76,7 @@ capitals. `orchard ai resume` tries again.
 | --- | --- |
 | `orchard ai ask "question"` | Ask. `-` reads the question from stdin. Exit 0 answered, 1 failed, 2 refused, 3 stopped. |
 | `orchard ai serve` | Keep the model ready for OpenAI, Claude and Ollama tools. `--port`, `--keep-alive`. Ctrl-C puts everything back. |
-| `orchard ai pick` | Which of the strongest open models your machines can run, and how they'd split. `--offline`, `--for`, `--machines`, `--json`. |
+| `orchard ai pick` | Which of the strongest open models for your use your machines can run, with their scores, and how they'd split. Asks the use, or `--for coding` (`agents`, `chat`, `reasoning`, `vision`, `general`); `--offline`, `--machines`, `--json`. |
 | `orchard ai setup` | Write the settings file, or check the machines against it. |
 | `orchard ai show ID` | Show a record and check its seal. |
 | `orchard ai list` | Recent questions. |
@@ -95,9 +95,24 @@ capitals. `orchard ai resume` tries again.
 ## Which model? Let it pick
 
 `orchard ai pick` tells you which of the strongest open models your machines can
-run, and how. It reads every machine Orchard knows, this one and each worker:
-memory, graphics memory, free disk and how fast it reads memory. Then it goes
-through a dated list of open models and sorts them:
+run for what you want to do, and how. First it asks:
+
+```console
+$ orchard ai pick
+What will you use it for?
+  1 coding
+  2 agents and tool use
+  3 chat and writing
+  4 reasoning and maths
+  5 reading pictures
+  6 a bit of everything
+Pick a number [6]: 1
+```
+
+(`--for coding` answers it up front; a script that pipes the output isn't asked
+and gets a bit of everything.) Then it reads every machine Orchard knows, this
+one and each worker: memory, graphics memory, free disk and how fast it reads
+memory. It goes through a dated list of open models and sorts them:
 
 - **Fits in memory:** fast. The split says which machine would hold how much.
 - **Runs slowly from disk:** too big for memory, but a mixture of experts, which
@@ -105,36 +120,72 @@ through a dated list of open models and sorts them:
 - **Won't run here,** and why: not enough disk, or the engine can't run that kind
   of model yet.
 
-The strongest come first, by the public index the list names, with the date it
-was read. The best pick is the strongest that fits in memory, should answer at 2
-or more words a second, and isn't squeezed below 3.5 bits a weight (a squeezed
-model is weaker than its score says; those are marked). A model you already use
-with `orchard ai` is marked too.
+**Ranked for your use.** Each use has its own public leaderboard, one that runs
+every model the same way rather than quoting the makers' own numbers:
+
+| Use | Ranked by | Models on the list it scores |
+| --- | --- | --- |
+| Coding | SciCode, run by Artificial Analysis: writing working scientific code, checked by hidden tests | 24 of 29 |
+| Agents and tool use | AutomationBench-AA, run by Artificial Analysis: multi-step work across apps through tool calls | 27 of 29 |
+| Chat and writing | LMArena's text rating: people's blind votes between two answers | 12 of 29 |
+| Reasoning and maths | Humanity's Last Exam, run by Artificial Analysis: expert questions needing several steps | 26 of 29 |
+| Reading pictures | MMMU-Pro, run by Artificial Analysis: university questions about images | 15 of 17 that read pictures |
+| A bit of everything | Artificial Analysis Progress Index: general capability across their tests | 18 of 29 |
+
+Models with a score for your use come first, by it. Those without one come
+after them, the ones made for that use first, and each says "no coding score
+yet" (or whichever use), so a gap in a leaderboard is never hidden. Reading
+pictures only lists models that can, and counts the small picture file they need
+beside the model (its name has "mmproj" in it) in the memory they take. Scores
+from different leaderboards aren't comparable with each other: a coding 40% and
+a reasoning 22% don't mean the model is better at coding.
+
+**What it shows for each model:** every score it has, each with its use and
+leaderboard (the sources, links and dates are listed at the end); what it is
+made for; how much it takes in at once, in tokens and roughly in words; how many
+parameters it has and, for a mixture of experts, how many are at work per word;
+its licence and where to get it.
+
+The best pick is the strongest at your use that fits in memory, should answer
+at 2 or more words a second, and isn't squeezed below 3.5 bits a weight (a
+squeezed model is weaker than its scores say; those are marked). When the
+strongest model overall is a different one, it is shown too. A model you
+already use with `orchard ai` is marked.
 
 ```console
-$ orchard ai pick
+$ orchard ai pick --for coding
 Your machines
-  this Mac   macOS arm64, 16 GB memory, Apple M5 GPU: room for 12.0 GB of model, 32.6 GB free disk, reads memory at 50.0 GB/s
-  old-mac    macOS x86_64, 8 GB memory, Intel Iris Plus Graphics 645: room for 6.0 GB of model, 8.9 GB free disk, reads memory at 7.0 GB/s
-  big-box    Linux in Windows x86_64, 8 GB memory, NVIDIA GeForce GTX 1050 2 GB: room for 7.4 GB of model, 112.4 GB free disk (the Windows drive), reads memory at 8.1 GB/s
+  this Mac   macOS arm64, 16 GB memory, Apple M5 GPU: room for 12.0 GB of model, 32.5 GB free disk, reads memory at 49.3 GB/s
+  old-mac    macOS x86_64, 8 GB memory, Intel Iris Plus Graphics 645: room for 6.0 GB of model, 7.7 GB free disk, reads memory at 7.8 GB/s
+  big-box    Linux in Windows x86_64, 8 GB memory, NVIDIA GeForce GTX 1050 2 GB: room for 7.4 GB of model, 112.4 GB free disk (the Windows drive), reads memory at 7.5 GB/s
   Together: room for 25.4 GB of model in memory.
 
-Best pick
+Best pick for coding
+  Gemma 4 26B A4B (UD-Q4_K_M, 16.9 GB file)
+    scores: coding 40.1% (SciCode), agents 1.9% (AutomationBench), reasoning 19.3% (Humanity's Last Exam), pictures 69.2% (MMMU-Pro), chat 1437.4 (Text Arena rating)
+    held in memory: this Mac 9.3 GB, big-box 5.7 GB, old-mac 4.6 GB; about 5.0 words a second (estimate)
+    made for chat, coding, agents, pictures; takes in 256K tokens at once (about 197K words); 25B parameters, 3.8B at work per word
+    licence apache-2.0; from huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF
+    the strongest at coding by SciCode of those here that should answer at 2 or more words a second, kept at 3.5 or more bits a weight
+
+Strongest overall here, by general score
   Qwen3.6 35B A3B (UD-Q4_K_M, 22.1 GB file)
-    strength: 261 on the Artificial Analysis Progress Index v1 (read 2026-11-14)
-    held in memory: this Mac 12.0 GB, big-box 7.4 GB, old-mac 6.0 GB; about 6.0 words a second (estimate)
-    good at coding, agents, chat, vision; licence apache-2.0; from huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF
-    the strongest here that should answer at 2 or more words a second, kept at 3.5 or more bits a weight
+    scores: coding 36.6% (SciCode), general 261 (Progress Index), agents 5.2% (AutomationBench), reasoning 22.2% (Humanity's Last Exam), pictures 75.0% (MMMU-Pro)
+    held in memory: this Mac 12.0 GB, big-box 7.4 GB, old-mac 6.0 GB; about 6.6 words a second (estimate)
+    made for coding, agents, chat, pictures; takes in 256K tokens at once (about 197K words); 35B parameters, 3.0B at work per word
+    licence apache-2.0; from huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF
 ...
+Ranked for coding by SciCode (Artificial Analysis): 24 of the 29 models have a score; the rest come after them, those made for it first.
 ```
 
-It downloads nothing. The list ships with Orchard (`src/orchard/ai_models.json`):
-exact file sizes read from Hugging Face, and scores from the named index. Unless
-you pass `--offline`, it also asks Hugging Face for each file's current size, and
-lists popular GGUF models from well-known publishers that aren't on the list yet,
-unranked. Nothing about you or your machines is sent. `--for coding` (or
-`agents`, `chat`, `reasoning`) keeps only models good at that, `--machines`
-limits which machines count, and `--json` prints it all for a script.
+That is a real run on three machines, 14 November 2026. It downloads nothing.
+The list ships with Orchard (`src/orchard/ai_models.json`): exact file sizes
+read from Hugging Face, and scores read from the named leaderboards, with the
+exact entry each was matched to. Unless you pass `--offline`, it also asks
+Hugging Face for each file's current size, and lists popular GGUF models from
+well-known publishers that aren't on the list yet, unranked. Nothing about you
+or your machines is sent. `--machines` limits which machines count, and
+`--json` prints it all for a script, every score included.
 
 **How it judges.** Each machine keeps a quarter of its memory, and at least 2 GB,
 for itself; a graphics card adds most of its own memory. A model needs its file
@@ -144,8 +195,8 @@ its room. The speed estimate assumes each word reads the model's active weights
 once, each machine its share, at the memory speed measured on that machine (one
 core copying memory, so it leaves out what graphics chips add and what the
 network between machines takes). Read the speeds as a rough guide; a short test
-run gives the real number. A model with no score wasn't in the index's top
-entries for its size, which doesn't mean it is weak.
+run gives the real number. A model with no score on a leaderboard wasn't found
+there, which doesn't mean it is weak.
 
 ## Keep it ready for your tools
 
