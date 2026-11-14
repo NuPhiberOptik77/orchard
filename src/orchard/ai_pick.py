@@ -64,6 +64,8 @@ RESERVE_MIN_MB_MAC = 4096
 NOW_MARGIN_GB = 1.0
 # Where a run ran short of memory holding a share, count at most this part of it.
 SHORT_SHARE = 0.8
+# Engine flags that move parts of a model by hand, so the split alone doesn't say who held what.
+PLACEMENT_FLAGS = {"-ot", "--override-tensor", "-ncmoe", "--n-cpu-moe", "-cmoe", "--cpu-moe"}
 # Of a graphics card's own memory, what a model can use.
 VRAM_SHARE = 0.8
 # Memory a model needs beyond its file: a tenth more, and 1 GB for its working memory.
@@ -178,7 +180,7 @@ class Machine(dict):
         free = self.get("free_mb")
         if free is None:
             return None
-        return round(min(self.room_gb, max(0.0, free / 1024 - NOW_MARGIN_GB) + self.vram_gb), 1)
+        return round(max(0.0, min(self.room_gb, max(0.0, free / 1024 - NOW_MARGIN_GB) + self.vram_gb)), 1)
 
     @property
     def speed_gbs(self) -> float:
@@ -371,7 +373,9 @@ def right_now(row: dict, machines: list[Machine]) -> dict:
         return row
     split = plan_memory(row["need_gb"], machines, now_room)
     short = [(m, share, now_room(m)) for m, share in row["split"] if share > now_room(m)]
-    return row | {"fits_now": split is not None, "split_now": split, "short_now": [] if split else short}
+    speed = estimate_words_per_second(row["model"], row["quant"], split) if split else None
+    return row | {"fits_now": split is not None, "split_now": split, "short_now": [] if split else short,
+                  "words_per_second_now": speed}
 
 
 def estimate_words_per_second(model: dict, quant: dict, split: list[tuple[Machine, float]]) -> float:
@@ -538,7 +542,9 @@ def pick(machines: list[Machine], catalogue: dict, use: str = "general", past: d
     # When the best pick doesn't fit at this moment, the best that does.
     best_now = None
     if best and best.get("fits_now") is False:
-        best_now = _best({"fast": [r for r in groups["fast"] if r.get("fits_now")], "slow": []})
+        now = [r | {"words_per_second": r["words_per_second_now"], "split": r["split_now"]}
+               for r in groups["fast"] if r.get("fits_now")]
+        best_now = _best({"fast": now, "slow": []})
     # For a task, also the strongest overall, when it isn't the same model. Only
     # a model with a general score can be called that.
     scored = [r for r in rows if score_of(r["model"], primary) is not None]
@@ -574,7 +580,9 @@ def held_gb(record: dict, model: dict, quant: dict, name_of: Callable[[str | Non
         sent = min(int(settings.get("layers") or 0), blocks or 0)
     except ValueError:
         return None
-    if not blocks or settings.get("overrides") or not devices or len(parts) != len(devices) or sum(parts) <= 0:
+    args = {str(a).split("=", 1)[0] for a in settings.get("args") or []}
+    if (not blocks or settings.get("overrides") or args & PLACEMENT_FLAGS or not devices or sent < 0
+            or len(parts) != len(devices) or sum(parts) <= 0):
         return None
     helpers = ([here] if who.get("helper") else []) + [name_of(h) for h in who.get("far_helpers") or []]
     engine = name_of(who.get("engine"))
@@ -660,7 +668,9 @@ def history(machines: list[Machine], catalogue: dict, folder: Path | None = None
                 managed[name] = max(managed.get(name, 0.0), gb)
     caps = {}
     for name, (gb, day, rid) in short.items():
-        cap = round(max(gb * SHORT_SHARE, managed.get(name, 0.0)), 1)
+        # An answer holding more than it ran short with says the shortage was the moment's, not the machine's.
+        lifted = managed.get(name, 0.0)
+        cap = round(lifted if lifted > gb else gb * SHORT_SHARE, 1)
         caps[name] = {"gb": cap, "why": f"it ran short of memory holding about {gb} GB on {day} (record {rid})"}
     for found_runs in runs.values():
         found_runs.sort(key=lambda r: r["id"] or "", reverse=True)
@@ -746,7 +756,8 @@ def _now_text(row: dict) -> str | None:
     if row["fits_now"]:
         moved = [(m["name"], gb) for m, gb in row["split_now"]] != [(m["name"], gb) for m, gb in row["split"]]
         where = ", ".join(f"{m['name']} {gb} GB" for m, gb in row["split_now"])
-        return "    right now: fits" + (f", held as {where}" if moved else "")
+        return "    right now: fits" + (f", held as {where}; about {row['words_per_second_now']} words a second there"
+                                       if moved else "")
     if not row["short_now"]:
         return "    right now: doesn't fit, with what your machines have free"
     short = "; ".join(f"{m['name']} has {now} GB free for its {share} GB share" for m, share, now in row["short_now"])
@@ -841,12 +852,15 @@ def report(result: dict, online: dict | None, new: list[dict]) -> list[str]:
         elif best.get("fits_now") is False:
             lines += ["", "Nothing on the list fits in memory right now; try again when your machines are quieter."]
         overall = result.get("overall")
-        if overall:
+        if overall and not (best_now and overall["model"] is best_now["model"]):
             lines += ["", "Strongest overall here, by general score"] + _row_lines(overall, result)
+        elif overall:
+            lines.append("    (also the strongest overall here, by general score)")
     else:
         lines.append("Nothing on the list runs on these machines"
                      + ("" if use == "general" else f" for {USES[use]}") + ".")
-    shown = {id(best), id(result.get("overall")), id(result.get("best_now"))}
+    shown = {id(best), id(result.get("overall"))} | {
+        id(r) for r in result["groups"]["fast"] if result.get("best_now") and r["model"] is result["best_now"]["model"]}
     for group, title, limit in (("fast", "Also fits in memory here", 4),
                                 ("slow", "Strongest that run slowly from disk (background work)", 2),
                                 ("no", "Won't run here", 4)):
@@ -917,6 +931,7 @@ def as_json(result: dict, online: dict | None, new: list[dict]) -> dict:
             out["split"] = [{"machine": m["name"], "gb": share} for m, share in r["split"]]
             out["words_per_second_estimate"] = r["words_per_second"]
             out["fits_now"] = r.get("fits_now")
+            out["words_per_second_now_estimate"] = r.get("words_per_second_now")
             out["split_now"] = [{"machine": m["name"], "gb": share} for m, share in r.get("split_now") or []]
             out["short_now"] = [{"machine": m["name"], "share_gb": share, "free_gb": now}
                                 for m, share, now in r.get("short_now") or []]

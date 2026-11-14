@@ -542,7 +542,7 @@ def test_a_pick_that_does_not_fit_now_names_the_busy_machine_and_the_best_that_d
     assert "right now: doesn't fit (this Mac has 2.0 GB free for its 10.6 GB share" in text
     assert "it fits when this Mac, big-box and old-mac are quieter" in text
     assert "Best that fits right now\n  Small (Q4_K_M, 3.0 GB file)" in text
-    assert "right now: fits, held as big-box 4.3 GB" in text
+    assert "held in memory: big-box 4.3 GB; about" in text  # where it would sit right now
     assert "Together: room for 23.6 GB of model in memory, 9.6 GB of it free right now." in text
     data = ai_pick.as_json(result, None, [])
     assert data["best"]["fits_now"] is False and data["best_now"]["id"] == "small"
@@ -681,3 +681,55 @@ def test_linux_in_windows_counts_what_windows_has_free(monkeypatch):
     machines = ai_pick.read_machines()
     assert machines[0]["free_mb"] == 2048 and machines[0]["disk_free_gb"] == 40.0
     assert seen == [("win", ai_pick.WINDOWS_FREE)]
+
+
+def test_the_best_that_fits_now_is_judged_where_it_would_sit_now():
+    # Right now only old-mac, slow at 1 GB/s, has room: the bigger model would crawl
+    # there, so the smaller one that stays comfortable wins.
+    mac, box, old = fleet()
+    mac["free_mb"], box["free_mb"], old["copy_gbs"] = 1 * GIB, 1 * GIB, 1.0
+    big = model("big", 90, 18.0, active=3.0)
+    slow_now = model("mid", 60, 2.0, params=4.0)
+    quick_now = model("small", 30, 0.5, params=1.0)
+    result = ai_pick.pick([mac, box, old], catalogue(big, slow_now, quick_now))
+    assert result["best"]["model"]["id"] == "big"
+    assert result["best_now"]["model"]["id"] == "small"
+    mid = next(r for r in result["groups"]["fast"] if r["model"]["id"] == "mid")
+    assert mid["words_per_second_now"] < 2.0 < mid["words_per_second"]
+    text = "\n".join(ai_pick.report(result, None, []))
+    assert "right now: fits, held as old-mac 2.1 GB, big-box 1.1 GB; about 0.7 words a second there" in text
+    assert "Best that fits right now\n  Small (Q4_K_M, 0.5 GB file)" in text
+
+
+def test_an_answer_holding_the_same_does_not_lift_the_limit():
+    run_of("ai-20261114-100000-aaaa", "answered", ms=250.0)  # this Mac held 9.6
+    run_of("ai-20261114-110000-bbbb", "stopped", reason="this machine is short of memory")  # also 9.6
+    assert ai_pick.history(fleet(), catalogue(layered()))["caps"]["this Mac"]["gb"] == 7.7
+
+
+def test_engine_flags_that_move_parts_or_odd_layer_counts_are_not_measured():
+    mid = layered()
+    record = {"settings": {"layers": 18, "devices": "CUDA0,RPC0", "split": "2,16", "overrides": "",
+                           "args": ["--n-cpu-moe", "30"]},
+              "machines": {"engine": "big-box", "helper": True, "far_helpers": []}}
+    assert ai_pick.held_gb(record, mid, mid["quants"][0], lambda h: h, "this Mac") is None
+    record["settings"]["args"] = ["-ot=exps=CPU"]
+    assert ai_pick.held_gb(record, mid, mid["quants"][0], lambda h: h, "this Mac") is None
+    record["settings"].update(args=[], layers=-1)
+    assert ai_pick.held_gb(record, mid, mid["quants"][0], lambda h: h, "this Mac") is None
+
+
+def test_room_now_never_goes_below_zero_and_a_model_is_not_shown_twice():
+    tiny = machine("tiny", 1, system="Linux")
+    assert tiny.room_gb < 0 and tiny.room_now_gb == 0.0
+    mac, box, old = fleet()
+    mac["free_mb"] = 1 * GIB
+    coder = model("coder", 50, 18.0, active=3.0, scores=[{"source": "code", "score": 0.5}])
+    small = model("small", 30, 3.0, params=5.0)
+    cat = catalogue(coder, small)
+    cat["sources"].append({"id": "code", "task": "coding", "name": "Code Bench", "url": "https://example.org/c",
+                           "read_on": "2026-11-14", "scale": "fraction"})
+    result = ai_pick.pick([mac, box, old], cat, "coding")
+    assert result["best_now"]["model"]["id"] == "small" and result["overall"]["model"]["id"] == "small"
+    text = "\n".join(ai_pick.report(result, None, []))
+    assert text.count("  Small (Q4_K_M") == 1 and "(also the strongest overall here, by general score)" in text
