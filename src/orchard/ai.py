@@ -51,6 +51,10 @@ HELPER_SETTLE = 4
 TUNNEL_TRIES = 6
 TUNNEL_SETTLE = 3
 TUNNEL_GAP = 10
+# A far helper hears from this machine this often, and stops after this long without a word,
+# so it doesn't hold its memory if this machine sleeps or drops off the network.
+FAR_BEAT = 20
+FAR_SILENCE = 90
 PAUSE_WAIT = 60
 RESUME_TRIES = 5
 RESUME_GAP = 5
@@ -171,6 +175,12 @@ def load_settings(threads: int | None = None, split: str | None = None, override
     ports += [p for h in cfg["far_helpers"] for p in (h["tunnel_port"],)]
     if len(ports) != len(set(ports)):
         raise ConfigError(f"{path}: two helpers share a tunnel_port")
+    here = [h["local_port"] for h in cfg["far_helpers"]] + ([cfg["helper"]["port"]] if cfg["helper"].get("folder") else [])
+    if len(here) != len(set(here)):
+        raise ConfigError(f"{path}: two helpers share a port on this machine (local_port)")
+    there = [(h["host"], h["port"]) for h in cfg["far_helpers"]]
+    if len(there) != len(set(there)):
+        raise ConfigError(f"{path}: two far helpers share a host and port")
     engine = cfg["engine"]
     for key in ("host", "folder", "model"):
         if not engine.get(key) or "CHANGE" in str(engine[key]):
@@ -196,9 +206,10 @@ def rpc_list(cfg: dict) -> str:
     return ",".join(f"127.0.0.1:{port}" for port in ports)
 
 
-def far_helper_script(h: dict) -> str:
+def far_helper_script(h: dict, silence: int | None = None) -> str:
     """Runs on a far helper's machine. The helper stops as soon as the ssh
-    session that started it ends, however that happens."""
+    session that started it ends, or when this machine has been silent for
+    `silence` seconds (it sends a line every FAR_BEAT seconds)."""
     argv = [f"./{h['binary']}", "-H", "127.0.0.1", "-p", str(h["port"])]
     if h["device"]:
         argv += ["-d", h["device"]]
@@ -209,7 +220,7 @@ def far_helper_script(h: dict) -> str:
         "exec 3<&0",
         " ".join(shlex.quote(a) for a in argv) + " < /dev/null 3<&- &",
         "pid=$!",
-        "( while read -r _ <&3; do :; done; kill $pid 2> /dev/null ) &",
+        f"( while read -r -t {int(silence or FAR_SILENCE)} _ <&3; do :; done; kill $pid 2> /dev/null ) &",
         "watch=$!",
         "wait $pid",
         "rc=$?",
@@ -549,6 +560,8 @@ class _Pool:
         self.stopping = threading.Event()
         # Per far helper: its process there, the link to it, and the tunnel on.
         self.far: list[dict] = []
+        self.beat: threading.Thread | None = None
+        self.beat_done = threading.Event()
 
     def preflight(self) -> None:
         e = self.cfg["engine"]
@@ -621,24 +634,38 @@ class _Pool:
 
     def start_tunnel(self) -> None:
         h = self.cfg["helper"]
-        self.tunnel = self._open_tunnel(h["tunnel_port"], h["port"])
+        self._open_tunnel(h["tunnel_port"], h["port"], lambda tunnel: setattr(self, "tunnel", tunnel))
 
-    def _open_tunnel(self, port: int, here: int) -> subprocess.Popen:
-        """The engine machine's `port` reaches this machine's `here`."""
+    def _open_tunnel(self, port: int, here: int, keep: Callable[[subprocess.Popen], None]) -> None:
+        """The engine machine's `port` reaches this machine's `here`. Each try is
+        handed to `keep` as it starts, so a signal mid-start can't lose it."""
         _pkill_local(f"^ssh .*-R {port}:")
         argv = ["ssh", "-N", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes",
                 "-R", f"{port}:127.0.0.1:{here}", self.host]
         for attempt in range(TUNNEL_TRIES):
             tunnel = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                       stderr=subprocess.DEVNULL)
+            keep(tunnel)
             time.sleep(TUNNEL_SETTLE)
             listening = _remote(self.host, f"ss -ltn | grep -c ':{port} '", 20).stdout.strip()
             if tunnel.poll() is None and listening not in ("", "0"):
-                return tunnel
+                return
             _stop_process(tunnel)
             if attempt + 1 < TUNNEL_TRIES:
                 time.sleep(TUNNEL_GAP)
         raise Refused(f"no tunnel to {self.host} after {TUNNEL_TRIES} tries")
+
+    def _heartbeat(self) -> None:
+        """A line to every far helper now and then: it stops itself if they stop."""
+        while not self.beat_done.wait(FAR_BEAT):
+            for far in self.far:
+                proc = far["helper"]
+                if proc is not None and proc.poll() is None and proc.stdin and not proc.stdin.closed:
+                    try:
+                        proc.stdin.write(b"\n")
+                        proc.stdin.flush()
+                    except (OSError, ValueError):
+                        pass
 
     def start_far_helpers(self) -> None:
         """Each far helper: its helper there, a link from here to it, and a
@@ -651,6 +678,9 @@ class _Pool:
             with (self.folder / f"helper-{h['host']}.log").open("wb") as log:
                 far["helper"] = subprocess.Popen([*_ssh(h["host"]), "bash -c " + shlex.quote(far_helper_script(h))],
                                                  stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT)
+            if self.beat is None:
+                self.beat = threading.Thread(target=self._heartbeat, daemon=True)
+                self.beat.start()
             time.sleep(HELPER_SETTLE)
             if far["helper"].poll() is not None:
                 raise Refused(f"the helper on {h['host']} stopped straight away: see "
@@ -663,7 +693,7 @@ class _Pool:
             time.sleep(TUNNEL_SETTLE)
             if far["link"].poll() is not None:
                 raise Refused(f"no link to {h['host']}")
-            far["tunnel"] = self._open_tunnel(h["tunnel_port"], h["local_port"])
+            self._open_tunnel(h["tunnel_port"], h["local_port"], lambda tunnel, f=far: f.__setitem__("tunnel", tunnel))
 
     def pause_apps(self, limit: int | None = None) -> None:
         win, names = self.cfg["windows"].get("host"), self.cfg["windows"]["pause"]
@@ -737,6 +767,10 @@ class _Pool:
                 if far[part] is not None and far[part].poll() is not None:
                     return f"the {part} for {h['host']} stopped"
             seen = far_check(h)
+            key = f"far unreached {h['host']}"
+            reads[key] = 0 if seen["reached"] else reads.get(key, 0) + 1
+            if reads[key] >= UNREAD_READS:
+                return f"{h['host']} stopped answering"
             if seen["busy"]:
                 return f"{h['host']} is in use: {seen['busy'][0][:60]}"
             if seen["pressure"] >= CRITICAL_PRESSURE:
@@ -816,6 +850,9 @@ class _Pool:
             self._step("guard", lambda: self.guard.join(5))
         if self.hold is not None:
             self._step("pause", self._end_pause)
+        self.beat_done.set()
+        if self.beat is not None:
+            self._step("heartbeat", lambda: self.beat.join(5))
         for far in reversed(self.far):
             self._step(f"tunnel to {far['host']}", lambda f=far: _stop_process(f["tunnel"]))
             self._step(f"link to {far['host']}", lambda f=far: _stop_process(f["link"]))

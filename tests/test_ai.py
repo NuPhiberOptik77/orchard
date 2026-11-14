@@ -740,8 +740,10 @@ def far_setup(stub, monkeypatch):
     return mark
 
 
-def busy_process(mark):
+def busy_process(mark, keep=None):
     proc = subprocess.Popen(["bash", "-c", f'exec -a "{mark} job" sleep 60'])
+    if keep is not None:
+        keep.append(proc)  # kept before anything can stop the run, so the test always ends it
     time.sleep(0.3)
     return proc
 
@@ -797,6 +799,7 @@ def test_a_busy_far_helper_is_refused_before_anything_starts(stub, monkeypatch):
         result = invoke("ask", "hello")
     finally:
         proc.kill()
+        proc.wait()
     assert result.exit_code == 2 and "far is busy: " + mark in result.output
     assert "engine started" not in events(stub) and "far helper up" not in events(stub)
 
@@ -818,16 +821,100 @@ def test_the_run_stops_when_the_far_machine_comes_into_use(stub, monkeypatch):
             if "engine started" in events(stub):
                 break
             time.sleep(0.05)
-        procs.append(busy_process(mark))
+        busy_process(mark, procs)
 
     threading.Thread(target=start_later, daemon=True).start()
     try:
         result = invoke("ask", "hello")
     finally:
+        time.sleep(0.5)  # the thread may still be starting it
         for proc in procs:
             proc.kill()
+            proc.wait()
     assert result.exit_code == 3, result.output
     record = ai.recent()[0]
     assert record["state"] == "stopped" and record["reason"].startswith("far is in use: " + mark)
     seen = events(stub)
     assert "far helper down" in seen and "link down" in seen
+
+
+def test_a_signal_while_the_tunnel_opens_still_closes_it(stub, monkeypatch):
+    write_settings(stub, helper=True)
+    real_remote = ai._remote
+
+    def remote(host, command, *args, **kwargs):
+        if command.startswith("ss "):  # the signal lands while the tunnel is being checked
+            raise ai._Interrupted("SIGTERM")
+        return real_remote(host, command, *args, **kwargs)
+
+    monkeypatch.setattr(ai, "_remote", remote)
+    result = invoke("ask", "hello")
+    assert result.exit_code == 3, result.output
+    for _ in range(50):
+        if "tunnel down" in events(stub):
+            break
+        time.sleep(0.1)
+    assert "tunnel down" in events(stub)  # close() found the tunnel and stopped it
+
+
+def test_a_far_helper_stops_itself_when_this_machine_goes_quiet(tmp_path):
+    far = tmp_path / "far"
+    far.mkdir()
+    _script(far / "ggml-rpc-server", "#!/bin/bash\necho $$ > \"$(dirname \"$0\")/pid\"\nexec sleep 60\n")
+    h = dict(ai.DEFAULTS["far_helper"], host="far", folder=str(far))
+
+    def start():
+        proc = subprocess.Popen(["bash", "-c", ai.far_helper_script(h, silence=1)], stdin=subprocess.PIPE)
+        for _ in range(50):
+            if (far / "pid").exists():
+                break
+            time.sleep(0.05)
+        return proc, int((far / "pid").read_text())
+
+    def alive(pid):
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+
+    proc, pid = start()  # nothing heard: it stops itself
+    assert proc.wait(5) is not None and not alive(pid)
+    (far / "pid").unlink()
+    proc, pid = start()  # heard every half second: it stays up, then stops when the session ends
+    for _ in range(5):
+        proc.stdin.write(b"\n")
+        proc.stdin.flush()
+        time.sleep(0.5)
+    assert alive(pid)
+    proc.stdin.close()
+    assert proc.wait(5) is not None and not alive(pid)
+
+
+def test_far_helpers_cannot_share_a_port(stub):
+    for body, message in (
+            ('host = "one"\nfolder = "~/llm"\n\n[[far_helper]]\nhost = "two"\nfolder = "~/llm"\nlocal_port = 50062',
+             "share a port on this machine"),
+            ('host = "one"\nfolder = "~/llm"\n\n[[far_helper]]\nhost = "one"\nfolder = "~/llm"', "share a host and port")):
+        write_settings(stub, helper=True)
+        with ai.CONFIG_PATH.open("a") as handle:
+            handle.write(f"\n[[far_helper]]\n{body}\n")
+        with pytest.raises(ai.ConfigError, match=message):
+            ai.load_settings()
+
+
+def test_the_run_stops_when_a_far_machine_stops_answering(stub, monkeypatch):
+    far_setup(stub, monkeypatch)
+    (stub.home / "slow").write_text("")
+    calls = {"n": 0}
+    real_check = ai.far_check
+
+    def check(h, timeout=30):
+        calls["n"] += 1
+        return real_check(h, timeout) if calls["n"] == 1 else {"reached": False, "pressure": 0, "busy": []}
+
+    monkeypatch.setattr(ai, "far_check", check)
+    result = invoke("ask", "hello")
+    assert result.exit_code == 3, result.output
+    assert ai.recent()[0]["reason"] == "far stopped answering"
+    assert "far helper down" in events(stub)

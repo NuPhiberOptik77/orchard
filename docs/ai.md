@@ -359,11 +359,14 @@ busy_pattern = "^\\./ggml-rpc|Runner\\.Worker"
 ```
 
 Before a run it checks each far machine: reachable, the helper there, not short
-of memory, and nothing running that matches `busy_pattern` (a process list
-pattern: put your own build or CI jobs in it). During the run it checks again,
-and stops and puts everything back if one comes into use or runs short. The
-helper there stops as soon as its ssh session ends, however the run ends. It
-keeps no cache on that machine's disk unless you set `cache = true`. Other
+of memory (read on macOS only), and nothing running that matches `busy_pattern`
+(a process list pattern: put your own build or CI jobs in it). During the run it
+checks again, and stops and puts everything back if one comes into use, runs
+short, or stops answering. The helper there stops as soon as its ssh session
+ends. This machine also sends it a line every 20 seconds, and it stops itself
+after 90 seconds without one, so it doesn't keep its memory if this machine
+sleeps or drops off the network. It keeps no cache on that machine's disk unless
+you set `cache = true`. Other
 settings, with their defaults: `binary` `ggml-rpc-server`, `device` empty (the
 helper's own choice), `port` 50052 on that machine, and `local_port` 50062 and
 `tunnel_port` 50073, each one more for every far helper after the first.
