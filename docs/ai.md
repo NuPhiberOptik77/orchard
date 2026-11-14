@@ -126,6 +126,13 @@ order as after `ask`, when:
 The next question loads it again. A question that runs past `cap_seconds` is
 stopped, and the model stays loaded.
 
+On the same 300 GB model and machines as the example above, the first question
+through the OpenAI API loaded the model in 299 s, gave its first word at 446 s
+and finished at 716 s (88 words at 3.1 s per word). A second question, through
+the Ollama API a moment later, gave its first word at 57 s, because nothing had
+to load. Stopping the server put everything back. One run each, so read the
+speeds as examples, not a benchmark.
+
 One question runs at a time; the rest wait their turn. While the model loads, a
 streamed answer gets a comment line every 10 seconds, so the tool knows the
 server is still there. If the model can't be loaded (the machine stays busy,
