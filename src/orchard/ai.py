@@ -68,6 +68,9 @@ DEFAULTS = {
         "stop_free_mb": 0, "settle_seconds": 300, "thinking_end": "",
     },
     "helper": {"binary": "ggml-rpc-server", "device": "", "port": 50052, "tunnel_port": 50072},
+    # Each [[far_helper]] gets these, with its ports moved on by its place in the list.
+    "far_helper": {"binary": "ggml-rpc-server", "device": "", "port": 50052, "local_port": 50062,
+                   "tunnel_port": 50073, "busy_pattern": r"^\./ggml-rpc", "cache": False},
     "windows": {"pause": []},
     "server": {"port": 6724, "keep_alive_seconds": 600, "max_loaded_seconds": 21600, "binary": "llama-server",
                "context": 0, "name": "", "args": [], "socket": "~/.orchard/ai-engine.sock", "origins": []},
@@ -105,6 +108,13 @@ worker_tags = []                                    # for example ["os:linux"]
 # folder = "~/llm/helper"
 # device = "MTL0"
 
+# Lend another machine to the engine too, through this one: two ssh links,
+# this machine to it, and the engine machine to this one. Repeat for more.
+# [[far_helper]]
+# host = "CHANGE"                 # ssh name of that machine
+# folder = "~/llm/helper"         # holds ggml-rpc-server
+# busy_pattern = "^\\./ggml-rpc"  # refuse, or stop, while a process like this runs there
+
 # The engine machine runs Linux inside Windows: read free memory from Windows,
 # and pause these apps during a run.
 # [windows]
@@ -125,23 +135,49 @@ class _Interrupted(Exception):
     pass
 
 
+def settings_path() -> Path:
+    """The settings file: ORCHARD_AI_SETTINGS names another one, say one per model."""
+    named = os.environ.get("ORCHARD_AI_SETTINGS", "").strip()
+    return Path(named).expanduser() if named else CONFIG_PATH
+
+
 def load_settings(threads: int | None = None, split: str | None = None, overrides: str | None = None,
                   words: int | None = None) -> dict:
     """The settings file over the defaults, then the given values over both."""
+    path = settings_path()
     try:
-        raw = tomllib.loads(CONFIG_PATH.read_text())
+        raw = tomllib.loads(path.read_text())
     except OSError:
-        raise ConfigError(f"no settings at {CONFIG_PATH}: run `orchard ai setup`")
+        raise ConfigError(f"no settings at {path}: run `orchard ai setup`")
     except tomllib.TOMLDecodeError as exc:
-        raise ConfigError(f"{CONFIG_PATH}: {exc}")
-    cfg = {section: {**values, **raw.get(section, {})} for section, values in DEFAULTS.items()}
+        raise ConfigError(f"{path}: {exc}")
+    cfg = {section: {**values, **raw.get(section, {})} for section, values in DEFAULTS.items()
+           if section != "far_helper"}
+    cfg["far_helpers"] = []
+    far = raw.get("far_helper", [])
+    if not isinstance(far, list):
+        raise ConfigError(f"{path}: write far helpers as [[far_helper]]")
+    for place, entry in enumerate(far):
+        h = {**DEFAULTS["far_helper"], "local_port": DEFAULTS["far_helper"]["local_port"] + place,
+             "tunnel_port": DEFAULTS["far_helper"]["tunnel_port"] + place, **entry}
+        for key in ("host", "folder"):
+            if not h.get(key) or "CHANGE" in str(h[key]):
+                raise ConfigError(f"{path}: set {key} for far helper {place + 1}")
+        for key in ("port", "local_port", "tunnel_port"):
+            if not isinstance(h[key], int) or not 1024 <= h[key] <= 65535:
+                raise ConfigError(f"{path}: far helper {place + 1}: {key} must be a port number")
+        cfg["far_helpers"].append(h)
+    ports = [cfg["helper"]["tunnel_port"]] if cfg["helper"].get("folder") else []
+    ports += [p for h in cfg["far_helpers"] for p in (h["tunnel_port"],)]
+    if len(ports) != len(set(ports)):
+        raise ConfigError(f"{path}: two helpers share a tunnel_port")
     engine = cfg["engine"]
     for key in ("host", "folder", "model"):
         if not engine.get(key) or "CHANGE" in str(engine[key]):
-            raise ConfigError(f"{CONFIG_PATH}: set engine.{key}")
+            raise ConfigError(f"{path}: set engine.{key}")
     for name in cfg["windows"]["pause"]:
         if not _PROCESS_NAME.match(name):
-            raise ConfigError(f"{CONFIG_PATH}: bad process name {name!r}")
+            raise ConfigError(f"{path}: bad process name {name!r}")
     for key, value in (("threads", threads), ("split", split), ("overrides", overrides), ("words", words)):
         if value not in (None, ""):
             engine[key] = value
@@ -150,6 +186,52 @@ def load_settings(threads: int | None = None, split: str | None = None, override
 
 def has_helper(cfg: dict) -> bool:
     return bool(cfg["helper"].get("folder"))
+
+
+def rpc_list(cfg: dict) -> str:
+    """Where the engine finds its helpers, in device order: RPC0 is this
+    machine's helper if there is one, then each far helper in turn."""
+    ports = [cfg["helper"]["tunnel_port"]] if has_helper(cfg) else []
+    ports += [h["tunnel_port"] for h in cfg.get("far_helpers", [])]
+    return ",".join(f"127.0.0.1:{port}" for port in ports)
+
+
+def far_helper_script(h: dict) -> str:
+    """Runs on a far helper's machine. The helper stops as soon as the ssh
+    session that started it ends, however that happens."""
+    argv = [f"./{h['binary']}", "-H", "127.0.0.1", "-p", str(h["port"])]
+    if h["device"]:
+        argv += ["-d", h["device"]]
+    if h["cache"]:
+        argv.append("-c")
+    return "\n".join([
+        f"cd {_rpath(h['folder'])} || exit 127",
+        "exec 3<&0",
+        " ".join(shlex.quote(a) for a in argv) + " < /dev/null 3<&- &",
+        "pid=$!",
+        "( while read -r _ <&3; do :; done; kill $pid 2> /dev/null ) &",
+        "watch=$!",
+        "wait $pid",
+        "rc=$?",
+        "kill $watch 2> /dev/null",
+        "exit $rc",
+    ]) + "\n"
+
+
+FAR_CHECK = ("sysctl -n kern.memorystatus_vm_pressure_level 2> /dev/null | sed 's/^/pressure /'\n"
+             "ps -Ao command= | grep -E -- {pattern} | grep -v 'grep -E' | sed 's/^/busy /'\n"
+             "echo reached\n")
+
+
+def far_check(h: dict, timeout: int = 30) -> dict:
+    """A far helper's machine: reachable, its memory pressure (macOS), and
+    any process matching its busy pattern other than our own helper."""
+    out = _remote(h["host"], "sh -s", timeout, FAR_CHECK.format(pattern=shlex.quote(h["busy_pattern"]))).stdout
+    lines = out.splitlines()
+    pressure = next((int(l.split()[1]) for l in lines if l.startswith("pressure ") and l.split()[1].isdigit()), 0)
+    ours = f"{h['binary']} -H 127.0.0.1 -p {h['port']}"
+    busy = [l[5:] for l in lines if l.startswith("busy ") and ours not in l]
+    return {"reached": "reached" in lines, "pressure": pressure, "busy": busy}
 
 
 def has_windows(cfg: dict) -> bool:
@@ -172,8 +254,8 @@ def engine_command(cfg: dict, question: str, words: int) -> list[str]:
     e = cfg["engine"]
     argv = [f"./{e['binary']}", "-m", e["model"], "-p", question, "-n", str(words),
             "-c", str(e["context"]), "-t", str(e["threads"])]
-    if has_helper(cfg):
-        argv += ["--rpc", f"127.0.0.1:{cfg['helper']['tunnel_port']}"]
+    if rpc := rpc_list(cfg):
+        argv += ["--rpc", rpc]
     for flag, key in (("--device", "devices"), ("-ngl", "layers"), ("-ts", "split"), ("-ot", "overrides")):
         if e[key] != "":
             argv += [flag, str(e[key])]
@@ -465,6 +547,8 @@ class _Pool:
         self.fingerprint: dict = {}
         self.problems: list[str] = []
         self.stopping = threading.Event()
+        # Per far helper: its process there, the link to it, and the tunnel on.
+        self.far: list[dict] = []
 
     def preflight(self) -> None:
         e = self.cfg["engine"]
@@ -481,6 +565,17 @@ class _Pool:
             raise Refused(f"already running on {self.host}: {busy[0][:80]}")
         if missing := [line[8:] for line in out.splitlines() if line.startswith("missing ")]:
             raise Refused(f"{' and '.join(missing)} not found on {self.host}: run `orchard ai setup`")
+        for h in self.cfg.get("far_helpers", []):
+            seen = far_check(h)
+            if not seen["reached"]:
+                raise Refused(f"cannot reach {h['host']}")
+            if seen["busy"]:
+                raise Refused(f"{h['host']} is busy: {seen['busy'][0][:80]}")
+            if seen["pressure"] >= CRITICAL_PRESSURE:
+                raise Refused(f"{h['host']} is short of memory")
+            there = _remote(h["host"], f"[ -x {_rpath(h['folder'])}/{shlex.quote(h['binary'])} ] && echo found", 30)
+            if "found" not in there.stdout:
+                raise Refused(f"{h['folder']}/{h['binary']} not found on {h['host']}: run `orchard ai setup`")
         result = _remote(self.host, "python3 -I -", 120, fingerprint_script(self.cfg))
         try:
             self.fingerprint = json.loads(result.stdout)
@@ -526,21 +621,49 @@ class _Pool:
 
     def start_tunnel(self) -> None:
         h = self.cfg["helper"]
-        port = h["tunnel_port"]
+        self.tunnel = self._open_tunnel(h["tunnel_port"], h["port"])
+
+    def _open_tunnel(self, port: int, here: int) -> subprocess.Popen:
+        """The engine machine's `port` reaches this machine's `here`."""
         _pkill_local(f"^ssh .*-R {port}:")
         argv = ["ssh", "-N", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes",
-                "-R", f"{port}:127.0.0.1:{h['port']}", self.host]
+                "-R", f"{port}:127.0.0.1:{here}", self.host]
         for attempt in range(TUNNEL_TRIES):
-            self.tunnel = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                           stderr=subprocess.DEVNULL)
+            tunnel = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL)
             time.sleep(TUNNEL_SETTLE)
             listening = _remote(self.host, f"ss -ltn | grep -c ':{port} '", 20).stdout.strip()
-            if self.tunnel.poll() is None and listening not in ("", "0"):
-                return
-            _stop_process(self.tunnel)
+            if tunnel.poll() is None and listening not in ("", "0"):
+                return tunnel
+            _stop_process(tunnel)
             if attempt + 1 < TUNNEL_TRIES:
                 time.sleep(TUNNEL_GAP)
         raise Refused(f"no tunnel to {self.host} after {TUNNEL_TRIES} tries")
+
+    def start_far_helpers(self) -> None:
+        """Each far helper: its helper there, a link from here to it, and a
+        tunnel from the engine machine to that link."""
+        for h in self.cfg.get("far_helpers", []):
+            far: dict = {"host": h["host"], "helper": None, "link": None, "tunnel": None}
+            self.far.append(far)
+            ours = f"^./{h['binary']} -H 127.0.0.1 -p {h['port']}"
+            _remote(h["host"], f"pkill -f {shlex.quote(ours)}", 30)  # one left by a run that was killed
+            with (self.folder / f"helper-{h['host']}.log").open("wb") as log:
+                far["helper"] = subprocess.Popen([*_ssh(h["host"]), "bash -c " + shlex.quote(far_helper_script(h))],
+                                                 stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT)
+            time.sleep(HELPER_SETTLE)
+            if far["helper"].poll() is not None:
+                raise Refused(f"the helper on {h['host']} stopped straight away: see "
+                              f"{self.folder / ('helper-' + h['host'] + '.log')}")
+            _pkill_local(f"^ssh .*-L {h['local_port']}:")
+            far["link"] = subprocess.Popen(["ssh", "-N", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes",
+                                            "-L", f"{h['local_port']}:127.0.0.1:{h['port']}", h["host"]],
+                                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.DEVNULL)
+            time.sleep(TUNNEL_SETTLE)
+            if far["link"].poll() is not None:
+                raise Refused(f"no link to {h['host']}")
+            far["tunnel"] = self._open_tunnel(h["tunnel_port"], h["local_port"])
 
     def pause_apps(self, limit: int | None = None) -> None:
         win, names = self.cfg["windows"].get("host"), self.cfg["windows"]["pause"]
@@ -609,6 +732,15 @@ class _Pool:
                 return f"could not read free memory {UNREAD_READS} times running"
         if has_helper(self.cfg) and _local_pressure() >= CRITICAL_PRESSURE:
             return "this machine is short of memory"
+        for h, far in zip(self.cfg.get("far_helpers", []), self.far):
+            for part in ("helper", "link", "tunnel"):
+                if far[part] is not None and far[part].poll() is not None:
+                    return f"the {part} for {h['host']} stopped"
+            seen = far_check(h)
+            if seen["busy"]:
+                return f"{h['host']} is in use: {seen['busy'][0][:60]}"
+            if seen["pressure"] >= CRITICAL_PRESSURE:
+                return f"{h['host']} is short of memory"
         if self.holder:
             entry = _job_entry(self.holder) or {}
             # The dispatcher marks a pause with paused_since and leaves the state running.
@@ -684,6 +816,13 @@ class _Pool:
             self._step("guard", lambda: self.guard.join(5))
         if self.hold is not None:
             self._step("pause", self._end_pause)
+        for far in reversed(self.far):
+            self._step(f"tunnel to {far['host']}", lambda f=far: _stop_process(f["tunnel"]))
+            self._step(f"link to {far['host']}", lambda f=far: _stop_process(f["link"]))
+            if far["helper"] is not None and far["helper"].stdin and not far["helper"].stdin.closed:
+                # Ending the session stops the helper there straight away.
+                self._step(f"helper on {far['host']}", far["helper"].stdin.close)
+            self._step(f"helper on {far['host']}", lambda f=far: _stop_process(f["helper"]))
         self._step("tunnel", lambda: _stop_process(self.tunnel))
         self._step("helper", lambda: _stop_process(self.helper))
         if self.holder and not _cancel_job(self.holder):
@@ -731,7 +870,8 @@ def ask(question: str, *, threads: int | None = None, split: str | None = None, 
         "id": rid, "kind": "ai", "state": "running", "question": question, "started_at": time.time(),
         "words_asked": int(e["words"]),
         "settings": {key: e[key] for key in ("threads", "context", "layers", "devices", "split", "overrides", "args", "env")},
-        "machines": {"engine": e["host"], "helper": has_helper(cfg), "windows": cfg["windows"].get("host", "")},
+        "machines": {"engine": e["host"], "helper": has_helper(cfg), "windows": cfg["windows"].get("host", ""),
+                     "far_helpers": [h["host"] for h in cfg["far_helpers"]]},
     }
     _save(record)
     pool = _Pool(cfg, folder, say)
@@ -754,6 +894,9 @@ def ask(question: str, *, threads: int | None = None, split: str | None = None, 
             say("starting the GPU helper and its tunnel")
             pool.start_helper()
             pool.start_tunnel()
+        if cfg["far_helpers"]:
+            say("starting the helpers on " + ", ".join(h["host"] for h in cfg["far_helpers"]))
+            pool.start_far_helpers()
         if pause and has_windows(cfg) and cfg["windows"]["pause"]:
             pool.pause_apps()
         pool.wait_for_memory()
@@ -922,6 +1065,18 @@ def probe(cfg: dict) -> list[dict]:
         else:
             _facts_rows(rows, "this machine", facts)
             _row(rows, "this machine", "helper", facts["engine"], f"{h['folder']}/{h['binary']}")
+    for h in cfg.get("far_helpers", []):
+        script = _PROBE.format(folder=h["folder"], binary=h["binary"], pattern="")
+        far = _remote(h["host"], "python3 -I -", 120, script)
+        try:
+            facts = json.loads(far.stdout)
+        except json.JSONDecodeError:
+            _row(rows, h["host"], "reachable", False, (far.stderr or "no answer").strip()[-120:])
+        else:
+            _facts_rows(rows, h["host"], facts)
+            _row(rows, h["host"], "far helper", facts["engine"], f"{h['folder']}/{h['binary']}")
+            seen = far_check(h)
+            _row(rows, h["host"], "free now", not seen["busy"], seen["busy"][0][:80] if seen["busy"] else "nothing busy")
     if has_windows(cfg):
         win = cfg["windows"]["host"]
         read = _remote(win, _powershell(_PROBE_WINDOWS), 60)
@@ -943,8 +1098,9 @@ def probe(cfg: dict) -> list[dict]:
 
 def write_template() -> bool:
     """Write a settings file to fill in. Never overwrites one."""
-    if CONFIG_PATH.exists():
+    path = settings_path()
+    if path.exists():
         return False
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(TEMPLATE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(TEMPLATE)
     return True

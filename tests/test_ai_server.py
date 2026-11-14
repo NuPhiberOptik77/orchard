@@ -833,3 +833,82 @@ def test_the_engine_socket_must_be_a_sock_file(stub):
                                                                  f'socket = "{stub.sockets}/engine"'))
     with pytest.raises(ai.ConfigError, match="ending in .sock"):
         ai_server.load_settings()
+
+
+# What the Checker asked to see tested.
+
+def bare_cfg():
+    cfg = {section: dict(values) for section, values in ai.DEFAULTS.items()}
+    cfg["engine"].update(host="box", folder="~/e", model="~/m/model.gguf")
+    return cfg
+
+
+def test_a_guard_from_an_earlier_loading_never_unloads_the_next_one(monkeypatch):
+    monkeypatch.setattr(ai, "GUARD_POLL", 0.01)
+    engine = ai_server.Engine(bare_cfg(), lambda _message: None)
+    unloads = []
+    monkeypatch.setattr(engine, "unload", lambda why, from_guard=False: unloads.append(why))
+    old, new = object(), object()
+    monkeypatch.setattr(engine, "_why_unload", lambda reads: ("memory ran low", True))
+    engine.pool = new
+    engine._watch(threading.Event(), old)  # an old guard wakes up after the next loading began
+    assert unloads == []
+
+    def slow_check(reads):
+        engine.pool = new  # the next loading starts while this check is still running
+        return ("memory ran low", True)
+
+    engine.pool = old
+    monkeypatch.setattr(engine, "_why_unload", slow_check)
+    engine._watch(threading.Event(), old)
+    assert unloads == []
+    monkeypatch.setattr(engine, "_why_unload", lambda reads: ("memory ran low", True))
+    engine._watch(threading.Event(), new)  # the current guard still does its job
+    assert unloads == ["memory ran low"] and engine.stop_reason == "memory ran low"
+
+
+def test_a_link_left_by_a_killed_server_is_cleared_and_nothing_else(tmp_path, monkeypatch):
+    sock_dir = Path(tempfile.mkdtemp(prefix="orch"))
+    monkeypatch.setattr(ai_server, "SOCKET_DIR", sock_dir)
+
+    def fake_link(path):  # a process that looks like an ssh link to `path`
+        return subprocess.Popen(["bash", "-c", f'exec -a "ssh -N -o BatchMode=yes -L {path}:/remote/ai.sock box" sleep 30'])
+
+    left = fake_link(sock_dir / "ai-engine.sock")
+    unrelated = fake_link(sock_dir / "other.sock")
+    time.sleep(0.3)
+    patterns = []
+    try:
+        pool = ai_server._ServerPool(bare_cfg(), tmp_path, lambda _message: None)
+        pool.remote_socket = "/remote/ai.sock"
+
+        def stop_here(*args, **kwargs):
+            raise RuntimeError("stop after the clearing step")
+
+        with monkeypatch.context() as m:
+            m.setattr(ai, "_pkill_local", patterns.append)
+            m.setattr(ai_server.subprocess, "Popen", stop_here)
+            with pytest.raises(RuntimeError):
+                pool.start_forward()
+        assert len(patterns) == 1
+        # The pattern start_forward really uses, given to the system's own pkill
+        # (the stub fixture puts a fake one first on PATH).
+        subprocess.run(["/usr/bin/pkill", "-f", patterns[0]], check=True)
+        assert left.wait(5) is not None
+        assert unrelated.poll() is None
+    finally:
+        for proc in (left, unrelated):
+            proc.kill()
+            proc.wait()
+        shutil.rmtree(sock_dir, ignore_errors=True)
+
+
+def test_the_server_engine_finds_every_helper():
+    cfg = bare_cfg()
+    cfg["helper"]["folder"] = "~/helper"
+    cfg["far_helpers"] = [dict(ai.DEFAULTS["far_helper"], host="far", folder="~/far")]
+    argv = ai_server.server_command(cfg)
+    assert argv[argv.index("--rpc") + 1] == "127.0.0.1:50072,127.0.0.1:50073"
+    cfg["helper"]["folder"] = ""
+    argv = ai_server.server_command(cfg)
+    assert argv[argv.index("--rpc") + 1] == "127.0.0.1:50073"

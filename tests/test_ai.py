@@ -6,6 +6,7 @@ import signal
 import stat
 import subprocess
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -38,14 +39,15 @@ def next_free():
         with open(f"{home}/free.txt", "w") as handle:
             handle.write("\n".join(values[1:]))
     return values[0]
-args, tunnel, host, words = sys.argv[1:], False, None, []
+args, tunnel, link, host, words = sys.argv[1:], False, False, None, []
 while args:
     arg = args.pop(0)
     if arg == "-T":
         continue
     if arg == "-N":
         tunnel = True
-    elif arg in ("-o", "-R"):
+    elif arg in ("-o", "-R", "-L"):
+        link = link or arg == "-L"
         args.pop(0)
     else:
         host, words = arg, args
@@ -53,7 +55,7 @@ while args:
 if host == "gone":
     sys.exit(255)
 if tunnel:
-    stay_up("tunnel up", "tunnel down")
+    stay_up("link up" if link else "tunnel up", "link down" if link else "tunnel down")
     time.sleep(600)
     sys.exit(0)
 command = " ".join(words)
@@ -68,7 +70,7 @@ elif command.startswith("awk"):
     free = next_free()
     if free.isdigit():
         print(free)
-elif command.startswith("pkill"):
+elif command.startswith("pkill") and "llama" in command:
     note("engine killed")
     with open(f"{home}/engine.pid") as handle:
         os.kill(int(handle.read()), signal.SIGTERM)
@@ -106,6 +108,14 @@ cat >&2 <<'LOG'
 21.39.294.198 I common_perf_print:        eval time =  93000.00 ms /    31 runs   ( 3000.00 ms per token,     0.33 tokens per second)
 LOG
 exit "$(cat "$AI_STUB/engine.exit" 2>/dev/null || echo 0)"
+'''
+
+FAR_HELPER = '''#!/bin/bash
+trap 'kill $child; echo "far helper down" >> "$AI_STUB/events.log"; exit 0' TERM
+printf '%s\\n' "$@" > "$AI_STUB/far.args"
+echo "far helper up" >> "$AI_STUB/events.log"
+sleep 600 & child=$!
+wait $child
 '''
 
 HELPER = '''#!/bin/bash
@@ -712,3 +722,112 @@ def test_running_out_of_words_while_thinking_is_not_an_answer(stub, monkeypatch)
     assert "word limit ran out" in result.output and "--- answer" not in result.output
     record = ai.recent()[0]
     assert record["state"] == "failed" and record["answer"] == "" and record["thinking"] == "Still reasoning about"
+
+
+# A helper on another machine, reached through this one.
+
+def far_setup(stub, monkeypatch):
+    far = stub.home.parent / "far"
+    far.mkdir(exist_ok=True)
+    _script(far / "ggml-rpc-server", FAR_HELPER)
+    mark = f"farbusy-{os.getpid()}"
+    write_settings(stub, helper=True)
+    with ai.CONFIG_PATH.open("a") as handle:
+        handle.write(f'\n[[far_helper]]\nhost = "far"\nfolder = "{far}"\nbusy_pattern = "^{mark}"\n')
+    # The far machine's memory pressure comes from a file here, not this Mac.
+    monkeypatch.setattr(ai, "FAR_CHECK", ai.FAR_CHECK.replace(
+        "sysctl -n kern.memorystatus_vm_pressure_level 2> /dev/null", 'cat "$AI_STUB/far_pressure" 2> /dev/null'))
+    return mark
+
+
+def busy_process(mark):
+    proc = subprocess.Popen(["bash", "-c", f'exec -a "{mark} job" sleep 60'])
+    time.sleep(0.3)
+    return proc
+
+
+def test_far_helpers_are_read_with_their_own_ports(stub):
+    write_settings(stub, helper=True)
+    with ai.CONFIG_PATH.open("a") as handle:
+        handle.write('\n[[far_helper]]\nhost = "one"\nfolder = "~/llm"\n\n[[far_helper]]\nhost = "two"\nfolder = "~/llm"\n')
+    cfg = ai.load_settings()
+    assert [(h["host"], h["local_port"], h["tunnel_port"]) for h in cfg["far_helpers"]] == [
+        ("one", 50062, 50073), ("two", 50063, 50074)]
+    assert ai.rpc_list(cfg) == "127.0.0.1:50072,127.0.0.1:50073,127.0.0.1:50074"
+    for bad, message in (('host = ""\nfolder = "~/llm"', "set host for far helper 1"),
+                         ('host = "one"\nfolder = "~/llm"\nport = 80', "port must be a port number"),
+                         ('host = "one"\nfolder = "~/llm"\ntunnel_port = 50072', "two helpers share a tunnel_port")):
+        write_settings(stub, helper=True)
+        with ai.CONFIG_PATH.open("a") as handle:
+            handle.write(f'\n[[far_helper]]\n{bad}\n')
+        with pytest.raises(ai.ConfigError, match=message):
+            ai.load_settings()
+
+
+def test_a_settings_file_can_be_named_for_one_model(stub, monkeypatch, tmp_path):
+    write_settings(stub)
+    other = tmp_path / "ai-other.toml"
+    other.write_text(ai.CONFIG_PATH.read_text().replace("threads = 4", "threads = 6"))
+    monkeypatch.setenv("ORCHARD_AI_SETTINGS", str(other))
+    assert ai.settings_path() == other and ai.load_settings()["engine"]["threads"] == 6
+    monkeypatch.setenv("ORCHARD_AI_SETTINGS", str(tmp_path / "missing.toml"))
+    with pytest.raises(ai.ConfigError, match="missing.toml"):
+        ai.load_settings()
+
+
+def test_a_far_helper_joins_through_this_machine_and_leaves_with_the_run(stub, monkeypatch):
+    far_setup(stub, monkeypatch)
+    result = invoke("ask", "why is the sky blue?")
+    assert result.exit_code == 0, result.output
+    args = (stub.home / "engine.args").read_text().split("\n")[:-1]
+    assert args[args.index("--rpc") + 1] == "127.0.0.1:50072,127.0.0.1:50073"
+    assert (stub.home / "far.args").read_text().split() == ["-H", "127.0.0.1", "-p", "50052"]  # no cache: small disks
+    seen = events(stub)
+    assert {"far helper up", "link up", "helper up"} <= set(seen) and seen.count("tunnel up") == 2
+    assert seen.index("engine started") < seen.index("far helper down")  # its ssh session ending stopped it
+    assert seen.index("engine started") < seen.index("link down")
+    record = ai.recent()[0]
+    assert record["state"] == "answered" and record["machines"]["far_helpers"] == ["far"]
+
+
+def test_a_busy_far_helper_is_refused_before_anything_starts(stub, monkeypatch):
+    mark = far_setup(stub, monkeypatch)
+    proc = busy_process(mark)
+    try:
+        result = invoke("ask", "hello")
+    finally:
+        proc.kill()
+    assert result.exit_code == 2 and "far is busy: " + mark in result.output
+    assert "engine started" not in events(stub) and "far helper up" not in events(stub)
+
+
+def test_a_far_helper_short_of_memory_is_refused(stub, monkeypatch):
+    far_setup(stub, monkeypatch)
+    (stub.home / "far_pressure").write_text("4\n")
+    result = invoke("ask", "hello")
+    assert result.exit_code == 2 and "far is short of memory" in result.output
+
+
+def test_the_run_stops_when_the_far_machine_comes_into_use(stub, monkeypatch):
+    mark = far_setup(stub, monkeypatch)
+    (stub.home / "slow").write_text("")
+    procs = []
+
+    def start_later():
+        for _ in range(200):
+            if "engine started" in events(stub):
+                break
+            time.sleep(0.05)
+        procs.append(busy_process(mark))
+
+    threading.Thread(target=start_later, daemon=True).start()
+    try:
+        result = invoke("ask", "hello")
+    finally:
+        for proc in procs:
+            proc.kill()
+    assert result.exit_code == 3, result.output
+    record = ai.recent()[0]
+    assert record["state"] == "stopped" and record["reason"].startswith("far is in use: " + mark)
+    seen = events(stub)
+    assert "far helper down" in seen and "link down" in seen

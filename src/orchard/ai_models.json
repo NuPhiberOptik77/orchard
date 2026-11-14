@@ -1240,7 +1240,7 @@
    "maker": "Mistral AI",
    "repo": "unsloth/Mistral-Small-4-119B-2603-GGUF",
    "params_b": 119.0,
-   "active_b": null,
+   "active_b": 6.5,
    "context": 1048576,
    "licence": "apache-2.0",
    "gated": false,
@@ -1304,7 +1304,7 @@
      "entry": "Mistral Small 4 (Reasoning)"
     }
    ],
-   "notes": "MoE with 128 experts, 4 active per token (model card); active parameter count not stated in the card text read, so null. AA entry is 'Mistral Small 4 Reasoning'."
+   "notes": "MoE with 128 experts, 4 active per token (model card); the card says 6.5B parameters are activated per token. AA entry is 'Mistral Small 4 Reasoning'."
   },
   {
    "id": "mistral-medium-3.5-128b",

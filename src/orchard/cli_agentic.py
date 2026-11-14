@@ -1053,7 +1053,7 @@ def ai_setup(json_out: bool = typer.Option(False, "--json", help="machine-readab
     """Check every machine in the settings, or write a settings file to fill in.
     Reads only. Exit 0 all good, 1 something needs fixing, 2 settings to fill in."""
     if ai.write_template():
-        print(f"wrote {ai.CONFIG_PATH}: fill it in and run this again. docs/ai.md explains it.")
+        print(f"wrote {ai.settings_path()}: fill it in and run this again. docs/ai.md explains it.")
         raise typer.Exit(2)
     try:
         rows = ai.probe(ai.load_settings())

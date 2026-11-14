@@ -82,16 +82,16 @@ def load_settings() -> dict:
     s = cfg["server"]
     for key in ("port", "context"):
         if not isinstance(s[key], int) or isinstance(s[key], bool) or s[key] < 0:
-            raise ai.ConfigError(f"{ai.CONFIG_PATH}: server.{key} must be a whole number")
+            raise ai.ConfigError(f"{ai.settings_path()}: server.{key} must be a whole number")
     for key in ("keep_alive_seconds", "max_loaded_seconds"):
         if not isinstance(s[key], (int, float)) or isinstance(s[key], bool) or s[key] < 0:
-            raise ai.ConfigError(f"{ai.CONFIG_PATH}: server.{key} must be a number of seconds")
+            raise ai.ConfigError(f"{ai.settings_path()}: server.{key} must be a number of seconds")
     if s["port"] > 65535:
-        raise ai.ConfigError(f"{ai.CONFIG_PATH}: server.port must be under 65536")
+        raise ai.ConfigError(f"{ai.settings_path()}: server.port must be under 65536")
     if not isinstance(s["origins"], list) or not all(isinstance(o, str) for o in s["origins"]):
-        raise ai.ConfigError(f"{ai.CONFIG_PATH}: server.origins must be a list of web origins")
+        raise ai.ConfigError(f"{ai.settings_path()}: server.origins must be a list of web origins")
     if not s["socket"] or not str(s["socket"]).startswith(("/", "~/")) or not str(s["socket"]).endswith(".sock"):
-        raise ai.ConfigError(f"{ai.CONFIG_PATH}: server.socket must be a full path ending in .sock")
+        raise ai.ConfigError(f"{ai.settings_path()}: server.socket must be a full path ending in .sock")
     return cfg
 
 
@@ -124,8 +124,8 @@ def server_command(cfg: dict) -> list[str]:
     argv = [f"./{s['binary']}", "-m", e["model"], "--host", SOCKET_ARG, "-c", str(s["context"] or e["context"]),
             "-t", str(e["threads"]), "-np", "1", "--no-webui", "--cache-ram", "0",
             "--timeout", str(int(e["cap_seconds"]) + 60), "--alias", model_name(cfg)]
-    if ai.has_helper(cfg):
-        argv += ["--rpc", f"127.0.0.1:{cfg['helper']['tunnel_port']}"]
+    if rpc := ai.rpc_list(cfg):
+        argv += ["--rpc", rpc]
     for flag, key in (("--device", "devices"), ("-ngl", "layers"), ("-ts", "split"), ("-ot", "overrides")):
         if e[key] != "":
             argv += [flag, str(e[key])]
@@ -334,7 +334,8 @@ class Engine:
             "settings": {key: e[key] for key in ("threads", "layers", "devices", "split", "overrides", "args", "env")}
             | {"context": s["context"] or e["context"], "keep_alive_seconds": s["keep_alive_seconds"]},
             "machines": {"engine": e["host"], "helper": ai.has_helper(self.cfg),
-                         "windows": self.cfg["windows"].get("host", "")},
+                         "windows": self.cfg["windows"].get("host", ""),
+                         "far_helpers": [h["host"] for h in self.cfg.get("far_helpers", [])]},
             "command": server_command(self.server_cfg), "answers": [],
         }
         ai._save(self.session)
@@ -354,6 +355,9 @@ class Engine:
                 self.say("starting the GPU helper and its tunnel")
                 self.pool.start_helper()
                 self.pool.start_tunnel()
+            if self.cfg.get("far_helpers"):
+                self.say("starting the helpers on " + ", ".join(h["host"] for h in self.cfg["far_helpers"]))
+                self.pool.start_far_helpers()
             if ai.has_windows(self.cfg) and self.cfg["windows"]["pause"]:
                 self.pool.pause_apps(longest + 1200)
             self.pool.wait_for_memory()

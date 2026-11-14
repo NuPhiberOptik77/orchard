@@ -52,11 +52,13 @@ record ai-20261106-091520-92d5
 2. **Holds the machine.** With `worker` set, a sleeping job keeps Orchard's queue
    off that machine. If the queue can't start it within `hold_wait_seconds`, the
    question is refused.
-3. **Starts the helper and tunnel**, if there's a `[helper]`.
+3. **Starts the helper and tunnel**, if there's a `[helper]`, and each far
+   helper with its link and tunnel.
 4. **Pauses the apps** in `[windows] pause`.
 5. **Waits for memory**, up to `settle_seconds`, until `start_free_mb` is free.
 6. **Runs the engine** and streams the answer to you.
-7. **Puts everything back**, in order: engine, apps, tunnel, helper, hold.
+7. **Puts everything back**, in order: engine, apps, far helpers, tunnel, helper,
+   hold.
 8. **Seals a record** in `~/.orchard/state/ai/`.
 
 During the run, every 20 seconds it stops the engine if:
@@ -65,6 +67,8 @@ During the run, every 20 seconds it stops the engine if:
 - free memory can't be read six times running
 - the machine lending the GPU reaches critical memory pressure
 - the hold job is paused, which means someone started using the machine
+- a far helper's machine is short of memory, runs something matching its
+  `busy_pattern`, or its helper, link or tunnel stops
 - the run passes `cap_seconds`
 
 If the sync apps can't be confirmed back, the record and the report say so in
@@ -339,6 +343,34 @@ Other settings, with their defaults: `context` 512, `layers` 99, `words` 200,
 its reasoning. With it, `ask` labels the reasoning, keeps it apart from the answer
 in the record, and calls a run that hits the word limit before the answer failed.
 Leave it empty for a model that doesn't reason first.
+
+**More machines: far helpers.** A `[[far_helper]]` lends another machine to the
+engine, reached through the one you ask from: an ssh link from here to it, and
+the engine machine's tunnel to that link, so the engine machine needs no access
+to it. Repeat the block for each machine. The engine sees them after this
+machine's helper, so with a `[helper]` and one far helper the devices are `RPC0`
+(here) and `RPC1` (the far one):
+
+```toml
+[[far_helper]]
+host = "old-mac"                # ssh name of that machine
+folder = "~/llm/helper"         # holds ggml-rpc-server
+busy_pattern = "^\\./ggml-rpc|Runner\\.Worker"
+```
+
+Before a run it checks each far machine: reachable, the helper there, not short
+of memory, and nothing running that matches `busy_pattern` (a process list
+pattern: put your own build or CI jobs in it). During the run it checks again,
+and stops and puts everything back if one comes into use or runs short. The
+helper there stops as soon as its ssh session ends, however the run ends. It
+keeps no cache on that machine's disk unless you set `cache = true`. Other
+settings, with their defaults: `binary` `ggml-rpc-server`, `device` empty (the
+helper's own choice), `port` 50052 on that machine, and `local_port` 50062 and
+`tunnel_port` 50073, each one more for every far helper after the first.
+
+**A settings file per model.** `ORCHARD_AI_SETTINGS` names another settings
+file, so each model can keep its own: `ORCHARD_AI_SETTINGS=~/.orchard/ai-coding.toml
+orchard ai serve`. Without it, `~/.orchard/ai.toml` is used.
 
 ## Tuning it
 
