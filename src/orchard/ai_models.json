@@ -234,7 +234,7 @@
      "entry": "Qwen3.5 4B (Reasoning)"
     }
    ],
-   "notes": "No AA score read (AA listing shows only the 2B of this family in its tiny top 12)."
+   "notes": "No Progress Index score read (AA listing shows only the 2B of this family in its tiny top 12)."
   },
   {
    "id": "gemma-4-e4b",
@@ -299,7 +299,7 @@
      "entry": "Gemma 4 E4B (Reasoning)"
     }
    ],
-   "notes": "4.5B effective, 8B with embeddings (model card of the 12B repo family table). No AA score read."
+   "notes": "4.5B effective, 8B with embeddings (model card of the 12B repo family table). No Progress Index score read."
   },
   {
    "id": "qwen3.5-9b",
@@ -364,7 +364,7 @@
      "entry": "Qwen3.5 9B (Reasoning)"
     }
    ],
-   "notes": "No AA score read."
+   "notes": "No Progress Index score read."
   },
   {
    "id": "gemma-4-12b",
@@ -424,7 +424,7 @@
      "entry": "Gemma 4 12B (Reasoning)"
     }
    ],
-   "notes": "Model card lists 11.95B params. No AA score read."
+   "notes": "Model card lists 11.95B params. No Progress Index score read."
   },
   {
    "id": "gpt-oss-20b",
@@ -484,7 +484,7 @@
      "entry": "gpt-oss-20b"
     }
    ],
-   "notes": "Model card: 21B params, 3.6B active. Older (Aug 2025 release; repo updated Dec 2025). No AA score read."
+   "notes": "Model card: 21B params, 3.6B active. Older (Aug 2025 release; repo updated Dec 2025). No Progress Index score read."
   },
   {
    "id": "gemma-4-26b-a4b",
@@ -555,7 +555,7 @@
      "entry": "Gemma 4 26B A4B"
     }
    ],
-   "notes": "Model card: 25.2B total, 3.8B active. No AA score read."
+   "notes": "Model card: 25.2B total, 3.8B active. No Progress Index score read."
   },
   {
    "id": "qwen3.8-27b",

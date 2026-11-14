@@ -450,3 +450,48 @@ def test_the_command_says_when_no_machine_matches(monkeypatch):
     monkeypatch.setattr(ai_pick, "builtin_list", lambda: catalogue(model("mid", 50, 5.0)))
     result = runner.invoke(cli.app, ["ai", "pick", "--offline", "--for", "general", "--machines", "nobody"])
     assert result.exit_code == 1 and "Nothing on the list runs" in result.stdout
+
+
+# What the Checker found in the by-use ranking.
+
+def test_only_a_model_with_a_general_score_is_called_strongest_overall():
+    unscored = model("unscored", 0, 5.0, params=8.0, good_at=("vision",), pictures={"file": "p.gguf", "bytes": 1})
+    unscored["scores"] = []
+    squeezed = model("squeezed", 80, 0, params=36.0, active=4.0, good_at=("vision",),
+                     quants=[{"quant": "IQ2_M", "files": ["s"], "bytes": int(13e9)}], pictures={"file": "p.gguf", "bytes": 1})
+    result = ai_pick.pick(fleet(), catalogue(unscored, squeezed), use="vision")
+    assert result["best"]["model"]["id"] == "unscored"
+    assert result["overall"]["model"]["id"] == "squeezed"  # never the unscored one
+    alone = ai_pick.pick(fleet(), catalogue(unscored), use="vision")
+    assert alone["overall"] is None
+    text = "\n".join(ai_pick.report(alone, None, []))
+    assert "Strongest overall" not in text
+    assert ("no pictures leaderboard on the list yet, so this is the strongest of them made for reading pictures, "
+            "with no general score either") in text
+
+
+def test_a_pick_without_a_score_for_the_use_says_how_it_was_chosen():
+    coder = model("coder", 60, 5.0, params=8.0)
+    talker = model("talker", 90, 5.0, params=8.0, good_at=("chat",))
+    scored_but_slow = with_score(model("dense", 99, 18.0), "code", 0.9)
+    result = ai_pick.pick(fleet(), coding_catalogue(coder, talker, scored_but_slow), use="coding")
+    assert result["best"]["model"]["id"] == "coder"
+    text = "\n".join(ai_pick.report(result, None, []))
+    assert ("none of the models here that run well at full strength has a coding score yet, so this is the "
+            "strongest of them made for coding, by general score") in text
+
+
+def test_no_question_when_the_output_is_piped(monkeypatch):
+    class Stream:
+        def __init__(self, tty):
+            self.tty = tty
+
+        def isatty(self):
+            return self.tty
+
+    monkeypatch.setattr(cli_agentic.sys, "stdin", Stream(True))
+    monkeypatch.setattr(cli_agentic.sys, "stderr", Stream(True))
+    monkeypatch.setattr(cli_agentic.sys, "stdout", Stream(False))
+    assert cli_agentic._can_ask() is False
+    monkeypatch.setattr(cli_agentic.sys, "stdout", Stream(True))
+    assert cli_agentic._can_ask() is True

@@ -462,14 +462,16 @@ def pick(machines: list[Machine], catalogue: dict, use: str = "general") -> dict
                                      v["quant"]["bytes"] if v["group"] == "no" else -v["quant"]["bytes"]))
         rows.append(verdicts[0])
 
-    def grouped(for_use: str) -> dict:
-        ranked = sorted(rows, key=lambda r: rank_key(r["model"], for_use, ranker, primary), reverse=True)
+    def grouped(for_use: str, among: list[dict]) -> dict:
+        ranked = sorted(among, key=lambda r: rank_key(r["model"], for_use, ranker, primary), reverse=True)
         return {g: [r for r in ranked if r["group"] == g] for g in ("fast", "slow", "no")}
 
-    groups = grouped(use)
+    groups = grouped(use, rows)
     best = _best(groups)
-    # For a task, also the strongest overall, when it isn't the same model.
-    overall = _best(grouped("general")) if use != "general" else None
+    # For a task, also the strongest overall, when it isn't the same model. Only
+    # a model with a general score can be called that.
+    scored = [r for r in rows if score_of(r["model"], primary) is not None]
+    overall = _best(grouped("general", scored)) if use != "general" else None
     covered = sum(1 for r in rows if ranker and score_of(r["model"], ranker["id"]) is not None)
     return {"machines": machines, "groups": groups, "best": best, "primary": primary, "use": use,
             "ranker": ranker, "overall": None if overall is best else overall,
@@ -575,14 +577,19 @@ def _why_best(best: dict, result: dict) -> str:
     comfortable = best["group"] == "fast" and best["words_per_second"] >= COMFORT_WPS
     speed = (f" of those here that should answer at {COMFORT_WPS:.0f} or more words a second"
              + ("" if squeezed(best) else f", kept at {FULL_BITS} or more bits a weight")) if comfortable else " here"
+    general = score_of(best["model"], result["primary"]) is not None
+    # The models the pick was chosen from, which then have no score of that kind.
+    among = ("here that run well at full strength" if comfortable and not squeezed(best)
+             else "here that run well" if comfortable else "that run here")
     if use == "general":
-        return f"    the strongest{speed}"
+        return f"    the strongest{speed}" if general else f"    none of the models {among} has a general score yet"
     if ranker and score_of(best["model"], ranker["id"]) is not None:
         return f"    the strongest at {USES[use]} by {ranker.get('short') or ranker['name']}{speed}"
-    if ranker:
-        return (f"    none of the models that run well here has a {_word(use)} score yet, "
-                f"so this is the strongest of them in general")
-    return f"    no {_word(use)} leaderboard on the list yet, so this is the strongest made for it in general"
+    why = (f"none of the models {among} has a {_word(use)} score yet" if ranker
+           else f"no {_word(use)} leaderboard on the list yet")
+    made = f" made for {USES[use]}" if use in (best["model"].get("good_at") or []) else ""
+    how = "by general score" if general else "with no general score either"
+    return f"    {why}, so this is the strongest of them{made}, {how}"
 
 
 def report(result: dict, online: dict | None, new: list[dict]) -> list[str]:

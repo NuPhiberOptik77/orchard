@@ -997,9 +997,9 @@ def ai_serve(
 
 
 def _can_ask() -> bool:
-    """Someone is at the keyboard to answer a question."""
+    """Someone is at the keyboard to answer a question, and the output isn't piped."""
     try:
-        return sys.stdin.isatty() and sys.stderr.isatty()
+        return sys.stdin.isatty() and sys.stdout.isatty() and sys.stderr.isatty()
     except (AttributeError, ValueError):
         return False
 

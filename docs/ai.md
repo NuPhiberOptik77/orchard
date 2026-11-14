@@ -142,7 +142,7 @@ a reasoning 22% don't mean the model is better at coding.
 
 **What it shows for each model:** every score it has, each with its use and
 leaderboard (the sources, links and dates are listed at the end); what it is
-made for; how much it takes in at once, in tokens and roughly in words; how many
+made for; how much it takes in at once, as its own file says, in tokens and roughly in words; how many
 parameters it has and, for a mixture of experts, how many are at work per word;
 its licence and where to get it.
 
