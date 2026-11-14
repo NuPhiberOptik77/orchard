@@ -66,6 +66,15 @@ NOW_MARGIN_GB = 1.0
 SHORT_SHARE = 0.8
 # Engine flags that move parts of a model by hand, so the split alone doesn't say who held what.
 PLACEMENT_FLAGS = {"-ot", "--override-tensor", "-ncmoe", "--n-cpu-moe", "-cmoe", "--cpu-moe"}
+# Flags Orchard writes once from its settings; written again, the later one wins.
+POSITION_FLAGS = [{"-ngl", "--n-gpu-layers", "--gpu-layers"}, {"-ts", "--tensor-split"},
+                  {"-dev", "--device"}, {"-sm", "--split-mode"}, {"-mg", "--main-gpu"}]
+
+
+def _moved_by_hand(command) -> bool:
+    """The engine was told where to put parts beyond Orchard's own settings."""
+    words = [str(w).split("=", 1)[0] for w in (command if isinstance(command, list) else str(command or "").split())]
+    return bool(set(words) & PLACEMENT_FLAGS) or any(sum(w in group for w in words) > 1 for group in POSITION_FLAGS)
 # Of a graphics card's own memory, what a model can use.
 VRAM_SHARE = 0.8
 # Memory a model needs beyond its file: a tenth more, and 1 GB for its working memory.
@@ -567,7 +576,7 @@ def _model_file(command) -> str | None:
 
 
 def held_gb(record: dict, model: dict, quant: dict, name_of: Callable[[str | None], str],
-            here: str) -> dict[str, float] | None:
+            here: str, command=None) -> dict[str, float] | None:
     """About how much of the model each machine held in a run, from its layers:
     the engine's graphics card and each helper take their part of the layers
     sent to devices, and the engine keeps the rest. None when the run moved
@@ -581,8 +590,8 @@ def held_gb(record: dict, model: dict, quant: dict, name_of: Callable[[str | Non
     except ValueError:
         return None
     args = {str(a).split("=", 1)[0] for a in settings.get("args") or []}
-    if (not blocks or settings.get("overrides") or args & PLACEMENT_FLAGS or not devices or sent < 0
-            or len(parts) != len(devices) or sum(parts) <= 0):
+    if (not blocks or settings.get("overrides") or args & (PLACEMENT_FLAGS | set().union(*POSITION_FLAGS))
+            or _moved_by_hand(command) or not devices or sent < 0 or len(parts) != len(devices) or sum(parts) <= 0):
         return None
     helpers = ([here] if who.get("helper") else []) + [name_of(h) for h in who.get("far_helpers") or []]
     engine = name_of(who.get("engine"))
@@ -649,7 +658,8 @@ def history(machines: list[Machine], catalogue: dict, folder: Path | None = None
         if not found:
             continue
         model, quant = found
-        held = held_gb(record if record.get("settings") else session, model, quant, name_of, here)
+        held = held_gb(record if record.get("settings") else session, model, quant, name_of, here,
+                       record.get("command") or session.get("command"))
         speed = (record.get("timings") or {}).get("ms_per_word")
         who = record.get("machines") or {}
         used = [name_of(who.get("engine"))] + ([here] if who.get("helper") else []) \

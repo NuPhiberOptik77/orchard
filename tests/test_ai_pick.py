@@ -717,6 +717,13 @@ def test_engine_flags_that_move_parts_or_odd_layer_counts_are_not_measured():
     assert ai_pick.held_gb(record, mid, mid["quants"][0], lambda h: h, "this Mac") is None
     record["settings"].update(args=[], layers=-1)
     assert ai_pick.held_gb(record, mid, mid["quants"][0], lambda h: h, "this Mac") is None
+    record["settings"].update(args=["-ngl", "10"], layers=18)
+    assert ai_pick.held_gb(record, mid, mid["quants"][0], lambda h: h, "this Mac") is None
+    # A served model's extra flags are only in its command: written twice, the later one wins.
+    record["settings"]["args"] = []
+    served = ["./llama-server", "-m", "m.gguf", "-ngl", "18", "-ts", "2,16", "--device", "CUDA0,RPC0", "-ts", "1,1"]
+    assert ai_pick.held_gb(record, mid, mid["quants"][0], lambda h: h, "this Mac", served) is None
+    assert ai_pick.held_gb(record, mid, mid["quants"][0], lambda h: h, "this Mac", served[:-2]) is not None
 
 
 def test_room_now_never_goes_below_zero_and_a_model_is_not_shown_twice():
