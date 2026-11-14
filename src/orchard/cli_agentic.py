@@ -19,7 +19,7 @@ from typing import Optional
 
 import typer
 
-from . import ab, ai, ai_server, consensus, fleet, live, mind, placement, receipts, replica, speculate, transport, worlds
+from . import ab, ai, ai_pick, ai_server, consensus, fleet, live, mind, placement, receipts, replica, speculate, transport, worlds
 from .job import slugify
 from .cli import app, find_jobs
 
@@ -994,6 +994,32 @@ def ai_serve(
         print(f"ai: {exc}", file=sys.stderr)
         raise typer.Exit(2)
     raise typer.Exit(code)
+
+
+@ai_app.command("pick")
+def ai_pick_cmd(
+    offline: bool = typer.Option(False, "--offline", help="use Orchard's own list only; don't ask Hugging Face"),
+    good_at: Optional[str] = typer.Option(None, "--for", help="only models good at this: coding, agents, chat or reasoning"),
+    machines: Optional[str] = typer.Option(None, "--machines", help="only these machines, comma-separated ('this' is this one)"),
+    json_out: bool = typer.Option(False, "--json", help="machine-readable output"),
+) -> None:
+    """Which of the strongest open models your machines can run, and how.
+
+    Reads each machine (memory, graphics, disk, memory speed), then sorts a dated
+    list of open models into fast (fits in memory), slow (runs from disk) and
+    won't run, strongest first, with the split across machines. Downloads nothing.
+    Unless --offline, file sizes are checked on Hugging Face; nothing about you is sent."""
+    def say(message: str) -> None:
+        if not json_out:
+            print(f"ai: {message}", file=sys.stderr, flush=True)
+
+    only = [name.strip() for name in machines.split(",")] if machines else None
+    result, online, new = ai_pick.run(offline=offline, good_at=good_at, only=only, say=say)
+    if json_out:
+        print(json.dumps(ai_pick.as_json(result, online, new), indent=2))
+    else:
+        print("\n".join(ai_pick.report(result, online, new)))
+    raise typer.Exit(0 if result["best"] else 1)
 
 
 @ai_app.command("setup")

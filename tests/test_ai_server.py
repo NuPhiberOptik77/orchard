@@ -800,3 +800,36 @@ def hold_job(monkeypatch, states):
     monkeypatch.setattr(ai, "_job_entry", entry)
     monkeypatch.setattr(ai, "_cancel_job", lambda job_id: cancelled.append(job_id) or True)
     return cancelled
+
+
+def test_an_answer_is_recorded_once_even_if_the_tool_hangs_up_after(serve, stub):
+    server = serve()
+    assert chat(server)[0] == 200
+    answer = ai_server.Answer(server.engine, "openai-chat", b"{}", {"messages": [{"role": "user", "content": "hi"}]})
+    first = answer.finish("answered", None, "", "Blue.", {})
+    second = answer.finish("stopped", "the tool hung up", "", "", {})
+    assert second is first and ai.find(answer.id)["state"] == "answered"
+    assert server.engine.session["answers"].count(answer.id) == 1
+
+
+def test_leftover_holds_are_cancelled_when_nothing_holds_the_lock(stub, monkeypatch):
+    entries = [{"id": "ai-hold-20261114-100814-6cd3", "state": "running"}, {"id": "bash-1", "state": "running"},
+               {"id": "ai-hold-20261113-000000-0000", "state": "done"}]
+    monkeypatch.setattr(ai.dispatcher, "load_entries", lambda: entries)
+    cancelled = []
+    monkeypatch.setattr(ai, "_cancel_job", lambda job: cancelled.append(job) or True)
+    said = []
+    assert ai_server.clear_leftovers(said.append) == ["ai-hold-20261114-100814-6cd3"]
+    assert "left by an earlier run" in said[0]
+    cancelled.clear()
+    with (ai.AI_DIR / ".lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        assert ai_server.clear_leftovers(said.append) == [] and cancelled == []
+
+
+def test_the_engine_socket_must_be_a_sock_file(stub):
+    write_settings(stub)
+    ai.CONFIG_PATH.write_text(ai.CONFIG_PATH.read_text().replace(f'socket = "{stub.sockets}/engine.sock"',
+                                                                 f'socket = "{stub.sockets}/engine"'))
+    with pytest.raises(ai.ConfigError, match="ending in .sock"):
+        ai_server.load_settings()

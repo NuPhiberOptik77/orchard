@@ -1,0 +1,1327 @@
+{
+ "about": "Open models Orchard's picker knows, with exact file sizes read from Hugging Face and strength from the named public index. Read on the date in as_of; `orchard ai pick` re-checks sizes online unless told not to. A model with no score was not in the index's top entries for its size, which doesn't mean it is weak.",
+ "as_of": "2026-11-14",
+ "primary": "aa-progress",
+ "sources": [
+  {
+   "id": "aa-progress",
+   "name": "Artificial Analysis Progress Index v1",
+   "url": "https://artificialanalysis.ai/models/open-source",
+   "read_on": "2026-11-14",
+   "what": "Read from its open-source size-class pages. Item-response-theory estimate of general capability across AA evaluations; pages /small, /medium, /large, /tiny each showed only the top 12 models, so a missing model is unscored in my data, not necessarily low."
+  },
+  {
+   "id": "aa-intel",
+   "name": "Artificial Analysis Intelligence Index v5.0.1",
+   "url": "https://artificialanalysis.ai/leaderboards/models",
+   "read_on": "2026-11-14",
+   "what": "Composite of several evaluations (v5 launched 27 Oct 2026, harsh: about 60% private test sets, so scores are low and not comparable with earlier versions). Whole numbers; no Coding/Agentic sub-index shown on pages read."
+  }
+ ],
+ "models": [
+  {
+   "id": "k2-horizon-3.7b",
+   "name": "K2 Horizon 3.7B",
+   "maker": "Institute of Foundation Models",
+   "repo": "IFM/K2-Horizon-3.7B-GGUF",
+   "params_b": 5.1,
+   "active_b": null,
+   "context": 524288,
+   "licence": "apache-2.0",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "chat",
+    "reasoning"
+   ],
+   "quants": [
+    {
+     "quant": "Q4_K_M",
+     "files": [
+      "K2-Horizon-4B-Q4_K_M.gguf"
+     ],
+     "bytes": 3156598144
+    }
+   ],
+   "scores": [
+    {
+     "source": "aa-progress",
+     "benchmark": "Progress Index v1",
+     "score": 242
+    }
+   ],
+   "notes": "Maker repo file names say 4B; AA lists 3.7B. Needs llama.cpp b11454 or newer (per repo README). params_b is HF GGUF metadata (5.06B, includes embeddings); AA lists 3.7B."
+  },
+  {
+   "id": "minicpm5-2b",
+   "name": "MiniCPM5 2B",
+   "maker": "OpenBMB",
+   "repo": "openbmb/MiniCPM5-2B-GGUF",
+   "params_b": 2.5,
+   "active_b": null,
+   "context": 131072,
+   "licence": "apache-2.0",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "chat"
+   ],
+   "quants": [
+    {
+     "quant": "Q4_K_M",
+     "files": [
+      "MiniCPM5-2B-Q4_K_M.gguf"
+     ],
+     "bytes": 1561318368
+    }
+   ],
+   "scores": [
+    {
+     "source": "aa-progress",
+     "benchmark": "Progress Index v1",
+     "score": 221
+    }
+   ],
+   "notes": ""
+  },
+  {
+   "id": "qwen3.5-4b",
+   "name": "Qwen3.5 4B",
+   "maker": "Alibaba",
+   "repo": "unsloth/Qwen3.5-4B-GGUF",
+   "params_b": 4.2,
+   "active_b": null,
+   "context": 262144,
+   "licence": "apache-2.0",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "chat",
+    "coding",
+    "agents",
+    "vision"
+   ],
+   "quants": [
+    {
+     "quant": "Q4_K_M",
+     "files": [
+      "Qwen3.5-4B-Q4_K_M.gguf"
+     ],
+     "bytes": 2740937888
+    },
+    {
+     "quant": "UD-IQ2_M",
+     "files": [
+      "Qwen3.5-4B-UD-IQ2_M.gguf"
+     ],
+     "bytes": 1759997088
+    }
+   ],
+   "scores": [],
+   "notes": "No AA score read (AA listing shows only the 2B of this family in its tiny top 12)."
+  },
+  {
+   "id": "gemma-4-e4b",
+   "name": "Gemma 4 E4B",
+   "maker": "Google",
+   "repo": "unsloth/gemma-4-E4B-it-GGUF",
+   "params_b": 7.5,
+   "active_b": null,
+   "context": 131072,
+   "licence": "apache-2.0",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "chat",
+    "coding",
+    "agents",
+    "vision"
+   ],
+   "quants": [
+    {
+     "quant": "Q4_K_M",
+     "files": [
+      "gemma-4-E4B-it-Q4_K_M.gguf"
+     ],
+     "bytes": 4977171584
+    },
+    {
+     "quant": "UD-IQ2_M",
+     "files": [
+      "gemma-4-E4B-it-UD-IQ2_M.gguf"
+     ],
+     "bytes": 3545083008
+    }
+   ],
+   "scores": [],
+   "notes": "4.5B effective, 8B with embeddings (model card of the 12B repo family table). No AA score read."
+  },
+  {
+   "id": "qwen3.5-9b",
+   "name": "Qwen3.5 9B",
+   "maker": "Alibaba",
+   "repo": "unsloth/Qwen3.5-9B-GGUF",
+   "params_b": 9.0,
+   "active_b": null,
+   "context": 262144,
+   "licence": "apache-2.0",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "chat",
+    "coding",
+    "agents",
+    "vision"
+   ],
+   "quants": [
+    {
+     "quant": "Q4_K_M",
+     "files": [
+      "Qwen3.5-9B-Q4_K_M.gguf"
+     ],
+     "bytes": 5680522464
+    },
+    {
+     "quant": "UD-IQ2_M",
+     "files": [
+      "Qwen3.5-9B-UD-IQ2_M.gguf"
+     ],
+     "bytes": 3649365216
+    }
+   ],
+   "scores": [],
+   "notes": "No AA score read."
+  },
+  {
+   "id": "gemma-4-12b",
+   "name": "Gemma 4 12B",
+   "maker": "Google",
+   "repo": "unsloth/gemma-4-12b-it-GGUF",
+   "params_b": 11.9,
+   "active_b": null,
+   "context": 262144,
+   "licence": "apache-2.0",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "chat",
+    "coding",
+    "agents",
+    "reasoning",
+    "vision"
+   ],
+   "quants": [
+    {
+     "quant": "Q4_K_M",
+     "files": [
+      "gemma-4-12b-it-Q4_K_M.gguf"
+     ],
+     "bytes": 7121861440
+    },
+    {
+     "quant": "UD-IQ2_M",
+     "files": [
+      "gemma-4-12b-it-UD-IQ2_M.gguf"
+     ],
+     "bytes": 4213353280
+    }
+   ],
+   "scores": [],
+   "notes": "Model card lists 11.95B params. No AA score read."
+  },
+  {
+   "id": "gpt-oss-20b",
+   "name": "gpt-oss-20b",
+   "maker": "OpenAI",
+   "repo": "unsloth/gpt-oss-20b-GGUF",
+   "params_b": 20.9,
+   "active_b": 3.6,
+   "context": 131072,
+   "licence": "apache-2.0",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "reasoning",
+    "agents",
+    "coding"
+   ],
+   "quants": [
+    {
+     "quant": "Q4_K_M",
+     "files": [
+      "gpt-oss-20b-Q4_K_M.gguf"
+     ],
+     "bytes": 11624759488
+    },
+    {
+     "quant": "Q2_K",
+     "files": [
+      "gpt-oss-20b-Q2_K.gguf"
+     ],
+     "bytes": 11468317888
+    }
+   ],
+   "scores": [],
+   "notes": "Model card: 21B params, 3.6B active. Older (Aug 2025 release; repo updated Dec 2025). No AA score read."
+  },
+  {
+   "id": "gemma-4-26b-a4b",
+   "name": "Gemma 4 26B A4B",
+   "maker": "Google",
+   "repo": "unsloth/gemma-4-26B-A4B-it-GGUF",
+   "params_b": 25.2,
+   "active_b": 3.8,
+   "context": 262144,
+   "licence": "apache-2.0",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "chat",
+    "coding",
+    "agents",
+    "vision"
+   ],
+   "quants": [
+    {
+     "quant": "UD-Q4_K_M",
+     "files": [
+      "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
+     ],
+     "bytes": 16947541728
+    },
+    {
+     "quant": "UD-IQ2_M",
+     "files": [
+      "gemma-4-26B-A4B-it-UD-IQ2_M.gguf"
+     ],
+     "bytes": 10014755296
+    }
+   ],
+   "scores": [],
+   "notes": "Model card: 25.2B total, 3.8B active. No AA score read."
+  },
+  {
+   "id": "qwen3.8-27b",
+   "name": "Qwen3.8 27B",
+   "maker": "Alibaba",
+   "repo": "unsloth/Qwen3.8-27B-GGUF",
+   "params_b": 27.3,
+   "active_b": null,
+   "context": 262144,
+   "licence": "apache-2.0",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "coding",
+    "agents",
+    "reasoning",
+    "chat"
+   ],
+   "quants": [
+    {
+     "quant": "UD-Q4_K_M",
+     "files": [
+      "Qwen3.8-27B-UD-Q4_K_M.gguf"
+     ],
+     "bytes": 16564259744
+    },
+    {
+     "quant": "UD-IQ2_XXS",
+     "files": [
+      "Qwen3.8-27B-UD-IQ2_XXS.gguf"
+     ],
+     "bytes": 7206043648
+    }
+   ],
+   "scores": [
+    {
+     "source": "aa-progress",
+     "benchmark": "Progress Index v1",
+     "score": 303
+    },
+    {
+     "source": "aa-intel",
+     "benchmark": "Intelligence Index v5.0.1",
+     "score": 20
+    }
+   ],
+   "notes": "Dense. Scores are AA 'Xhigh' reasoning variant. Unsloth quants are the UD (dynamic) ones."
+  },
+  {
+   "id": "nanbeige4.3-33b",
+   "name": "Nanbeige4.3 33B",
+   "maker": "Nanbeige",
+   "repo": "bartowski/Nanbeige_Nanbeige4.3-33B-GGUF",
+   "params_b": 33.1,
+   "active_b": null,
+   "context": 524288,
+   "licence": "apache-2.0",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "reasoning",
+    "chat"
+   ],
+   "quants": [
+    {
+     "quant": "Q4_K_M",
+     "files": [
+      "Nanbeige_Nanbeige4.3-33B-Q4_K_M.gguf"
+     ],
+     "bytes": 20788825216
+    },
+    {
+     "quant": "IQ2_M",
+     "files": [
+      "Nanbeige_Nanbeige4.3-33B-IQ2_M.gguf"
+     ],
+     "bytes": 12187167872
+    }
+   ],
+   "scores": [
+    {
+     "source": "aa-progress",
+     "benchmark": "Progress Index v1",
+     "score": 306
+    }
+   ],
+   "notes": "Top of AA small-model Progress Index list. Dense llama architecture. Repo is bartowski's, not the maker's."
+  },
+  {
+   "id": "gemma-4-31b",
+   "name": "Gemma 4 31B",
+   "maker": "Google",
+   "repo": "unsloth/gemma-4-31B-it-GGUF",
+   "params_b": 30.7,
+   "active_b": null,
+   "context": 262144,
+   "licence": "apache-2.0",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "chat",
+    "coding",
+    "agents",
+    "reasoning",
+    "vision"
+   ],
+   "quants": [
+    {
+     "quant": "Q4_K_M",
+     "files": [
+      "gemma-4-31B-it-Q4_K_M.gguf"
+     ],
+     "bytes": 18323733440
+    },
+    {
+     "quant": "UD-IQ2_M",
+     "files": [
+      "gemma-4-31B-it-UD-IQ2_M.gguf"
+     ],
+     "bytes": 10752820160
+    }
+   ],
+   "scores": [
+    {
+     "source": "aa-progress",
+     "benchmark": "Progress Index v1",
+     "score": 254
+    },
+    {
+     "source": "aa-intel",
+     "benchmark": "Intelligence Index v5.0.1",
+     "score": 4
+    }
+   ],
+   "notes": "Dense, 30.7B. AA scores are the Reasoning variant."
+  },
+  {
+   "id": "laguna-xs-2.1",
+   "name": "Laguna XS 2.1",
+   "maker": "poolside",
+   "repo": "poolside/Laguna-XS-2.1-GGUF",
+   "params_b": 33.4,
+   "active_b": 3.0,
+   "context": 262144,
+   "licence": "openmdw-1.1",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "coding",
+    "agents"
+   ],
+   "quants": [
+    {
+     "quant": "Q4_K_M",
+     "files": [
+      "Laguna-XS-2.1-Q4_K_M.gguf"
+     ],
+     "bytes": 20274300032
+    }
+   ],
+   "scores": [],
+   "notes": "Agentic coding MoE, 33B total / 3B active. Repo README still says not upstream, but its PR ggml-org/llama.cpp shows merged on 2026-07-22 (GitHub API). Only Q4_K_M and BF16 are offered; no smaller quant. No AA score read."
+  },
+  {
+   "id": "qwen3.6-35b-a3b",
+   "name": "Qwen3.6 35B A3B",
+   "maker": "Alibaba",
+   "repo": "unsloth/Qwen3.6-35B-A3B-GGUF",
+   "params_b": 34.7,
+   "active_b": 3.0,
+   "context": 262144,
+   "licence": "apache-2.0",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "coding",
+    "agents",
+    "chat",
+    "vision"
+   ],
+   "quants": [
+    {
+     "quant": "UD-Q4_K_M",
+     "files": [
+      "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+     ],
+     "bytes": 22134528992
+    },
+    {
+     "quant": "UD-IQ2_M",
+     "files": [
+      "Qwen3.6-35B-A3B-UD-IQ2_M.gguf"
+     ],
+     "bytes": 11522702304
+    }
+   ],
+   "scores": [
+    {
+     "source": "aa-progress",
+     "benchmark": "Progress Index v1",
+     "score": 261
+    }
+   ],
+   "notes": "AA score is the Reasoning variant."
+  },
+  {
+   "id": "k2-horizon-mova-36b-a4b",
+   "name": "K2 Horizon MoVA 36B A4B",
+   "maker": "Institute of Foundation Models",
+   "repo": "bartowski/K2-Horizon-MoVA-36B-A4B-GGUF",
+   "params_b": 37.4,
+   "active_b": 4.0,
+   "context": 524288,
+   "licence": "apache-2.0",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "reasoning",
+    "chat"
+   ],
+   "quants": [
+    {
+     "quant": "Q4_K_M",
+     "files": [
+      "K2-Horizon-MoVA-36B-A4B-Q4_K_M.gguf"
+     ],
+     "bytes": 22701885664
+    },
+    {
+     "quant": "IQ2_M",
+     "files": [
+      "K2-Horizon-MoVA-36B-A4B-IQ2_M.gguf"
+     ],
+     "bytes": 13085042144
+    }
+   ],
+   "scores": [
+    {
+     "source": "aa-progress",
+     "benchmark": "Progress Index v1",
+     "score": 281
+    }
+   ],
+   "notes": "Maker also publishes IFM/K2-Horizon-MoVA-36B-A4B-GGUF; bartowski used here for the quant spread."
+  },
+  {
+   "id": "nemotron-3.5-lightning-30b-a3b",
+   "name": "Nemotron 3.5 Lightning 30B A3B",
+   "maker": "NVIDIA",
+   "repo": "ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF",
+   "params_b": 31.6,
+   "active_b": 3.0,
+   "context": 1048576,
+   "licence": "other",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "chat",
+    "agents"
+   ],
+   "quants": [
+    {
+     "quant": "Q4_0",
+     "files": [
+      "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf"
+     ],
+     "bytes": 18898091584
+    }
+   ],
+   "scores": [
+    {
+     "source": "aa-intel",
+     "benchmark": "Intelligence Index v5.0.1",
+     "score": 6
+    }
+   ],
+   "notes": "AA Intelligence Index entry is 'Nemotron 3.5 Lightning'. Only Q4_0 and Q8_0 in this repo. Active 3B taken from the repo name (A3B)."
+  },
+  {
+   "id": "nemotron-3.5-bolt-74b-a9b",
+   "name": "Nemotron 3.5 Bolt 74B A9B (24GB)",
+   "maker": "NVIDIA",
+   "repo": "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF",
+   "params_b": 74.0,
+   "active_b": 9.0,
+   "context": 262144,
+   "licence": "other",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "agents",
+    "chat",
+    "vision"
+   ],
+   "quants": [
+    {
+     "quant": "native-2bit-24GB",
+     "files": [
+      "NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf"
+     ],
+     "bytes": 22018326528
+    }
+   ],
+   "scores": [
+    {
+     "source": "aa-progress",
+     "benchmark": "Progress Index v1",
+     "score": 269
+    }
+   ],
+   "notes": "Native 2-bit quantisation built to fit 24 GB; single file is the only quant. AA score is for the model family entry 'Nemotron 3.5 Bolt 74B-A9B'. Model card: 74B total, 9B active."
+  },
+  {
+   "id": "qwen3-coder-next",
+   "name": "Qwen3 Coder Next 80B A3B",
+   "maker": "Alibaba",
+   "repo": "unsloth/Qwen3-Coder-Next-GGUF",
+   "params_b": 79.7,
+   "active_b": 3.0,
+   "context": 262144,
+   "licence": "apache-2.0",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "coding",
+    "agents"
+   ],
+   "quants": [
+    {
+     "quant": "Q4_K_M",
+     "files": [
+      "Qwen3-Coder-Next-Q4_K_M.gguf"
+     ],
+     "bytes": 48528320544
+    },
+    {
+     "quant": "UD-IQ2_M",
+     "files": [
+      "Qwen3-Coder-Next-UD-IQ2_M.gguf"
+     ],
+     "bytes": 24962293760
+    }
+   ],
+   "scores": [
+    {
+     "source": "aa-progress",
+     "benchmark": "Progress Index v1",
+     "score": 227
+    }
+   ],
+   "notes": "Older (March 2026). Coding specialist."
+  },
+  {
+   "id": "gpt-oss-120b",
+   "name": "gpt-oss-120b",
+   "maker": "OpenAI",
+   "repo": "ggml-org/gpt-oss-120b-GGUF",
+   "params_b": 116.8,
+   "active_b": 5.1,
+   "context": 131072,
+   "licence": "apache-2.0",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "reasoning",
+    "agents",
+    "coding"
+   ],
+   "quants": [
+    {
+     "quant": "MXFP4",
+     "files": [
+      "gpt-oss-120b-MXFP4.gguf"
+     ],
+     "bytes": 63387346208
+    }
+   ],
+   "scores": [
+    {
+     "source": "aa-progress",
+     "benchmark": "Progress Index v1",
+     "score": 240
+    },
+    {
+     "source": "aa-intel",
+     "benchmark": "Intelligence Index v5.0.1",
+     "score": 4
+    }
+   ],
+   "notes": "Native MXFP4 file, no other quant in the maker-run repo. AA entries are the High reasoning variant."
+  },
+  {
+   "id": "qwen3.5-122b-a10b",
+   "name": "Qwen3.5 122B A10B",
+   "maker": "Alibaba",
+   "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+   "params_b": 122.1,
+   "active_b": 10.0,
+   "context": 262144,
+   "licence": "apache-2.0",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "chat",
+    "coding",
+    "agents",
+    "vision"
+   ],
+   "quants": [
+    {
+     "quant": "Q4_K_M",
+     "files": [
+      "Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00001-of-00003.gguf",
+      "Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00002-of-00003.gguf",
+      "Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00003-of-00003.gguf"
+     ],
+     "bytes": 76536964608
+    },
+    {
+     "quant": "UD-IQ2_M",
+     "files": [
+      "Qwen3.5-122B-A10B-UD-IQ2_M.gguf"
+     ],
+     "bytes": 39148942528
+    }
+   ],
+   "scores": [
+    {
+     "source": "aa-progress",
+     "benchmark": "Progress Index v1",
+     "score": 261
+    }
+   ],
+   "notes": "AA score is the Reasoning variant."
+  },
+  {
+   "id": "mistral-small-4-119b",
+   "name": "Mistral Small 4 119B",
+   "maker": "Mistral AI",
+   "repo": "unsloth/Mistral-Small-4-119B-2603-GGUF",
+   "params_b": 119.0,
+   "active_b": null,
+   "context": 1048576,
+   "licence": "apache-2.0",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "chat",
+    "reasoning",
+    "agents"
+   ],
+   "quants": [
+    {
+     "quant": "UD-Q4_K_M",
+     "files": [
+      "UD-Q4_K_M/Mistral-Small-4-119B-2603-UD-Q4_K_M-00001-of-00003.gguf",
+      "UD-Q4_K_M/Mistral-Small-4-119B-2603-UD-Q4_K_M-00002-of-00003.gguf",
+      "UD-Q4_K_M/Mistral-Small-4-119B-2603-UD-Q4_K_M-00003-of-00003.gguf"
+     ],
+     "bytes": 73763180544
+    },
+    {
+     "quant": "UD-IQ2_M",
+     "files": [
+      "Mistral-Small-4-119B-2603-UD-IQ2_M.gguf"
+     ],
+     "bytes": 37574987456
+    }
+   ],
+   "scores": [
+    {
+     "source": "aa-intel",
+     "benchmark": "Intelligence Index v5.0.1",
+     "score": 4
+    }
+   ],
+   "notes": "MoE with 128 experts, 4 active per token (model card); active parameter count not stated in the card text read, so null. AA entry is 'Mistral Small 4 Reasoning'."
+  },
+  {
+   "id": "mistral-medium-3.5-128b",
+   "name": "Mistral Medium 3.5 128B",
+   "maker": "Mistral AI",
+   "repo": "unsloth/Mistral-Medium-3.5-128B-GGUF",
+   "params_b": 125.0,
+   "active_b": null,
+   "context": 262144,
+   "licence": "other",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "chat",
+    "agents"
+   ],
+   "quants": [
+    {
+     "quant": "Q4_K_M",
+     "files": [
+      "Q4_K_M/Mistral-Medium-3.5-128B-Q4_K_M-00001-of-00003.gguf",
+      "Q4_K_M/Mistral-Medium-3.5-128B-Q4_K_M-00002-of-00003.gguf",
+      "Q4_K_M/Mistral-Medium-3.5-128B-Q4_K_M-00003-of-00003.gguf"
+     ],
+     "bytes": 74897139136
+    },
+    {
+     "quant": "UD-IQ2_XXS",
+     "files": [
+      "Mistral-Medium-3.5-128B-UD-IQ2_XXS.gguf"
+     ],
+     "bytes": 34937742432
+    }
+   ],
+   "scores": [
+    {
+     "source": "aa-progress",
+     "benchmark": "Progress Index v1",
+     "score": 257
+    }
+   ],
+   "notes": "Dense (AA lists no active params). HF licence field says 'other'."
+  },
+  {
+   "id": "qwen3.8-flash-next",
+   "name": "Qwen3.8 Flash Next 180B A6B",
+   "maker": "Alibaba",
+   "repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
+   "params_b": 176.9,
+   "active_b": 6.0,
+   "context": 262144,
+   "licence": "other",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "coding",
+    "agents",
+    "reasoning"
+   ],
+   "quants": [
+    {
+     "quant": "UD-IQ1_M",
+     "files": [
+      "UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf",
+      "UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00002-of-00003.gguf",
+      "UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00003-of-00003.gguf"
+     ],
+     "bytes": 68007094938
+    },
+    {
+     "quant": "UD-Q2_K_XL",
+     "files": [
+      "UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00004.gguf",
+      "UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00004.gguf",
+      "UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00004.gguf",
+      "UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00004-of-00004.gguf"
+     ],
+     "bytes": 79580752666
+    },
+    {
+     "quant": "UD-IQ4_XS",
+     "files": [
+      "UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00004.gguf",
+      "UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00004.gguf",
+      "UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00004.gguf",
+      "UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00004-of-00004.gguf"
+     ],
+     "bytes": 93672359738
+    }
+   ],
+   "scores": [
+    {
+     "source": "aa-progress",
+     "benchmark": "Progress Index v1",
+     "score": 320
+    }
+   ],
+   "notes": "Brand new (repo updated 2026-11-13); arch 'qwen4exp'. Unsloth says run it with llama.cpp. Not in AA Intelligence Index list read."
+  },
+  {
+   "id": "glm-5.3-flash",
+   "name": "GLM-5.3-Flash",
+   "maker": "Z.ai",
+   "repo": "unsloth/GLM-5.3-Flash-GGUF",
+   "params_b": 320.8,
+   "active_b": 18.0,
+   "context": 1048576,
+   "licence": "mit",
+   "gated": false,
+   "llama_cpp": null,
+   "good_at": [
+    "coding",
+    "agents",
+    "vision"
+   ],
+   "quants": [
+    {
+     "quant": "UD-IQ1_M",
+     "files": [
+      "UD-IQ1_M/GLM-5.3-Flash-UD-IQ1_M-00001-of-00003.gguf",
+      "UD-IQ1_M/GLM-5.3-Flash-UD-IQ1_M-00002-of-00003.gguf",
+      "UD-IQ1_M/GLM-5.3-Flash-UD-IQ1_M-00003-of-00003.gguf"
+     ],
+     "bytes": 97579344672
+    },
+    {
+     "quant": "UD-Q2_K_XL",
+     "files": [
+      "UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00001-of-00004.gguf",
+      "UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00002-of-00004.gguf",
+      "UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00003-of-00004.gguf",
+      "UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00004-of-00004.gguf"
+     ],
+     "bytes": 108720071552
+    },
+    {
+     "quant": "UD-IQ4_XS",
+     "files": [
+      "UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf",
+      "UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00002-of-00005.gguf",
+      "UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00003-of-00005.gguf",
+      "UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00004-of-00005.gguf",
+      "UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00005-of-00005.gguf"
+     ],
+     "bytes": 156822111200
+    }
+   ],
+   "scores": [
+    {
+     "source": "aa-progress",
+     "benchmark": "Progress Index v1",
+     "score": 319
+    }
+   ],
+   "notes": "Native multimodal. Repo README points to a llama.cpp pull request, which GitHub shows closed and not merged; a GLM5-next code path is mentioned in other open PRs, so mainline status is unclear."
+  },
+  {
+   "id": "minimax-m3.1-flash",
+   "name": "MiniMax M3.1 Flash",
+   "maker": "MiniMax",
+   "repo": "unsloth/MiniMax-M3.1-Flash-GGUF",
+   "params_b": 426.2,
+   "active_b": 23.0,
+   "context": 1048576,
+   "licence": "other",
+   "gated": false,
+   "llama_cpp": false,
+   "good_at": [
+    "coding",
+    "agents"
+   ],
+   "quants": [
+    {
+     "quant": "UD-IQ1_M",
+     "files": [
+      "UD-IQ1_M/MiniMax-M3.1-Flash-UD-IQ1_M-00001-of-00004.gguf",
+      "UD-IQ1_M/MiniMax-M3.1-Flash-UD-IQ1_M-00002-of-00004.gguf",
+      "UD-IQ1_M/MiniMax-M3.1-Flash-UD-IQ1_M-00003-of-00004.gguf",
+      "UD-IQ1_M/MiniMax-M3.1-Flash-UD-IQ1_M-00004-of-00004.gguf"
+     ],
+     "bytes": 129361076548
+    },
+    {
+     "quant": "UD-Q2_K_XL",
+     "files": [
+      "UD-Q2_K_XL/MiniMax-M3.1-Flash-UD-Q2_K_XL-00001-of-00004.gguf",
+      "UD-Q2_K_XL/MiniMax-M3.1-Flash-UD-Q2_K_XL-00002-of-00004.gguf",
+      "UD-Q2_K_XL/MiniMax-M3.1-Flash-UD-Q2_K_XL-00003-of-00004.gguf",
+      "UD-Q2_K_XL/MiniMax-M3.1-Flash-UD-Q2_K_XL-00004-of-00004.gguf"
+     ],
+     "bytes": 143910068580
+    },
+    {
+     "quant": "UD-Q4_K_XL",
+     "files": [
+      "UD-Q4_K_XL/MiniMax-M3.1-Flash-UD-Q4_K_XL-00001-of-00007.gguf",
+      "UD-Q4_K_XL/MiniMax-M3.1-Flash-UD-Q4_K_XL-00002-of-00007.gguf",
+      "UD-Q4_K_XL/MiniMax-M3.1-Flash-UD-Q4_K_XL-00003-of-00007.gguf",
+      "UD-Q4_K_XL/MiniMax-M3.1-Flash-UD-Q4_K_XL-00004-of-00007.gguf",
+      "UD-Q4_K_XL/MiniMax-M3.1-Flash-UD-Q4_K_XL-00005-of-00007.gguf",
+      "UD-Q4_K_XL/MiniMax-M3.1-Flash-UD-Q4_K_XL-00006-of-00007.gguf",
+      "UD-Q4_K_XL/MiniMax-M3.1-Flash-UD-Q4_K_XL-00007-of-00007.gguf"
+     ],
+     "bytes": 249402105310
+    }
+   ],
+   "scores": [
+    {
+     "source": "aa-progress",
+     "benchmark": "Progress Index v1",
+     "score": 318
+    }
+   ],
+   "notes": "Repo says it needs a llama.cpp build with M3.1 support; a llama.cpp pull request 'add MiniMax-M3.1' was still open when read."
+  },
+  {
+   "id": "inkling-2-small",
+   "name": "Inkling 2 Small",
+   "maker": "Thinking Machines",
+   "repo": "unsloth/Inkling-2-Small-GGUF",
+   "params_b": 593.7,
+   "active_b": 17.0,
+   "context": 1048576,
+   "licence": "apache-2.0",
+   "gated": false,
+   "llama_cpp": false,
+   "good_at": [
+    "chat",
+    "agents",
+    "reasoning"
+   ],
+   "quants": [
+    {
+     "quant": "UD-IQ1_M",
+     "files": [
+      "UD-IQ1_M/Inkling-2-Small-UD-IQ1_M-00001-of-00005.gguf",
+      "UD-IQ1_M/Inkling-2-Small-UD-IQ1_M-00002-of-00005.gguf",
+      "UD-IQ1_M/Inkling-2-Small-UD-IQ1_M-00003-of-00005.gguf",
+      "UD-IQ1_M/Inkling-2-Small-UD-IQ1_M-00004-of-00005.gguf",
+      "UD-IQ1_M/Inkling-2-Small-UD-IQ1_M-00005-of-00005.gguf"
+     ],
+     "bytes": 178544971609
+    },
+    {
+     "quant": "UD-Q2_K_XL",
+     "files": [
+      "UD-Q2_K_XL/Inkling-2-Small-UD-Q2_K_XL-00001-of-00006.gguf",
+      "UD-Q2_K_XL/Inkling-2-Small-UD-Q2_K_XL-00002-of-00006.gguf",
+      "UD-Q2_K_XL/Inkling-2-Small-UD-Q2_K_XL-00003-of-00006.gguf",
+      "UD-Q2_K_XL/Inkling-2-Small-UD-Q2_K_XL-00004-of-00006.gguf",
+      "UD-Q2_K_XL/Inkling-2-Small-UD-Q2_K_XL-00005-of-00006.gguf",
+      "UD-Q2_K_XL/Inkling-2-Small-UD-Q2_K_XL-00006-of-00006.gguf"
+     ],
+     "bytes": 204969271289
+    }
+   ],
+   "scores": [
+    {
+     "source": "aa-intel",
+     "benchmark": "Intelligence Index v5.0.1",
+     "score": 31
+    }
+   ],
+   "notes": "594B total, 17B active (repo README). New 'inkling2' architecture: llama.cpp PRs / still open when read, so mainline cannot run it yet."
+  },
+  {
+   "id": "ling-3.1-flash-1019",
+   "name": "Ling 3.1 Flash 1019",
+   "maker": "InclusionAI",
+   "repo": "bartowski/Ling-3.1-flash-1019-GGUF",
+   "params_b": 572.1,
+   "active_b": 25.0,
+   "context": 262144,
+   "licence": "mit",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "chat",
+    "coding",
+    "agents"
+   ],
+   "quants": [
+    {
+     "quant": "IQ1_M",
+     "files": [
+      "Ling-3.1-flash-1019-IQ1_M/Ling-3.1-flash-1019-IQ1_M-00001-of-00004.gguf",
+      "Ling-3.1-flash-1019-IQ1_M/Ling-3.1-flash-1019-IQ1_M-00002-of-00004.gguf",
+      "Ling-3.1-flash-1019-IQ1_M/Ling-3.1-flash-1019-IQ1_M-00003-of-00004.gguf",
+      "Ling-3.1-flash-1019-IQ1_M/Ling-3.1-flash-1019-IQ1_M-00004-of-00004.gguf"
+     ],
+     "bytes": 145087687200
+    },
+    {
+     "quant": "IQ2_M",
+     "files": [
+      "Ling-3.1-flash-1019-IQ2_M/Ling-3.1-flash-1019-IQ2_M-00001-of-00006.gguf",
+      "Ling-3.1-flash-1019-IQ2_M/Ling-3.1-flash-1019-IQ2_M-00002-of-00006.gguf",
+      "Ling-3.1-flash-1019-IQ2_M/Ling-3.1-flash-1019-IQ2_M-00003-of-00006.gguf",
+      "Ling-3.1-flash-1019-IQ2_M/Ling-3.1-flash-1019-IQ2_M-00004-of-00006.gguf",
+      "Ling-3.1-flash-1019-IQ2_M/Ling-3.1-flash-1019-IQ2_M-00005-of-00006.gguf",
+      "Ling-3.1-flash-1019-IQ2_M/Ling-3.1-flash-1019-IQ2_M-00006-of-00006.gguf"
+     ],
+     "bytes": 213027941120
+    },
+    {
+     "quant": "Q4_K_M",
+     "files": [
+      "Ling-3.1-flash-1019-Q4_K_M/Ling-3.1-flash-1019-Q4_K_M-00001-of-00010.gguf",
+      "Ling-3.1-flash-1019-Q4_K_M/Ling-3.1-flash-1019-Q4_K_M-00002-of-00010.gguf",
+      "Ling-3.1-flash-1019-Q4_K_M/Ling-3.1-flash-1019-Q4_K_M-00003-of-00010.gguf",
+      "Ling-3.1-flash-1019-Q4_K_M/Ling-3.1-flash-1019-Q4_K_M-00004-of-00010.gguf",
+      "Ling-3.1-flash-1019-Q4_K_M/Ling-3.1-flash-1019-Q4_K_M-00005-of-00010.gguf",
+      "Ling-3.1-flash-1019-Q4_K_M/Ling-3.1-flash-1019-Q4_K_M-00006-of-00010.gguf",
+      "Ling-3.1-flash-1019-Q4_K_M/Ling-3.1-flash-1019-Q4_K_M-00007-of-00010.gguf",
+      "Ling-3.1-flash-1019-Q4_K_M/Ling-3.1-flash-1019-Q4_K_M-00008-of-00010.gguf",
+      "Ling-3.1-flash-1019-Q4_K_M/Ling-3.1-flash-1019-Q4_K_M-00009-of-00010.gguf",
+      "Ling-3.1-flash-1019-Q4_K_M/Ling-3.1-flash-1019-Q4_K_M-00010-of-00010.gguf"
+     ],
+     "bytes": 357969521856
+    }
+   ],
+   "scores": [
+    {
+     "source": "aa-progress",
+     "benchmark": "Progress Index v1",
+     "score": 322
+    },
+    {
+     "source": "aa-intel",
+     "benchmark": "Intelligence Index v5.0.1",
+     "score": 30
+    }
+   ],
+   "notes": "Repo is bartowski's, quantised with llama.cpp b11913 (so mainline supports it)."
+  },
+  {
+   "id": "deepseek-v4.1-flash-1017",
+   "name": "DeepSeek V4.1 Flash 1017",
+   "maker": "DeepSeek",
+   "repo": "unsloth/DeepSeek-V4.1-Flash-1017-GGUF",
+   "params_b": 748.5,
+   "active_b": 16.0,
+   "context": 1048576,
+   "licence": "mit",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "coding",
+    "agents",
+    "reasoning"
+   ],
+   "quants": [
+    {
+     "quant": "UD-IQ2_XXS",
+     "files": [
+      "UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf",
+      "UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00002-of-00006.gguf",
+      "UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00003-of-00006.gguf",
+      "UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00004-of-00006.gguf",
+      "UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00005-of-00006.gguf",
+      "UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00006-of-00006.gguf"
+     ],
+     "bytes": 300475464795
+    },
+    {
+     "quant": "UD-IQ1_M",
+     "files": [
+      "UD-IQ1_M/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00001-of-00005.gguf",
+      "UD-IQ1_M/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00002-of-00005.gguf",
+      "UD-IQ1_M/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00003-of-00005.gguf",
+      "UD-IQ1_M/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00004-of-00005.gguf",
+      "UD-IQ1_M/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00005-of-00005.gguf"
+     ],
+     "bytes": 250404346724
+    },
+    {
+     "quant": "UD-Q2_K_XL",
+     "files": [
+      "UD-Q2_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00001-of-00007.gguf",
+      "UD-Q2_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00002-of-00007.gguf",
+      "UD-Q2_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00003-of-00007.gguf",
+      "UD-Q2_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00004-of-00007.gguf",
+      "UD-Q2_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00005-of-00007.gguf",
+      "UD-Q2_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00006-of-00007.gguf",
+      "UD-Q2_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00007-of-00007.gguf"
+     ],
+     "bytes": 334793544836
+    },
+    {
+     "quant": "UD-IQ3_XXS",
+     "files": [
+      "UD-IQ3_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS-00001-of-00007.gguf",
+      "UD-IQ3_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS-00002-of-00007.gguf",
+      "UD-IQ3_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS-00003-of-00007.gguf",
+      "UD-IQ3_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS-00004-of-00007.gguf",
+      "UD-IQ3_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS-00005-of-00007.gguf",
+      "UD-IQ3_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS-00006-of-00007.gguf",
+      "UD-IQ3_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS-00007-of-00007.gguf"
+     ],
+     "bytes": 394736596867
+    }
+   ],
+   "scores": [
+    {
+     "source": "aa-progress",
+     "benchmark": "Progress Index v1",
+     "score": 324
+    },
+    {
+     "source": "aa-intel",
+     "benchmark": "Intelligence Index v5.0.1",
+     "score": 33
+    }
+   ],
+   "notes": "unsloth/DeepSeek-V4.1-Flash-GGUF returned HTTP 401 (no such repo); the 1017 update repo is used. AA lists 552B total; HF GGUF metadata counts 748.5B (not reconciled). Repo README says use unsloth's llama.cpp PR or Unsloth Desktop; llama.cpp merged PRs mention DeepSeek-V4/V4.1 so mainline support is likely but unproven. Runs on the llama.cpp release Orchard's build script uses: Orchard's own runs of the UD-IQ2_XXS files, reading from disk on a 4 core laptop with a borrowed GPU, gave 3.1 to 4.1 s per word."
+  },
+  {
+   "id": "glm-5.3",
+   "name": "GLM-5.3",
+   "maker": "Z.ai",
+   "repo": "unsloth/GLM-5.3-GGUF",
+   "params_b": 753.9,
+   "active_b": 40.0,
+   "context": 1048576,
+   "licence": "other",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "coding",
+    "agents",
+    "reasoning"
+   ],
+   "quants": [
+    {
+     "quant": "UD-IQ1_M",
+     "files": [
+      "UD-IQ1_M/GLM-5.3-UD-IQ1_M-00001-of-00006.gguf",
+      "UD-IQ1_M/GLM-5.3-UD-IQ1_M-00002-of-00006.gguf",
+      "UD-IQ1_M/GLM-5.3-UD-IQ1_M-00003-of-00006.gguf",
+      "UD-IQ1_M/GLM-5.3-UD-IQ1_M-00004-of-00006.gguf",
+      "UD-IQ1_M/GLM-5.3-UD-IQ1_M-00005-of-00006.gguf",
+      "UD-IQ1_M/GLM-5.3-UD-IQ1_M-00006-of-00006.gguf"
+     ],
+     "bytes": 228492971557
+    },
+    {
+     "quant": "UD-IQ2_M",
+     "files": [
+      "UD-IQ2_M/GLM-5.3-UD-IQ2_M-00001-of-00006.gguf",
+      "UD-IQ2_M/GLM-5.3-UD-IQ2_M-00002-of-00006.gguf",
+      "UD-IQ2_M/GLM-5.3-UD-IQ2_M-00003-of-00006.gguf",
+      "UD-IQ2_M/GLM-5.3-UD-IQ2_M-00004-of-00006.gguf",
+      "UD-IQ2_M/GLM-5.3-UD-IQ2_M-00005-of-00006.gguf",
+      "UD-IQ2_M/GLM-5.3-UD-IQ2_M-00006-of-00006.gguf"
+     ],
+     "bytes": 238577585701
+    },
+    {
+     "quant": "UD-Q4_K_XL",
+     "files": [
+      "UD-Q4_K_XL/GLM-5.3-UD-Q4_K_XL-00001-of-00011.gguf",
+      "UD-Q4_K_XL/GLM-5.3-UD-Q4_K_XL-00002-of-00011.gguf",
+      "UD-Q4_K_XL/GLM-5.3-UD-Q4_K_XL-00003-of-00011.gguf",
+      "UD-Q4_K_XL/GLM-5.3-UD-Q4_K_XL-00004-of-00011.gguf",
+      "UD-Q4_K_XL/GLM-5.3-UD-Q4_K_XL-00005-of-00011.gguf",
+      "UD-Q4_K_XL/GLM-5.3-UD-Q4_K_XL-00006-of-00011.gguf",
+      "UD-Q4_K_XL/GLM-5.3-UD-Q4_K_XL-00007-of-00011.gguf",
+      "UD-Q4_K_XL/GLM-5.3-UD-Q4_K_XL-00008-of-00011.gguf",
+      "UD-Q4_K_XL/GLM-5.3-UD-Q4_K_XL-00009-of-00011.gguf",
+      "UD-Q4_K_XL/GLM-5.3-UD-Q4_K_XL-00010-of-00011.gguf",
+      "UD-Q4_K_XL/GLM-5.3-UD-Q4_K_XL-00011-of-00011.gguf"
+     ],
+     "bytes": 467289116837
+    }
+   ],
+   "scores": [
+    {
+     "source": "aa-progress",
+     "benchmark": "Progress Index v1",
+     "score": 323
+    },
+    {
+     "source": "aa-intel",
+     "benchmark": "Intelligence Index v5.0.1",
+     "score": 32
+    }
+   ],
+   "notes": "Model card calls it the most capable open-weights model for coding (maker's claim). Licence 'other'."
+  },
+  {
+   "id": "mistral-large-4-1t",
+   "name": "Mistral Large 4 1T A52B",
+   "maker": "Mistral AI",
+   "repo": "ggml-org/Mistral-Large-4-1T-A52B-GGUF",
+   "params_b": 1049.4,
+   "active_b": 52.0,
+   "context": 1048576,
+   "licence": "other",
+   "gated": false,
+   "llama_cpp": true,
+   "good_at": [
+    "chat",
+    "agents",
+    "reasoning"
+   ],
+   "quants": [
+    {
+     "quant": "IQ2_XXS",
+     "files": [
+      "IQ2_XXS/Mistral-Large-4-1T-A52B-IQ2_XXS-00001-of-00006.gguf",
+      "IQ2_XXS/Mistral-Large-4-1T-A52B-IQ2_XXS-00002-of-00006.gguf",
+      "IQ2_XXS/Mistral-Large-4-1T-A52B-IQ2_XXS-00003-of-00006.gguf",
+      "IQ2_XXS/Mistral-Large-4-1T-A52B-IQ2_XXS-00004-of-00006.gguf",
+      "IQ2_XXS/Mistral-Large-4-1T-A52B-IQ2_XXS-00005-of-00006.gguf",
+      "IQ2_XXS/Mistral-Large-4-1T-A52B-IQ2_XXS-00006-of-00006.gguf"
+     ],
+     "bytes": 297676048832
+    },
+    {
+     "quant": "Q4_K_M",
+     "files": [
+      "Q4_K_M/Mistral-Large-4-1T-A52B-Q4_K_M-00001-of-00013.gguf",
+      "Q4_K_M/Mistral-Large-4-1T-A52B-Q4_K_M-00002-of-00013.gguf",
+      "Q4_K_M/Mistral-Large-4-1T-A52B-Q4_K_M-00003-of-00013.gguf",
+      "Q4_K_M/Mistral-Large-4-1T-A52B-Q4_K_M-00004-of-00013.gguf",
+      "Q4_K_M/Mistral-Large-4-1T-A52B-Q4_K_M-00005-of-00013.gguf",
+      "Q4_K_M/Mistral-Large-4-1T-A52B-Q4_K_M-00006-of-00013.gguf",
+      "Q4_K_M/Mistral-Large-4-1T-A52B-Q4_K_M-00007-of-00013.gguf",
+      "Q4_K_M/Mistral-Large-4-1T-A52B-Q4_K_M-00008-of-00013.gguf",
+      "Q4_K_M/Mistral-Large-4-1T-A52B-Q4_K_M-00009-of-00013.gguf",
+      "Q4_K_M/Mistral-Large-4-1T-A52B-Q4_K_M-00010-of-00013.gguf",
+      "Q4_K_M/Mistral-Large-4-1T-A52B-Q4_K_M-00011-of-00013.gguf",
+      "Q4_K_M/Mistral-Large-4-1T-A52B-Q4_K_M-00012-of-00013.gguf",
+      "Q4_K_M/Mistral-Large-4-1T-A52B-Q4_K_M-00013-of-00013.gguf"
+     ],
+     "bytes": 634802244608
+    }
+   ],
+   "scores": [
+    {
+     "source": "aa-intel",
+     "benchmark": "Intelligence Index v5.0.1",
+     "score": 26
+    }
+   ],
+   "notes": "Support merged: a llama.cpp pull request closed merged 2026-10-29. AA entry 'Mistral Large 4 (High)'. Even IQ2_XXS is ~298 GB."
+  }
+ ]
+}

@@ -76,6 +76,7 @@ capitals. `orchard ai resume` tries again.
 | --- | --- |
 | `orchard ai ask "question"` | Ask. `-` reads the question from stdin. Exit 0 answered, 1 failed, 2 refused, 3 stopped. |
 | `orchard ai serve` | Keep the model ready for OpenAI, Claude and Ollama tools. `--port`, `--keep-alive`. Ctrl-C puts everything back. |
+| `orchard ai pick` | Which of the strongest open models your machines can run, and how they'd split. `--offline`, `--for`, `--machines`, `--json`. |
 | `orchard ai setup` | Write the settings file, or check the machines against it. |
 | `orchard ai show ID` | Show a record and check its seal. |
 | `orchard ai list` | Recent questions. |
@@ -91,6 +92,61 @@ capitals. `orchard ai resume` tries again.
 | `--no-hold` | | Don't hold the machine in the queue. |
 | `--json` | | Print the record. |
 
+## Which model? Let it pick
+
+`orchard ai pick` tells you which of the strongest open models your machines can
+run, and how. It reads every machine Orchard knows, this one and each worker:
+memory, graphics memory, free disk and how fast it reads memory. Then it goes
+through a dated list of open models and sorts them:
+
+- **Fits in memory:** fast. The split says which machine would hold how much.
+- **Runs slowly from disk:** too big for memory, but a mixture of experts, which
+  reads only a small part of itself per word. For background work.
+- **Won't run here,** and why: not enough disk, or the engine can't run that kind
+  of model yet.
+
+The strongest come first, by the public index the list names, with the date it
+was read. The best pick is the strongest that fits in memory, should answer at 2
+or more words a second, and isn't squeezed below 3.5 bits a weight (a squeezed
+model is weaker than its score says; those are marked). A model you already use
+with `orchard ai` is marked too.
+
+```console
+$ orchard ai pick
+Your machines
+  this Mac   macOS arm64, 16 GB memory, Apple M5 GPU: room for 12.0 GB of model, 32.6 GB free disk, reads memory at 50.0 GB/s
+  old-mac    macOS x86_64, 8 GB memory, Intel Iris Plus Graphics 645: room for 6.0 GB of model, 8.9 GB free disk, reads memory at 7.0 GB/s
+  big-box    Linux in Windows x86_64, 8 GB memory, NVIDIA GeForce GTX 1050 2 GB: room for 7.4 GB of model, 112.4 GB free disk (the Windows drive), reads memory at 8.1 GB/s
+  Together: room for 25.4 GB of model in memory.
+
+Best pick
+  Qwen3.6 35B A3B (UD-Q4_K_M, 22.1 GB file)
+    strength: 261 on the Artificial Analysis Progress Index v1 (read 2026-11-14)
+    held in memory: this Mac 12.0 GB, big-box 7.4 GB, old-mac 6.0 GB; about 6.0 words a second (estimate)
+    good at coding, agents, chat, vision; licence apache-2.0; from huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF
+    the strongest here that should answer at 2 or more words a second, kept at 3.5 or more bits a weight
+...
+```
+
+It downloads nothing. The list ships with Orchard (`src/orchard/ai_models.json`):
+exact file sizes read from Hugging Face, and scores from the named index. Unless
+you pass `--offline`, it also asks Hugging Face for each file's current size, and
+lists popular GGUF models from well-known publishers that aren't on the list yet,
+unranked. Nothing about you or your machines is sent. `--for coding` (or
+`agents`, `chat`, `reasoning`) keeps only models good at that, `--machines`
+limits which machines count, and `--json` prints it all for a script.
+
+**How it judges.** Each machine keeps a quarter of its memory, and at least 2 GB,
+for itself; a graphics card adds most of its own memory. A model needs its file
+size plus a tenth, and 1 GB for its working memory. The machines with the most
+room are used first, as few as will hold it, each given a share in proportion to
+its room. The speed estimate assumes each word reads the model's active weights
+once, each machine its share, at the memory speed measured on that machine (one
+core copying memory, so it leaves out what graphics chips add and what the
+network between machines takes). Read the speeds as a rough guide; a short test
+run gives the real number. A model with no score wasn't in the index's top
+entries for its size, which doesn't mean it is weak.
+
 ## Keep it ready for your tools
 
 `orchard ai serve` keeps the model ready for the tools you already use. It
@@ -103,7 +159,7 @@ listens on this machine only and speaks the APIs they expect:
 | Ollama | `OLLAMA_HOST=127.0.0.1:6724` |
 
 ```console
-$ orchard ai serve
+$ orchard ai serve        # times left out
 ai: ready at http://127.0.0.1:6724 for big-model
 ai:   OpenAI tools: base URL http://127.0.0.1:6724/v1
 ai:   Claude tools: base URL http://127.0.0.1:6724
@@ -124,7 +180,9 @@ order as after `ask`, when:
 - the model has been loaded for `max_loaded_seconds`
 
 The next question loads it again. A question that runs past `cap_seconds` is
-stopped, and the model stays loaded.
+stopped, and the model stays loaded. If the server itself is killed outright, with
+no chance to put things back, the engine still stops when its ssh link closes; the
+next `orchard ai serve` cancels the hold job it left behind.
 
 On the same 300 GB model and machines as the example above, the first question
 through the OpenAI API loaded the model in 299 s, gave its first word at 446 s
@@ -134,10 +192,12 @@ to load. Stopping the server put everything back. One run each, so read the
 speeds as examples, not a benchmark.
 
 One question runs at a time; the rest wait their turn. While the model loads, a
-streamed answer gets a comment line every 10 seconds, so the tool knows the
-server is still there. If the model can't be loaded (the machine stays busy,
-memory is short, or an `ask` is running), the tool gets a 503 with
-`Retry-After: 60`, and the record says why.
+streamed OpenAI or Claude answer gets a comment line every 10 seconds, so the
+tool knows the server is still there; an Ollama stream just waits. If the model
+can't be loaded (the machine stays busy, memory is short, or an `ask` is
+running), the tool gets a 503 with `Retry-After: 60`, or, for a streamed OpenAI
+or Claude answer that has already started, an error event in the stream. The
+record says why.
 
 Every answer gets a sealed record like an `ask`. Its id comes back in the
 `X-Orchard-Record` header, and `orchard ai show ID` checks it. Each loading has
@@ -146,8 +206,8 @@ seen, whether the apps came back, and why it unloaded.
 
 **What it lets in.** It listens on `127.0.0.1` only. It refuses a request
 addressed to any other host name, and any request from a web page, unless that
-page's origin is in `origins`. It has no password: any program you run on this
-machine can use it, as with Ollama. On the engine machine, llama.cpp's server
+page's origin is in `origins`. It has no password: any program on this machine,
+under any account, can use it, as with Ollama. On the engine machine, llama.cpp's server
 listens on a socket file only your account can open, not a network port, and is
 reached through the same ssh that Orchard already uses. If that ssh session ends
 for any reason, the engine stops.
@@ -174,7 +234,7 @@ context = 0                     # 0 uses engine.context; tools that send long ch
 name = ""                       # what tools see; empty uses the model's file name
 args = []                       # more llama-server flags
 origins = []                    # web origins allowed in, like "vscode-webview://..."
-socket = "~/.orchard/ai-engine.sock"   # the engine's socket file, on the engine machine
+socket = "~/.orchard/ai-engine.sock"   # the engine's socket file, on the engine machine; must end in .sock
 ```
 
 It uses llama.cpp's `llama-server` from the engine folder, which the release

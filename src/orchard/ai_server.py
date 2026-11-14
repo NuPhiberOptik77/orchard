@@ -90,8 +90,8 @@ def load_settings() -> dict:
         raise ai.ConfigError(f"{ai.CONFIG_PATH}: server.port must be under 65536")
     if not isinstance(s["origins"], list) or not all(isinstance(o, str) for o in s["origins"]):
         raise ai.ConfigError(f"{ai.CONFIG_PATH}: server.origins must be a list of web origins")
-    if not s["socket"] or not str(s["socket"]).startswith(("/", "~/")):
-        raise ai.ConfigError(f"{ai.CONFIG_PATH}: server.socket must be a full path")
+    if not s["socket"] or not str(s["socket"]).startswith(("/", "~/")) or not str(s["socket"]).endswith(".sock"):
+        raise ai.ConfigError(f"{ai.CONFIG_PATH}: server.socket must be a full path ending in .sock")
     return cfg
 
 
@@ -208,6 +208,7 @@ class _ServerPool(ai._Pool):
 
     def start_forward(self) -> None:
         SOCKET_DIR.mkdir(parents=True, exist_ok=True)
+        ai._pkill_local(f"^ssh .*-L {self.local_socket}:")  # a link left by a server that was killed
         with contextlib.suppress(FileNotFoundError):
             self.local_socket.unlink()
         argv = ["ssh", "-N", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes",
@@ -359,7 +360,7 @@ class Engine:
             # Each loading has its own guard and its own stop signal, so a guard
             # still finishing a slow check can never run beside the next one.
             self.guard_done = threading.Event()
-            self.guard = threading.Thread(target=self._watch, args=(self.guard_done,), daemon=True)
+            self.guard = threading.Thread(target=self._watch, args=(self.guard_done, self.pool), daemon=True)
             self.guard.start()
             self.pool.start_server()
             self.pool.start_forward()
@@ -426,11 +427,11 @@ class Engine:
             with contextlib.suppress(OSError):
                 conn.sock.shutdown(socket.SHUT_RDWR)
 
-    def _watch(self, done: threading.Event) -> None:
+    def _watch(self, done: threading.Event, pool: _ServerPool) -> None:
         reads = {"low": 0, "unread": 0, "paused": 0}
         while not done.wait(ai.GUARD_POLL):
             found = self._why_unload(reads)
-            if done.is_set():
+            if done.is_set() or self.pool is not pool:
                 return
             if found is None:
                 continue
@@ -438,6 +439,8 @@ class Engine:
             if not urgent and not self.turn.acquire(blocking=False):
                 continue
             try:
+                if done.is_set() or self.pool is not pool:
+                    return
                 self.stop_reason = why
                 self.unload(why, from_guard=True)
             finally:
@@ -727,6 +730,8 @@ class Answer:
 
     def finish(self, state: str, reason: str | None, thinking: str, answer: str, timings: dict,
                fresh: bool = False) -> dict:
+        if "seal" in self.record:  # already finished: a tool hanging up afterwards changes nothing
+            return self.record
         self.raw.close()
         engine = self.engine
         session = engine.session or {}
@@ -994,8 +999,9 @@ class _Handler(BaseHTTPRequestHandler):
                     record = answer.finish("answered" if ok else "failed",
                                            None if ok else f"the engine said {resp.status}", thinking, text,
                                            engine_timings(obj) if isinstance(obj, dict) else {}, fresh)
-                    self._send(resp.status, data, resp.getheader("Content-Type") or "application/json",
-                               (("X-Orchard-Record", record["id"]),))
+                    with contextlib.suppress(OSError):  # the answer is kept even if the tool hung up
+                        self._send(resp.status, data, resp.getheader("Content-Type") or "application/json",
+                                   (("X-Orchard-Record", record["id"]),))
                     return
                 if resp.status != 200:
                     data = resp.read()
@@ -1085,7 +1091,8 @@ class _Handler(BaseHTTPRequestHandler):
                                          time.time() - answer.started, engine.session.get("load_seconds", 0)
                                          if fresh else 0)
                     record = answer.finish("answered", None, thinking, text, engine_timings(obj), fresh)
-                    self._json(200, out, (("X-Orchard-Record", record["id"]),))
+                    with contextlib.suppress(OSError):  # the answer is kept even if the tool hung up
+                        self._json(200, out, (("X-Orchard-Record", record["id"]),))
                     return
                 self._start_stream("application/x-ndjson", answer.id)
                 sse = answer.sse = SSE()
@@ -1156,6 +1163,24 @@ class _Handler(BaseHTTPRequestHandler):
                 "model_info": {}, "capabilities": capabilities, "modified_at": _iso(self.server.started)}
 
 
+def clear_leftovers(say: Callable[[str], None]) -> list[str]:
+    """A server killed outright (no chance to put things back) leaves its hold
+    job queued for hours. When no question holds the lock, no hold is live, so
+    any still waiting or running is a leftover: cancel it."""
+    ai.AI_DIR.mkdir(parents=True, exist_ok=True)
+    with (ai.AI_DIR / ".lock").open("w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return []
+        stale = [entry["id"] for entry in ai.dispatcher.load_entries()
+                 if str(entry.get("id", "")).startswith(ai.HOLD_NAME) and entry.get("state") in ("queued", "running", "paused")]
+        cancelled = [job for job in stale if ai._cancel_job(job)]
+    for job in cancelled:
+        say(f"cancelled {job}, left by an earlier run that was stopped without cleaning up")
+    return cancelled
+
+
 def serve(port: int | None = None, keep_alive: int | None = None, say: Callable[[str], None] = lambda _: None) -> int:
     """Run until stopped, then put everything back. Raises ai.ConfigError on
     bad settings or a port that's taken."""
@@ -1168,6 +1193,7 @@ def serve(port: int | None = None, keep_alive: int | None = None, say: Callable[
         server = Server(cfg, int(cfg["server"]["port"]), say)
     except OSError as exc:
         raise ai.ConfigError(f"can't listen on 127.0.0.1:{cfg['server']['port']}: {exc.strerror or exc}")
+    clear_leftovers(say)
     stop = threading.Event()
     why = {"reason": "the server stopped"}
 
