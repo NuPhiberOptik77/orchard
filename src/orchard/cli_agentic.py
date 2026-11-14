@@ -19,7 +19,7 @@ from typing import Optional
 
 import typer
 
-from . import ab, ai, consensus, fleet, live, mind, placement, receipts, replica, speculate, transport, worlds
+from . import ab, ai, ai_server, consensus, fleet, live, mind, placement, receipts, replica, speculate, transport, worlds
 from .job import slugify
 from .cli import app, find_jobs
 
@@ -972,6 +972,28 @@ def ai_ask(
         for line in ai.report(record):
             print(line)
     raise typer.Exit(ai.EXIT_CODES[record["state"]])
+
+
+@ai_app.command("serve")
+def ai_serve(
+    port: Optional[int] = typer.Option(None, "--port", help="port on this machine's loopback (default 6724)"),
+    keep_alive: Optional[int] = typer.Option(None, "--keep-alive", help="seconds without a question before the model unloads"),
+) -> None:
+    """Keep the model ready for tools that speak OpenAI, Claude or Ollama.
+
+    Listens on 127.0.0.1 only. The first question loads the model; it unloads after
+    --keep-alive seconds without one, when someone uses the machine, or when memory
+    runs low. Every answer gets a sealed record. Ctrl-C puts everything back.
+    Exit 0 stopped, 2 bad settings or the port is taken."""
+    def say(message: str) -> None:
+        print(f"ai: {time.strftime('%H:%M:%S')} {message}", file=sys.stderr, flush=True)
+
+    try:
+        code = ai_server.serve(port=port, keep_alive=keep_alive, say=say)
+    except ai.ConfigError as exc:
+        print(f"ai: {exc}", file=sys.stderr)
+        raise typer.Exit(2)
+    raise typer.Exit(code)
 
 
 @ai_app.command("setup")

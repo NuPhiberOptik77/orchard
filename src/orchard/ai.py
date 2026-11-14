@@ -69,6 +69,8 @@ DEFAULTS = {
     },
     "helper": {"binary": "ggml-rpc-server", "device": "", "port": 50052, "tunnel_port": 50072},
     "windows": {"pause": []},
+    "server": {"port": 6724, "keep_alive_seconds": 600, "max_loaded_seconds": 21600, "binary": "llama-server",
+               "context": 0, "name": "", "args": [], "socket": "~/.orchard/ai-engine.sock", "origins": []},
 }
 
 TEMPLATE = """\
@@ -178,16 +180,10 @@ def engine_command(cfg: dict, question: str, words: int) -> list[str]:
     return argv + [str(a) for a in e["args"]]
 
 
-def run_script(cfg: dict, question: str, words: int) -> str:
-    """The script the engine machine runs. The engine's stdout is the answer.
-    On the way out it asks the kernel to drop the model from memory."""
+def give_back_lines(cfg: dict) -> list[str]:
+    """A shell function that asks the kernel to drop the model from memory."""
     e = cfg["engine"]
-    argv = engine_command(cfg, question, words)
-    # The model path goes through the shell like the folder does, so ~ works.
-    command = " ".join(_rpath(a) if i == 2 else shlex.quote(a) for i, a in enumerate(argv))
-    lines = [f"cd {_rpath(e['folder'])} || exit 127"]
-    lines += [f"export {key}={shlex.quote(str(value))}" for key, value in e["env"].items()]
-    lines += [
+    return [
         "give_back() {",
         "python3 -I - >&2 <<'GIVE_BACK'",
         "import glob, os",
@@ -200,6 +196,20 @@ def run_script(cfg: dict, question: str, words: int) -> str:
         "print(f'gave back {len(paths)} model files')",
         "GIVE_BACK",
         "}",
+    ]
+
+
+def run_script(cfg: dict, question: str, words: int) -> str:
+    """The script the engine machine runs. The engine's stdout is the answer.
+    On the way out it asks the kernel to drop the model from memory."""
+    e = cfg["engine"]
+    argv = engine_command(cfg, question, words)
+    # The model path goes through the shell like the folder does, so ~ works.
+    command = " ".join(_rpath(a) if i == 2 else shlex.quote(a) for i, a in enumerate(argv))
+    lines = [f"cd {_rpath(e['folder'])} || exit 127"]
+    lines += [f"export {key}={shlex.quote(str(value))}" for key, value in e["env"].items()]
+    lines += give_back_lines(cfg)
+    lines += [
         "trap give_back EXIT",
         f"perl -e 'alarm {int(e['cap_seconds'])}; exec @ARGV' {command} < /dev/null",
         "exit $?",
@@ -454,6 +464,7 @@ class _Pool:
         self.resumed: bool | None = None
         self.fingerprint: dict = {}
         self.problems: list[str] = []
+        self.stopping = threading.Event()
 
     def preflight(self) -> None:
         e = self.cfg["engine"]
@@ -476,13 +487,13 @@ class _Pool:
         except json.JSONDecodeError:
             self.problems.append("could not record which files answered")
 
-    def hold_machine(self) -> None:
+    def hold_machine(self, seconds: int | None = None) -> None:
         """A sleeping job on the machine, so the queue keeps other jobs off it.
         The engine isn't an Orchard job, so the dispatcher can't see it otherwise."""
         e = self.cfg["engine"]
         cwd = AI_DIR / "hold"
         cwd.mkdir(parents=True, exist_ok=True)
-        result = _submit_hold(self.cfg, int(e["cap_seconds"]) + 1800, cwd)
+        result = _submit_hold(self.cfg, seconds or int(e["cap_seconds"]) + 1800, cwd)
         match = re.search(rf"{HOLD_NAME}-\d{{8}}-\d{{6}}-[0-9a-f]+", result.stdout + result.stderr)
         if result.returncode != 0 or not match:
             raise Refused(f"could not hold {e['worker']} in the queue: {(result.stdout + result.stderr).strip()[-200:]}")
@@ -497,7 +508,8 @@ class _Pool:
                 raise Refused(f"the hold on {e['worker']} ended early: {state}")
             if time.time() >= end:
                 raise Refused(f"{e['worker']} stayed busy for {int(e['hold_wait_seconds'])} s")
-            time.sleep(HOLD_POLL)
+            if self.stopping.wait(HOLD_POLL):
+                raise Refused(f"stopped while waiting for {e['worker']}")
 
     def start_helper(self) -> None:
         h = self.cfg["helper"]
@@ -530,9 +542,9 @@ class _Pool:
                 time.sleep(TUNNEL_GAP)
         raise Refused(f"no tunnel to {self.host} after {TUNNEL_TRIES} tries")
 
-    def pause_apps(self) -> None:
+    def pause_apps(self, limit: int | None = None) -> None:
         win, names = self.cfg["windows"].get("host"), self.cfg["windows"]["pause"]
-        limit = int(self.cfg["engine"]["cap_seconds"]) + 1200
+        limit = limit or int(self.cfg["engine"]["cap_seconds"]) + 1200
         log_path = self.folder / "pause.log"
         with log_path.open("wb") as log:
             self.hold = subprocess.Popen([*_ssh(win), _powershell(hold_script(names, limit))],
@@ -578,7 +590,8 @@ class _Pool:
                 seen = "an unknown amount" if free is None else f"{free} MB"
                 raise Refused(f"{seen} free on the engine machine, and a run needs {need} MB")
             self.say(f"waiting for free memory: {'unknown' if free is None else free} of {need} MB")
-            time.sleep(MEMORY_POLL)
+            if self.stopping.wait(MEMORY_POLL):
+                raise Refused("stopped while waiting for free memory")
 
     def _kill_engine(self) -> None:
         _remote(self.host, f"pkill -f {shlex.quote('^./' + self.cfg['engine']['binary'])}", 30)

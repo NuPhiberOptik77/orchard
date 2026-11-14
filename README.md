@@ -159,7 +159,10 @@ setting in mirrored order and keeps sealed proof. See [docs/ab.md](docs/ab.md).
 `orchard ai ask "question"` asks a large model spread across your own machines:
 it holds the machine, starts the GPU helper and its tunnel, pauses the sync apps,
 watches memory, and puts everything back however the run ends. The answer lands
-in a sealed record and nothing leaves your machines. See [docs/ai.md](docs/ai.md).
+in a sealed record and nothing leaves your machines. `orchard ai serve` keeps
+the model ready on this machine's loopback for tools that speak the OpenAI,
+Claude or Ollama APIs, and puts everything back when it's idle or a machine is
+needed. See [docs/ai.md](docs/ai.md).
 
 ## Menu-bar apps (optional)
 

@@ -75,6 +75,7 @@ capitals. `orchard ai resume` tries again.
 | Command | What it does |
 | --- | --- |
 | `orchard ai ask "question"` | Ask. `-` reads the question from stdin. Exit 0 answered, 1 failed, 2 refused, 3 stopped. |
+| `orchard ai serve` | Keep the model ready for OpenAI, Claude and Ollama tools. `--port`, `--keep-alive`. Ctrl-C puts everything back. |
 | `orchard ai setup` | Write the settings file, or check the machines against it. |
 | `orchard ai show ID` | Show a record and check its seal. |
 | `orchard ai list` | Recent questions. |
@@ -89,6 +90,89 @@ capitals. `orchard ai resume` tries again.
 | `--no-pause` | `ORCHARD_AI_NO_PAUSE` | Leave the sync apps running. |
 | `--no-hold` | | Don't hold the machine in the queue. |
 | `--json` | | Print the record. |
+
+## Keep it ready for your tools
+
+`orchard ai serve` keeps the model ready for the tools you already use. It
+listens on this machine only and speaks the APIs they expect:
+
+| Your tool speaks | Point it at |
+| --- | --- |
+| OpenAI Chat Completions or Responses | base URL `http://127.0.0.1:6724/v1` |
+| Claude Messages | base URL `http://127.0.0.1:6724` |
+| Ollama | `OLLAMA_HOST=127.0.0.1:6724` |
+
+```console
+$ orchard ai serve
+ai: ready at http://127.0.0.1:6724 for big-model
+ai:   OpenAI tools: base URL http://127.0.0.1:6724/v1
+ai:   Claude tools: base URL http://127.0.0.1:6724
+ai:   Ollama tools: OLLAMA_HOST=127.0.0.1:6724
+ai: nothing loads until the first question; it unloads after 600 s without one
+```
+
+Nothing loads until the first question. That one loads the model the way `ask`
+does: it holds the machine, starts the GPU helper and its tunnel, pauses the
+apps and waits for memory. Then the model stays loaded, and the apps stay paused,
+so the next questions skip all of that. Everything is put back, in the same
+order as after `ask`, when:
+
+- nobody has asked for `keep_alive_seconds`
+- someone starts using the machine (Orchard pauses the hold job)
+- memory runs low, by the same rules as `ask`
+- the engine or its link stops
+- the model has been loaded for `max_loaded_seconds`
+
+The next question loads it again. A question that runs past `cap_seconds` is
+stopped, and the model stays loaded.
+
+One question runs at a time; the rest wait their turn. While the model loads, a
+streamed answer gets a comment line every 10 seconds, so the tool knows the
+server is still there. If the model can't be loaded (the machine stays busy,
+memory is short, or an `ask` is running), the tool gets a 503 with
+`Retry-After: 60`, and the record says why.
+
+Every answer gets a sealed record like an `ask`. Its id comes back in the
+`X-Orchard-Record` header, and `orchard ai show ID` checks it. Each loading has
+its own record, `ais-...`, with how long it took to load, the lowest free memory
+seen, whether the apps came back, and why it unloaded.
+
+**What it lets in.** It listens on `127.0.0.1` only. It refuses a request
+addressed to any other host name, and any request from a web page, unless that
+page's origin is in `origins`. It has no password: any program you run on this
+machine can use it, as with Ollama. On the engine machine, llama.cpp's server
+listens on a socket file only your account can open, not a network port, and is
+reached through the same ssh that Orchard already uses. If that ssh session ends
+for any reason, the engine stops.
+
+**The APIs.** OpenAI and Claude requests go straight to llama.cpp's server, so
+they support what it supports. Ollama requests are translated: `chat`,
+`generate` (an empty prompt loads the model), `tags`, `show`, `ps` and
+`version`, with the options `temperature`, `top_p`, `top_k`, `seed`,
+`num_predict`, `stop`, `repeat_penalty`, `min_p`, `presence_penalty` and
+`frequency_penalty`, JSON and schema `format`, `tools`, and `think: false`.
+There are no images, embeddings, model downloads or deletes, per-request
+`keep_alive`, or `num_ctx`: the context is fixed when the model loads. Ollama
+tools show a digest; this one names the model setting, not the files' bytes,
+because hashing a model this big at every start would take too long.
+
+The server reads the same settings file, plus its own section:
+
+```toml
+[server]
+port = 6724
+keep_alive_seconds = 600        # unload after this long without a question
+max_loaded_seconds = 21600      # then unload anyway, once nobody is waiting
+context = 0                     # 0 uses engine.context; tools that send long chats need more
+name = ""                       # what tools see; empty uses the model's file name
+args = []                       # more llama-server flags
+origins = []                    # web origins allowed in, like "vscode-webview://..."
+socket = "~/.orchard/ai-engine.sock"   # the engine's socket file, on the engine machine
+```
+
+It uses llama.cpp's `llama-server` from the engine folder, which the release
+that `build-engine.sh` downloads already has. Flags in `engine.args` that only
+the one-question engine takes, like `-no-cnv` or `-st`, are left out.
 
 ## Settings
 
@@ -167,14 +251,18 @@ changed since. Anyone who can read your Orchard folder can read your questions.
 
 ## Limits
 
-- **Each question loads the model and shuts it down.** Nothing stays loaded
-  between questions, so it's slow to start every time.
+- **`ask` loads the model for each question and shuts it down.** `serve` keeps
+  it loaded between questions, but its first question still waits for the load.
+- **`serve` doesn't start by itself.** Start it yourself, or from your own login
+  item. It serves one model, and the engine has to be on a machine reached over
+  ssh.
 - **A foreground Orchard job on that machine isn't seen.** Those jobs don't appear
   in the queue. The checks find a running engine, and the hold keeps queued jobs
   off, but a job started in the foreground can still overlap a question.
 - **You name the machines.** It doesn't pick free ones or search for the best
   split. Use `orchard ab` to compare splits.
-- **One question at a time per Orchard install.** A second is refused while the
-  first runs.
+- **One question at a time per Orchard install.** A second `ask` is refused while
+  the first runs, and `ask` is refused while `serve` has the model loaded.
+  `serve` queues its own questions.
 - **Pausing apps needs ssh to Windows.** Windows' own OpenSSH server has to be on,
   because WSL can't reach Windows processes when interop is off.
