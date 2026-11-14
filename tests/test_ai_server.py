@@ -158,6 +158,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
         for name, obj in items:
+            if name == "pause":
+                time.sleep(0.3)
+                continue
             head = f"event: {name}\n".encode() if name else b""
             body = b"[DONE]" if obj is None else json.dumps(obj).encode()
             self.wfile.write(head + b"data: " + body + b"\n\n")
@@ -194,7 +197,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, {"choices": [{"index": 0, "message": message,
                                                      "finish_reason": "tool_calls" if tools else "stop"}],
                                         "usage": {"prompt_tokens": 12, "completion_tokens": 5}, "timings": TIMINGS})
-            items = [(None, {"choices": [{"delta": {"reasoning_content": THINKING}}]})]
+            items = [(None, {"choices": [{"delta": {"role": "assistant", "content": None}}]}), ("pause", None),
+                     (None, {"choices": [{"delta": {"reasoning_content": THINKING}}]})]
             if tools:
                 items += [(None, {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "type": "function",
                            "function": {"name": "weather", "arguments": "{\"city\": "}}]}}]}),
@@ -413,11 +417,13 @@ def test_a_streamed_answer_passes_through_and_is_recorded(serve, stub):
     server = serve()
     status, headers, body = chat(server, stream=True)
     assert status == 200 and headers["content-type"] == "text/event-stream"
-    assert body.count(b"data: ") == 7 and body.rstrip().endswith(b"data: [DONE]")
+    assert body.count(b"data: ") == 8 and body.rstrip().endswith(b"data: [DONE]")
     record = record_of(headers)
     assert record["answer"] == "The sky scatters blue." and record["thinking"] == "Light scatters."
     assert record["timings"]["ms_per_word"] == 3000.0
-    assert record["first_word_seconds"] is not None
+    # The engine's opening chunk carries no words, so it doesn't count as the first word.
+    assert record["first_word_seconds"] >= 0.3
+    assert record_of(chat(server)[1])["first_word_seconds"] is None
 
 
 def test_claude_messages_and_openai_responses_pass_through(serve, stub):

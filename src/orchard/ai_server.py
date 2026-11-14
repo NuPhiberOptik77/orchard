@@ -573,6 +573,7 @@ class SSE:
         self.finish: str | None = None
         self.usage: dict = {}
         self.error: str | None = None
+        self.first_word_at: float | None = None
 
     def feed(self, data: bytes) -> list[dict]:
         self.buffer += data
@@ -592,6 +593,8 @@ class SSE:
             if not isinstance(obj, dict):
                 continue
             thinking, answer = stream_piece(obj)
+            if (thinking or answer) and self.first_word_at is None:
+                self.first_word_at = time.time()
             self.thinking.append(thinking)
             self.answer.append(answer)
             self.timings |= engine_timings(obj)
@@ -711,8 +714,7 @@ class Answer:
         (self.folder / "request.json").write_bytes(body)
         self.raw = (self.folder / "answer.txt").open("wb")
         self.started = time.time()
-        self.first_word: float | None = None
-        self.load_seconds = 0.0
+        self.sse: SSE | None = None  # a streamed answer's reader, for when the first word came
         self.record: dict = {
             "id": self.id, "kind": "ai", "via": "server", "api": api, "state": "running",
             "question": question_text(api, req), "model_asked": str(req.get("model") or ""),
@@ -722,8 +724,6 @@ class Answer:
 
     def write(self, data: bytes) -> None:
         self.raw.write(data)
-        if self.first_word is None and data.strip():
-            self.first_word = time.time()
 
     def finish(self, state: str, reason: str | None, thinking: str, answer: str, timings: dict,
                fresh: bool = False) -> dict:
@@ -736,7 +736,8 @@ class Answer:
             "state": state, "reason": reason, "ended_at": time.time(), "thinking": thinking.strip(),
             "answer": answer.strip(), "timings": timings, "session": session.get("id"),
             "loaded_for_this_question": fresh, "load_seconds": session.get("load_seconds") if fresh else 0,
-            "first_word_seconds": round(self.first_word - self.started, 1) if self.first_word else None,
+            "first_word_seconds": round(first - self.started, 1) if (first := self.sse and self.sse.first_word_at)
+            else None,
             "files_used": session.get("files_used") or {}, "settings": session.get("settings") or {},
             "problems": [],
             "logs": {name: ai._digest(self.folder / name) for name in ("request.json", "answer.txt")},
@@ -973,7 +974,7 @@ class _Handler(BaseHTTPRequestHandler):
         answer = Answer(engine, api, body, req)
         if streaming:
             self._start_stream("text/event-stream", answer.id)
-        sse = SSE() if streaming else None
+        sse = answer.sse = SSE() if streaming else None
         fresh = False
         try:
             with self._keepalive(streaming) as quiet, engine.use() as fresh:
@@ -1087,7 +1088,7 @@ class _Handler(BaseHTTPRequestHandler):
                     self._json(200, out, (("X-Orchard-Record", record["id"]),))
                     return
                 self._start_stream("application/x-ndjson", answer.id)
-                sse = SSE()
+                sse = answer.sse = SSE()
                 calls: dict[int, dict] = {}
                 while chunk := resp.read1(65536):
                     answer.write(chunk)

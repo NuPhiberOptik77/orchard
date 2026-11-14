@@ -264,5 +264,9 @@ changed since. Anyone who can read your Orchard folder can read your questions.
 - **One question at a time per Orchard install.** A second `ask` is refused while
   the first runs, and `ask` is refused while `serve` has the model loaded.
   `serve` queues its own questions.
+- **The machine lending its GPU isn't held in the queue.** Only the engine's
+  machine is. A job that Orchard starts on the GPU machine during a question
+  keeps running, and if it squeezes that machine's memory, the question stops
+  and `serve` unloads the model. Other work comes first.
 - **Pausing apps needs ssh to Windows.** Windows' own OpenSSH server has to be on,
   because WSL can't reach Windows processes when interop is off.
