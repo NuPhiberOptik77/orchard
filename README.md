@@ -165,7 +165,9 @@ Claude or Ollama APIs, and puts everything back when it's idle or a machine is
 needed. `orchard ai pick` asks what the model is for (coding, agents, chat,
 reasoning or reading pictures) and says which of the strongest open models at
 that your machines can run, fast from memory or slowly from disk, with each
-model's scores and how it would split across them. See [docs/ai.md](docs/ai.md).
+model's scores and how it would split across them. It says whether each fits
+right now, and shows what your own earlier runs measured: a machine that ran
+short of memory in a run counts less room from then on. See [docs/ai.md](docs/ai.md).
 
 ## Menu-bar apps (optional)
 

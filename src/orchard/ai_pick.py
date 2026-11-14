@@ -9,6 +9,12 @@ goes through a dated list of open models and sorts them into three groups:
   (a mixture of experts), for background work
 - won't run here, and why
 
+Room on each machine is its memory less what the machine keeps for itself, and
+less again where an earlier run there ran short of memory: Orchard's own sealed
+records of past runs say how much that machine was holding. Each pick also says
+whether it fits right now, from what each machine has free at this moment, and
+shows what earlier runs of the same file measured next to the estimate.
+
 It asks what the model is for (coding, agents, chat and writing, reasoning and
 maths, reading pictures, or a bit of everything) and, within each group, puts
 the strongest at that first: by a public leaderboard for that task where the
@@ -30,13 +36,15 @@ import json
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from importlib import resources
+from pathlib import Path
 from typing import Callable
 
-from . import ai, config
+from . import ai, config, receipts
 
 GB = 1e9
 HF = "https://huggingface.co"
@@ -46,9 +54,16 @@ NEW_LIMIT = 6
 PROBE_TIMEOUT = 90
 USER_AGENT = "orchard-ai-pick"
 
-# What a machine keeps for itself: a quarter of its memory, and at least 2 GB.
+# What a machine keeps for itself: a quarter of its memory, and at least 2 GB;
+# a Mac at least 4 GB, as macOS and its background work take that much (an 8 GB
+# Mac ran short of memory holding 5.5 GB of a model).
 RESERVE_SHARE = 0.25
 RESERVE_MIN_MB = 2048
+RESERVE_MIN_MB_MAC = 4096
+# What fits right now leaves this much of what's free untouched.
+NOW_MARGIN_GB = 1.0
+# Where a run ran short of memory holding a share, count at most this part of it.
+SHORT_SHARE = 0.8
 # Of a graphics card's own memory, what a model can use.
 VRAM_SHARE = 0.8
 # Memory a model needs beyond its file: a tenth more, and 1 GB for its working memory.
@@ -131,19 +146,39 @@ print(json.dumps(f))
 """
 
 WINDOWS_DISK = "$ProgressPreference = 'SilentlyContinue'; [math]::Round((Get-PSDrive C).Free / 1e9, 1)"
+WINDOWS_FREE = 'typeperf "\\Memory\\Available MBytes" -sc 1'
 
 
 class Machine(dict):
     """One machine's readings, and what it can give a model."""
 
     @property
-    def room_gb(self) -> float:
-        """Memory a model can have here: its RAM less what the machine keeps for
-        itself, plus most of a graphics card's own memory."""
+    def vram_gb(self) -> float:
+        """Most of a graphics card's own memory, which the machine itself doesn't use."""
+        return sum(g["memory_mb"] or 0 for g in self["gpus"] if g["kind"] == "nvidia") * VRAM_SHARE / 1024
+
+    @property
+    def full_room_gb(self) -> float:
+        """Its RAM less what the machine keeps for itself, plus graphics memory."""
         ram = self["ram_mb"]
-        reserve = max(RESERVE_MIN_MB, ram * RESERVE_SHARE)
-        vram = sum(g["memory_mb"] or 0 for g in self["gpus"] if g["kind"] == "nvidia") * VRAM_SHARE
-        return round((ram - reserve + vram) / 1024, 1)
+        floor = RESERVE_MIN_MB_MAC if self.get("system") == "Darwin" else RESERVE_MIN_MB
+        return round((ram - max(floor, ram * RESERVE_SHARE)) / 1024 + self.vram_gb, 1)
+
+    @property
+    def room_gb(self) -> float:
+        """Memory a model can have here when the machine is quiet: its full room,
+        or less where a run here ran short of memory (`cap_gb`)."""
+        cap = self.get("cap_gb")
+        return self.full_room_gb if cap is None else min(self.full_room_gb, cap)
+
+    @property
+    def room_now_gb(self) -> float | None:
+        """What it can give a model at this moment: what's free less a margin,
+        plus graphics memory, and never more than its room. None if unread."""
+        free = self.get("free_mb")
+        if free is None:
+            return None
+        return round(min(self.room_gb, max(0.0, free / 1024 - NOW_MARGIN_GB) + self.vram_gb), 1)
 
     @property
     def speed_gbs(self) -> float:
@@ -169,6 +204,11 @@ def windows_disk(host: str) -> float | None:
         return None
 
 
+def windows_free(host: str) -> int | None:
+    """Free memory on Windows, in MB: Linux inside it can only grow into that."""
+    return ai.parse_typeperf(ai._remote(host, WINDOWS_FREE, 40).stdout)
+
+
 def read_machines(only: list[str] | None = None) -> list[Machine]:
     """This machine and every Orchard worker, read side by side."""
     wanted = [("this Mac" if sys.platform == "darwin" else "this machine", None)]
@@ -187,6 +227,9 @@ def read_machines(only: list[str] | None = None) -> list[Machine]:
             real = windows_disk(cfg["windows"]["host"])
             if real is not None:
                 m["disk_free_gb"], m["disk_note"] = real, "the Windows drive"
+            free = windows_free(cfg["windows"]["host"])
+            if free is not None:
+                m["free_mb"] = free if m.get("free_mb") is None else min(m["free_mb"], free)
         elif m.get("wsl"):
             m["disk_note"] = "a virtual disk: the Windows drive may have less"
     return machines
@@ -299,19 +342,36 @@ def active_share(model: dict) -> float:
     return 1.0
 
 
-def plan_memory(need: float, machines: list[Machine]) -> list[tuple[Machine, float]] | None:
+def plan_memory(need: float, machines: list[Machine],
+                room_of: Callable[[Machine], float] = lambda m: m.room_gb) -> list[tuple[Machine, float]] | None:
     """The fewest machines that hold `need` GB between them, most room first,
     each given a share in proportion to its room. None if they can't."""
-    ranked = sorted(machines, key=lambda m: (m.room_gb, m.speed_gbs), reverse=True)
+    ranked = sorted(machines, key=lambda m: (room_of(m), m.speed_gbs), reverse=True)
     chosen: list[Machine] = []
     for machine in ranked:
-        if machine.room_gb <= 0:
+        if room_of(machine) <= 0:
             continue
         chosen.append(machine)
-        room = sum(m.room_gb for m in chosen)
+        room = sum(room_of(m) for m in chosen)
         if room >= need:
-            return [(m, round(need * m.room_gb / room, 1)) for m in chosen]
+            return [(m, round(need * room_of(m) / room, 1)) for m in chosen]
     return None
+
+
+def now_room(m: Machine) -> float:
+    """Room right now; a machine whose free memory couldn't be read counts its room."""
+    now = m.room_now_gb
+    return m.room_gb if now is None else now
+
+
+def right_now(row: dict, machines: list[Machine]) -> dict:
+    """Whether a model that fits in memory fits at this moment, and if not, which
+    machines are short and by how much."""
+    if row["group"] != "fast":
+        return row
+    split = plan_memory(row["need_gb"], machines, now_room)
+    short = [(m, share, now_room(m)) for m, share in row["split"] if share > now_room(m)]
+    return row | {"fits_now": split is not None, "split_now": split, "short_now": [] if split else short}
 
 
 def estimate_words_per_second(model: dict, quant: dict, split: list[tuple[Machine, float]]) -> float:
@@ -341,7 +401,8 @@ def judge(model: dict, quant: dict, machines: list[Machine], extra_gb: float = 0
         return out | {"group": "no", "why": "no machine answered, so nothing could be judged"}
     split = plan_memory(need, machines)
     if split:
-        return out | {"group": "fast", "split": split, "words_per_second": estimate_words_per_second(model, quant, split)}
+        return right_now(out | {"group": "fast", "split": split,
+                                "words_per_second": estimate_words_per_second(model, quant, split)}, machines)
     room = round(sum(max(m.room_gb, 0) for m in machines), 1)
     size = round(quant["bytes"] / GB, 1)
     home = max(machines, key=lambda m: (m.get("disk_free_gb") or 0, m.room_gb))
@@ -442,10 +503,16 @@ def _best(groups: dict) -> dict | None:
     return (full or comfortable or groups["fast"] or groups["slow"] or [None])[0]
 
 
-def pick(machines: list[Machine], catalogue: dict, use: str = "general") -> dict:
+def pick(machines: list[Machine], catalogue: dict, use: str = "general", past: dict | None = None) -> dict:
     """Every model judged, the strongest at `use` first in each group. Reading
-    pictures needs a model that can; any model can be asked to do the rest."""
+    pictures needs a model that can; any model can be asked to do the rest.
+    `past` is what earlier runs showed (see `history`)."""
+    past = past or {"runs": {}, "caps": {}}
     ready = [m for m in machines if m.get("reachable")]
+    for m in ready:
+        cap = past["caps"].get(m["name"])
+        if cap and cap["gb"] < m.full_room_gb:
+            m["cap_gb"], m["cap_why"] = cap["gb"], cap["why"]
     primary = catalogue.get("primary")
     ranker = ranking_source(catalogue, use)
     rows = []
@@ -460,7 +527,7 @@ def pick(machines: list[Machine], catalogue: dict, use: str = "general") -> dict
         order = {"fast": 0, "slow": 1, "no": 2}
         verdicts.sort(key=lambda v: (order[v["group"]], v["group"] == "slow" and not v["quant"].get("owned"),
                                      v["quant"]["bytes"] if v["group"] == "no" else -v["quant"]["bytes"]))
-        rows.append(verdicts[0])
+        rows.append(verdicts[0] | {"runs": past["runs"].get((model["id"], verdicts[0]["quant"]["quant"]), [])})
 
     def grouped(for_use: str, among: list[dict]) -> dict:
         ranked = sorted(among, key=lambda r: rank_key(r["model"], for_use, ranker, primary), reverse=True)
@@ -468,15 +535,136 @@ def pick(machines: list[Machine], catalogue: dict, use: str = "general") -> dict
 
     groups = grouped(use, rows)
     best = _best(groups)
+    # When the best pick doesn't fit at this moment, the best that does.
+    best_now = None
+    if best and best.get("fits_now") is False:
+        best_now = _best({"fast": [r for r in groups["fast"] if r.get("fits_now")], "slow": []})
     # For a task, also the strongest overall, when it isn't the same model. Only
     # a model with a general score can be called that.
     scored = [r for r in rows if score_of(r["model"], primary) is not None]
     overall = _best(grouped("general", scored)) if use != "general" else None
     covered = sum(1 for r in rows if ranker and score_of(r["model"], ranker["id"]) is not None)
     return {"machines": machines, "groups": groups, "best": best, "primary": primary, "use": use,
-            "ranker": ranker, "overall": None if overall is best else overall,
+            "ranker": ranker, "overall": None if overall is best else overall, "best_now": best_now,
             "covered": covered, "listed": len(rows),
             "sources": {s["id"]: s for s in catalogue.get("sources", [])}, "as_of": catalogue.get("as_of")}
+
+
+# What earlier runs showed.
+
+def _model_file(command) -> str | None:
+    parts = command if isinstance(command, list) else str(command or "").split()
+    for flag, value in zip(parts, parts[1:]):
+        if flag in ("-m", "--model"):
+            return str(value).rsplit("/", 1)[-1]
+    return None
+
+
+def held_gb(record: dict, model: dict, quant: dict, name_of: Callable[[str | None], str],
+            here: str) -> dict[str, float] | None:
+    """About how much of the model each machine held in a run, from its layers:
+    the engine's graphics card and each helper take their part of the layers
+    sent to devices, and the engine keeps the rest. None when the run moved
+    parts by hand or left the split to the engine."""
+    settings, who = record.get("settings") or {}, record.get("machines") or {}
+    blocks = model.get("layers")
+    devices = [d.strip() for d in str(settings.get("devices") or "").split(",") if d.strip()]
+    try:
+        parts = [float(x) for x in str(settings.get("split") or "").split(",") if x.strip()]
+        sent = min(int(settings.get("layers") or 0), blocks or 0)
+    except ValueError:
+        return None
+    if not blocks or settings.get("overrides") or not devices or len(parts) != len(devices) or sum(parts) <= 0:
+        return None
+    helpers = ([here] if who.get("helper") else []) + [name_of(h) for h in who.get("far_helpers") or []]
+    engine = name_of(who.get("engine"))
+    per_layer = quant["bytes"] / GB / blocks
+    out: dict[str, float] = {engine: (blocks - sent) * per_layer}
+    for device, part in zip(devices, parts):
+        index = device[3:]
+        if device.upper().startswith("RPC") and not (index.isdigit() and int(index) < len(helpers)):
+            return None
+        holder = helpers[int(index)] if device.upper().startswith("RPC") else engine
+        out[holder] = out.get(holder, 0.0) + sent * part / sum(parts) * per_layer
+    return {name: round(gb, 1) for name, gb in out.items() if gb > 0}
+
+
+def short_of_memory(reason: str | None, record: dict, name_of: Callable[[str | None], str],
+                    here: str) -> str | None:
+    """Which machine a run stopped for, when it stopped for want of memory."""
+    reason = reason or ""
+    if reason == "this machine is short of memory":
+        return here
+    if reason.startswith("under ") and reason.endswith(" free on the engine machine"):
+        return name_of((record.get("machines") or {}).get("engine"))
+    if match := re.fullmatch(r"(\S+) is short of memory", reason):
+        return name_of(match[1])
+    return None
+
+
+def _day(seconds) -> str:
+    try:
+        return time.strftime("%d %b", time.localtime(float(seconds))).lstrip("0")
+    except (TypeError, ValueError, OverflowError):
+        return "?"
+
+
+def history(machines: list[Machine], catalogue: dict, folder: Path | None = None) -> dict:
+    """What Orchard's sealed records of earlier runs show: for each listed file,
+    its runs; for each machine, the most a model may count on there. Only
+    records whose seal checks out count."""
+    folder = ai.AI_DIR if folder is None else folder
+    here = next((m["name"] for m in machines if m.get("target") is None), "this machine")
+
+    def name_of(host: str | None) -> str:
+        return next((m["name"] for m in machines if host and host in (m.get("target"), m["name"])), host or "?")
+
+    files = {quant["files"][0].rsplit("/", 1)[-1]: (model, quant)
+             for model in catalogue["models"] for quant in model["quants"] if quant.get("files")}
+    records = []
+    for path in sorted(folder.glob("ai*.json")) if folder.is_dir() else []:
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(record, dict) and receipts.verify(record):
+            records.append(record)
+    sessions = {r.get("id"): r for r in records if r.get("kind") == "ai-session"}
+    runs: dict[tuple, list] = {}
+    short: dict[str, tuple] = {}
+    managed: dict[str, float] = {}
+    for record in records:
+        if record.get("state") == "refused":
+            continue
+        session = sessions.get(record.get("session")) or {}
+        found = files.get(_model_file(record.get("command") or session.get("command")) or "")
+        if not found:
+            continue
+        model, quant = found
+        held = held_gb(record if record.get("settings") else session, model, quant, name_of, here)
+        speed = (record.get("timings") or {}).get("ms_per_word")
+        who = record.get("machines") or {}
+        used = [name_of(who.get("engine"))] + ([here] if who.get("helper") else []) \
+            + [name_of(h) for h in who.get("far_helpers") or []]
+        if record.get("kind") == "ai":
+            runs.setdefault((model["id"], quant["quant"]), []).append({
+                "id": record.get("id"), "day": _day(record.get("started_at")), "state": record.get("state"),
+                "reason": record.get("reason"), "words_per_second": round(1000 / speed, 1) if speed else None,
+                "machines": used, "held": held})
+        ran_short = short_of_memory(record.get("reason"), record, name_of, here)
+        if ran_short and held and ran_short in held:
+            if ran_short not in short or held[ran_short] < short[ran_short][0]:
+                short[ran_short] = (held[ran_short], _day(record.get("started_at")), record.get("id"))
+        elif record.get("state") == "answered" and held:
+            for name, gb in held.items():
+                managed[name] = max(managed.get(name, 0.0), gb)
+    caps = {}
+    for name, (gb, day, rid) in short.items():
+        cap = round(max(gb * SHORT_SHARE, managed.get(name, 0.0)), 1)
+        caps[name] = {"gb": cap, "why": f"it ran short of memory holding about {gb} GB on {day} (record {rid})"}
+    for found_runs in runs.values():
+        found_runs.sort(key=lambda r: r["id"] or "", reverse=True)
+    return {"runs": runs, "caps": caps}
 
 
 # Saying it.
@@ -543,9 +731,45 @@ def _machine_line(m: Machine) -> str:
     gpus = "; ".join(g["name"] + (f" {g['memory_mb'] / 1024:.0f} GB" if g["memory_mb"] else "") for g in m["gpus"])
     kind = "Linux in Windows" if m.get("wsl") else {"Darwin": "macOS", "Linux": "Linux"}.get(m["system"], m["system"])
     disk = f"{m['disk_free_gb']} GB free disk" + (f" ({m['disk_note']})" if m.get("disk_note") else "")
-    return (f"  {m['name']:<10} {kind} {m['arch']}, {m['ram_mb'] / 1024:.0f} GB memory"
-            f"{', ' + gpus if gpus else ''}: room for {m.room_gb} GB of model, {disk}, "
+    now = "" if m.room_now_gb is None else f" ({m.room_now_gb} GB of it free right now)"
+    line = (f"  {m['name']:<10} {kind} {m['arch']}, {m['ram_mb'] / 1024:.0f} GB memory"
+            f"{', ' + gpus if gpus else ''}: room for {m.room_gb} GB of model{now}, {disk}, "
             f"reads memory at {m.speed_gbs} GB/s")
+    if m.get("cap_why"):
+        line += f"\n             counted at {m['cap_gb']} GB, not {m.full_room_gb}: {m['cap_why']}"
+    return line
+
+
+def _now_text(row: dict) -> str | None:
+    if "fits_now" not in row:
+        return None
+    if row["fits_now"]:
+        moved = [(m["name"], gb) for m, gb in row["split_now"]] != [(m["name"], gb) for m, gb in row["split"]]
+        where = ", ".join(f"{m['name']} {gb} GB" for m, gb in row["split_now"])
+        return "    right now: fits" + (f", held as {where}" if moved else "")
+    if not row["short_now"]:
+        return "    right now: doesn't fit, with what your machines have free"
+    short = "; ".join(f"{m['name']} has {now} GB free for its {share} GB share" for m, share, now in row["short_now"])
+    names = [m["name"] for m, _, _ in row["short_now"]]
+    names = ", ".join(names[:-1]) + " and " + names[-1] if len(names) > 1 else names[0]
+    return f"    right now: doesn't fit ({short}); it fits when {names} {'is' if len(row['short_now']) == 1 else 'are'} quieter"
+
+
+def _runs_text(row: dict) -> list[str]:
+    """What earlier sealed runs of this file measured, next to the estimate."""
+    runs = row.get("runs") or []
+    lines = []
+    answered = [r for r in runs if r["state"] == "answered" and r["words_per_second"]]
+    if answered:
+        fast = max(answered, key=lambda r: r["words_per_second"])
+        lines.append(f"    ran here: {fast['words_per_second']} words a second on {' and '.join(fast['machines'])}, "
+                     f"{fast['day']} (record {fast['id']}, measured)")
+    other = [r for r in runs if r["state"] != "answered"]
+    if other and (not answered or other[0]["id"] > answered[0]["id"]):
+        last = other[0]
+        lines.append(f"    tried here: {last['state']}" + (f", {last['reason']}" if last.get("reason") else "")
+                     + f", {last['day']} (record {last['id']})")
+    return lines
 
 
 def _row_lines(row: dict, result: dict) -> list[str]:
@@ -559,10 +783,13 @@ def _row_lines(row: dict, result: dict) -> list[str]:
     if row["group"] == "fast":
         split = ", ".join(f"{m['name']} {share} GB" for m, share in row["split"])
         lines.append(f"    held in memory: {split}; about {row['words_per_second']} words a second (estimate)")
+        if now := _now_text(row):
+            lines.append(now)
     elif row["group"] == "slow":
         lines.append(f"    {row['why']}: the engine sits on {row['home']['name']}; expect seconds per word")
     else:
         lines.append(f"    {row['why']}")
+    lines += _runs_text(row)
     lines.append(f"    {_abilities_text(model)}")
     if result["use"] == "vision":
         lines.append(f"    {_pictures_text(model)}")
@@ -596,7 +823,10 @@ def report(result: dict, online: dict | None, new: list[dict]) -> list[str]:
     sources, use, ranker = result["sources"], result["use"], result["ranker"]
     lines = ["Your machines"] + [_machine_line(m) for m in result["machines"]]
     ready = [m for m in result["machines"] if m.get("reachable")]
-    lines.append(f"  Together: room for {round(sum(max(m.room_gb, 0) for m in ready), 1)} GB of model in memory.")
+    together = f"  Together: room for {round(sum(max(m.room_gb, 0) for m in ready), 1)} GB of model in memory"
+    if ready and all(m.room_now_gb is not None for m in ready):
+        together += f", {round(sum(m.room_now_gb for m in ready), 1)} GB of it free right now"
+    lines.append(together + ".")
     lines.append("")
     best = result["best"]
     if best:
@@ -605,13 +835,18 @@ def report(result: dict, online: dict | None, new: list[dict]) -> list[str]:
         why = _why_best(best, result)
         if why:
             lines.append(why)
+        best_now = result.get("best_now")
+        if best_now:
+            lines += ["", "Best that fits right now"] + _row_lines(best_now, result)
+        elif best.get("fits_now") is False:
+            lines += ["", "Nothing on the list fits in memory right now; try again when your machines are quieter."]
         overall = result.get("overall")
         if overall:
             lines += ["", "Strongest overall here, by general score"] + _row_lines(overall, result)
     else:
         lines.append("Nothing on the list runs on these machines"
                      + ("" if use == "general" else f" for {USES[use]}") + ".")
-    shown = {id(best), id(result.get("overall"))}
+    shown = {id(best), id(result.get("overall")), id(result.get("best_now"))}
     for group, title, limit in (("fast", "Also fits in memory here", 4),
                                 ("slow", "Strongest that run slowly from disk (background work)", 2),
                                 ("no", "Won't run here", 4)):
@@ -651,8 +886,10 @@ def report(result: dict, online: dict | None, new: list[dict]) -> list[str]:
             notes.append("the makers' own numbers")
         lines.append(f"  {_word(source.get('task') or 'general')}: {source['name']}, {source.get('url', '')}, "
                      f"read {source.get('read_on', '?')}" + (f" ({'; '.join(notes)})" if notes else ""))
-    lines.append("Speeds are rough estimates; a short test run gives the real number. Room keeps a quarter of each "
-                 "machine's memory, at least 2 GB, for the machine itself.")
+    lines.append("Speeds are rough estimates unless marked measured, from Orchard's sealed records of earlier runs "
+                 "on these machines. Room keeps a quarter of each machine's memory for the machine itself, at least "
+                 "2 GB (4 GB on a Mac), and less where a run there ran short of memory. Right now leaves 1 GB of "
+                 "what's free untouched.")
     return lines
 
 
@@ -675,19 +912,30 @@ def as_json(result: dict, online: dict | None, new: list[dict]) -> dict:
                "licence": model.get("licence"), "gated": model.get("gated", False)}
         if model.get("pictures"):
             out["pictures"] = model["pictures"]
+        out["runs"] = r.get("runs") or []
         if r["group"] == "fast":
             out["split"] = [{"machine": m["name"], "gb": share} for m, share in r["split"]]
             out["words_per_second_estimate"] = r["words_per_second"]
+            out["fits_now"] = r.get("fits_now")
+            out["split_now"] = [{"machine": m["name"], "gb": share} for m, share in r.get("split_now") or []]
+            out["short_now"] = [{"machine": m["name"], "share_gb": share, "free_gb": now}
+                                for m, share, now in r.get("short_now") or []]
         elif r["group"] == "slow":
             out["home"] = r["home"]["name"]
         else:
             out["why"] = r["why"]
         return out
 
-    return {"machines": [dict(m, room_gb=m.room_gb if m.get("reachable") else None) for m in result["machines"]],
+    def machine(m: Machine) -> dict:
+        if not m.get("reachable"):
+            return dict(m, room_gb=None)
+        return dict(m, room_gb=m.room_gb, full_room_gb=m.full_room_gb, room_now_gb=m.room_now_gb)
+
+    return {"machines": [machine(m) for m in result["machines"]],
             "use": result["use"], "ranked_by": ranker["id"] if ranker else None,
             "scored": result["covered"], "listed": result["listed"],
             "best": row(result["best"]), "overall": row(result.get("overall")),
+            "best_now": row(result.get("best_now")),
             "groups": {g: [row(r) for r in rows] for g, rows in result["groups"].items()},
             "sources": list(result["sources"].values()),
             "online": online, "new": new, "primary": result["primary"], "as_of": result["as_of"]}
@@ -721,4 +969,4 @@ def run(offline: bool = False, use: str = "general", only: list[str] | None = No
             online = refresh(catalogue["models"])
             new = new_models({m["repo"] for m in catalogue["models"]})
         machines = machines_job.result()
-    return pick(machines, catalogue, use), online, new
+    return pick(machines, catalogue, use, history(machines, catalogue)), online, new

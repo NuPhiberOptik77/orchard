@@ -156,33 +156,44 @@ squeezed model is weaker than its scores say; those are marked). When the
 strongest model overall is a different one, it is shown too. A model you
 already use with `orchard ai` is marked.
 
+Each model that fits also says whether it fits **right now**, from what each
+machine has free at this moment. If the best pick doesn't, it names the machines
+that are short and by how much, and shows the best model that does fit right
+now. And where you've run a model before, it shows what that run measured next
+to the estimate (see "It learns from your runs" below).
+
 ```console
 $ orchard ai pick --for coding
 Your machines
-  this Mac   macOS arm64, 16 GB memory, Apple M5 GPU: room for 12.0 GB of model, 32.5 GB free disk, reads memory at 49.3 GB/s
-  old-mac    macOS x86_64, 8 GB memory, Intel Iris Plus Graphics 645: room for 6.0 GB of model, 7.7 GB free disk, reads memory at 7.8 GB/s
-  big-box    Linux in Windows x86_64, 8 GB memory, NVIDIA GeForce GTX 1050 2 GB: room for 7.4 GB of model, 112.4 GB free disk (the Windows drive), reads memory at 7.5 GB/s
-  Together: room for 25.4 GB of model in memory.
+  this Mac   macOS arm64, 16 GB memory, Apple M5 GPU: room for 12.0 GB of model (3.0 GB of it free right now), 16.7 GB free disk, reads memory at 43.8 GB/s
+  old-mac    macOS x86_64, 8 GB memory, Intel Iris Plus Graphics 645: room for 4.0 GB of model (0.9 GB of it free right now), 16.1 GB free disk, reads memory at 8.5 GB/s
+  big-box    Linux in Windows x86_64, 8 GB memory, NVIDIA GeForce GTX 1050 2 GB: room for 7.4 GB of model (7.4 GB of it free right now), 66.1 GB free disk (the Windows drive), reads memory at 7.9 GB/s
+  Together: room for 23.4 GB of model in memory, 11.3 GB of it free right now.
 
 Best pick for coding
   Gemma 4 26B A4B (UD-Q4_K_M, 16.9 GB file)
     scores: coding 40.1% (SciCode), agents 1.9% (AutomationBench), reasoning 19.3% (Humanity's Last Exam), pictures 69.2% (MMMU-Pro), chat 1437.4 (Text Arena rating)
-    held in memory: this Mac 9.3 GB, big-box 5.7 GB, old-mac 4.6 GB; about 5.0 words a second (estimate)
+    held in memory: this Mac 10.1 GB, big-box 6.2 GB, old-mac 3.4 GB; about 5.4 words a second (estimate)
+    right now: doesn't fit (this Mac has 3.0 GB free for its 10.1 GB share; old-mac has 0.9 GB free for its 3.4 GB share); it fits when this Mac and old-mac are quieter
+    ran here: 4.2 words a second on big-box and this Mac, 14 Nov (record ai-20261114-135432-5cae, measured)
     made for chat, coding, agents, pictures; takes in 256K tokens at once (about 197K words); 25B parameters, 3.8B at work per word
     licence apache-2.0; from huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF
     the strongest at coding by SciCode of those here that should answer at 2 or more words a second, kept at 3.5 or more bits a weight
 
-Strongest overall here, by general score
-  Qwen3.6 35B A3B (UD-Q4_K_M, 22.1 GB file)
-    scores: coding 36.6% (SciCode), general 261 (Progress Index), agents 5.2% (AutomationBench), reasoning 22.2% (Humanity's Last Exam), pictures 75.0% (MMMU-Pro)
-    held in memory: this Mac 12.0 GB, big-box 7.4 GB, old-mac 6.0 GB; about 6.6 words a second (estimate)
-    made for coding, agents, chat, pictures; takes in 256K tokens at once (about 197K words); 35B parameters, 3.0B at work per word
-    licence apache-2.0; from huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF
+Best that fits right now
+  Qwen3.5 9B (Q4_K_M, 5.7 GB file)
+    scores: coding 29.5% (SciCode), agents 1.1% (AutomationBench), reasoning 14.9% (Humanity's Last Exam), pictures 69.2% (MMMU-Pro)
+    held in memory: this Mac 7.2 GB; about 7.7 words a second (estimate)
+    right now: fits, held as big-box 7.2 GB
+    made for chat, coding, agents, pictures; takes in 256K tokens at once (about 197K words); 9.0B parameters
+    licence apache-2.0; from huggingface.co/unsloth/Qwen3.5-9B-GGUF
 ...
 Ranked for coding by SciCode (Artificial Analysis): 24 of the 29 models have a score; the rest come after them, those made for it first.
 ```
 
-That is a real run on three machines, 14 November 2026. It downloads nothing.
+That is a real run on three machines, 14 November 2026, while this Mac was busy
+with other work: Gemma had answered on two of them earlier that day, measured
+below the estimate. It downloads nothing.
 The list ships with Orchard (`src/orchard/ai_models.json`): exact file sizes
 read from Hugging Face, and scores read from the named leaderboards, with the
 exact entry each was matched to. Unless you pass `--offline`, it also asks
@@ -191,8 +202,10 @@ well-known publishers that aren't on the list yet, unranked. Nothing about you
 or your machines is sent. `--machines` limits which machines count, and
 `--json` prints it all for a script, every score included.
 
-**How it judges.** Each machine keeps a quarter of its memory, and at least 2 GB,
-for itself; a graphics card adds most of its own memory. A model needs its file
+**How it judges.** Each machine keeps a quarter of its memory for itself, at
+least 2 GB, and at least 4 GB on a Mac, since macOS and its background work take
+that much (an 8 GB Mac ran short of memory holding 5.5 GB of a model); a
+graphics card adds most of its own memory. A model needs its file
 size plus a tenth, and 1 GB for its working memory. The machines with the most
 room are used first, as few as will hold it, each given a share in proportion to
 its room. The speed estimate assumes each word reads the model's active weights
@@ -200,7 +213,26 @@ once, each machine its share, at the memory speed measured on that machine (one
 core copying memory, so it leaves out what graphics chips add and what the
 network between machines takes). Read the speeds as a rough guide; a short test
 run gives the real number. A model with no score on a leaderboard wasn't found
-there, which doesn't mean it is weak.
+there, which doesn't mean it is weak. Speeds, here and in `orchard ai ask`,
+count the engine's tokens, which Orchard calls words; a token is about three
+quarters of an English word.
+
+**Right now** is what each machine has free at this moment, less 1 GB, and never
+more than its room; on Linux inside Windows it is what Windows has free, since
+Linux can only grow into that. It is a snapshot: `orchard ai ask` itself pauses
+the sync apps and waits for memory before it starts.
+
+**It learns from your runs.** Every `orchard ai ask` and `orchard ai serve` run
+leaves a sealed record on this machine, and the picker reads them. Each file
+you've run shows its fastest answer ("ran here", measured) and, when its latest
+run didn't answer, why ("tried here"). When a run stopped because a machine ran
+short of memory, it works out about how much of the model that machine held,
+from the model's layers (read from its own file) and the split the run used, and
+from then on counts at most 80% of that as the machine's room, unless a run that
+answered had it holding more. The machine's line says so and names the record.
+Runs that moved parts of the model by hand (`overrides`) or left the split to
+the engine aren't measured that way, and a record whose seal doesn't check out
+is ignored.
 
 ## Keep it ready for your tools
 

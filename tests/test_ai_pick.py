@@ -3,10 +3,17 @@ import json
 import pytest
 from typer.testing import CliRunner
 
-from orchard import ai, ai_pick, cli, cli_agentic
+from orchard import ai, ai_pick, cli, cli_agentic, receipts
 
 runner = CliRunner()
 GIB = 1024
+
+
+@pytest.fixture(autouse=True)
+def _no_real_records(tmp_path, monkeypatch):
+    # Earlier runs are read from Orchard's records: keep the real ones out.
+    monkeypatch.setattr(ai, "AI_DIR", tmp_path / "ai")
+    monkeypatch.setattr(receipts, "KEY_PATH", tmp_path / "receipt.key")
 
 
 def machine(name, ram_gb, *, gpu=None, vram_gb=0, disk=100.0, speed=20.0, wsl=False, system="Darwin"):
@@ -45,9 +52,11 @@ def catalogue(*models):
 
 def test_room_keeps_a_quarter_and_counts_graphics_memory():
     mac, box, old = fleet()
-    assert mac.room_gb == 12.0 and old.room_gb == 6.0
+    assert mac.room_gb == 12.0
+    assert old.room_gb == 4.0  # a Mac keeps at least 4 GB for itself
     assert box.room_gb == 7.6  # 6 GB of memory and 80% of a 2 GB card
-    assert machine("tiny", 4).room_gb == 2.0  # at least 2 GB stays with the machine
+    assert machine("tiny", 4, system="Linux").room_gb == 2.0  # at least 2 GB stays with the machine
+    assert machine("tiny-mac", 4).room_gb == 0.0
 
 
 def test_the_fewest_machines_share_in_proportion_to_their_room():
@@ -76,7 +85,7 @@ def test_a_big_mixture_of_experts_runs_from_disk_and_a_big_dense_model_does_not(
     assert "reads from disk" in row["why"]
     dense = model("dense", 70, 45.0, params=70.0)
     row = ai_pick.judge(dense, dense["quants"][0], fleet())
-    assert row["group"] == "no" and "your machines have 25.6 GB together" in row["why"]
+    assert row["group"] == "no" and "your machines have 23.6 GB together" in row["why"]
 
 
 def test_a_model_bigger_than_any_disk_is_turned_away_with_the_reason():
@@ -287,7 +296,7 @@ def stub_settings(tmp_path, monkeypatch):
 def test_a_squeezed_model_is_flagged_and_not_the_best_pick():
     squeezed = model("squeezed", 80, 0, params=36.0, active=4.0,
                      quants=[{"quant": "IQ2_M", "files": ["s"], "bytes": int(13e9)}])
-    full = model("full", 60, 0, params=35.0, active=3.0, quants=[{"quant": "Q4_K_M", "files": ["f"], "bytes": int(21e9)}])
+    full = model("full", 60, 0, params=35.0, active=3.0, quants=[{"quant": "Q4_K_M", "files": ["f"], "bytes": int(19e9)}])
     result = ai_pick.pick(fleet(), catalogue(squeezed, full))
     assert result["best"]["model"]["id"] == "full"
     text = "\n".join(ai_pick.report(result, None, []))
@@ -495,3 +504,180 @@ def test_no_question_when_the_output_is_piped(monkeypatch):
     assert cli_agentic._can_ask() is False
     monkeypatch.setattr(cli_agentic.sys, "stdout", Stream(True))
     assert cli_agentic._can_ask() is True
+
+
+# Right now, and what earlier runs showed.
+
+NOON = __import__("time").mktime((2026, 11, 14, 12, 0, 0, 0, 0, -1))
+
+
+def test_room_now_is_whats_free_less_a_margin_and_never_more_than_room():
+    mac = machine("this Mac", 16, gpu="apple")
+    mac["free_mb"] = 3 * GIB
+    assert mac.room_now_gb == 2.0
+    mac["free_mb"] = 15 * GIB
+    assert mac.room_now_gb == 12.0
+    mac["cap_gb"] = 5.0
+    assert (mac.room_gb, mac.full_room_gb, mac.room_now_gb) == (5.0, 12.0, 5.0)
+    mac["free_mb"] = None
+    assert mac.room_now_gb is None
+    box = machine("big-box", 8, gpu="nvidia", vram_gb=2, system="Linux", wsl=True)
+    box["free_mb"] = 2 * GIB
+    assert box.room_now_gb == 2.6  # 1 GB of what's free, and the card's own memory
+
+
+def busy_fleet():
+    mac, box, old = fleet()
+    mac["free_mb"] = 3 * GIB
+    return [mac, box, old]
+
+
+def test_a_pick_that_does_not_fit_now_names_the_busy_machine_and_the_best_that_does():
+    big, small = model("big", 60, 18.0, active=3.0), model("small", 30, 3.0, params=5.0)
+    result = ai_pick.pick(busy_fleet(), catalogue(big, small))
+    assert result["best"]["model"]["id"] == "big" and result["best"]["fits_now"] is False
+    assert result["best_now"]["model"]["id"] == "small"
+    text = "\n".join(ai_pick.report(result, None, []))
+    assert "room for 12.0 GB of model (2.0 GB of it free right now)" in text
+    assert "right now: doesn't fit (this Mac has 2.0 GB free for its 10.6 GB share" in text
+    assert "it fits when this Mac, big-box and old-mac are quieter" in text
+    assert "Best that fits right now\n  Small (Q4_K_M, 3.0 GB file)" in text
+    assert "right now: fits, held as big-box 4.3 GB" in text
+    assert "Together: room for 23.6 GB of model in memory, 9.6 GB of it free right now." in text
+    data = ai_pick.as_json(result, None, [])
+    assert data["best"]["fits_now"] is False and data["best_now"]["id"] == "small"
+    assert data["best"]["short_now"][0] == {"machine": "this Mac", "share_gb": 10.6, "free_gb": 2.0}
+    assert data["machines"][0]["room_now_gb"] == 2.0
+
+
+def test_when_the_best_pick_fits_now_nothing_else_is_offered():
+    result = ai_pick.pick(fleet(), catalogue(model("small", 30, 3.0, params=5.0)))
+    assert result["best"]["fits_now"] is True and result["best_now"] is None
+    assert "right now: fits\n" in "\n".join(ai_pick.report(result, None, []))
+
+
+def save_record(rid, **fields):
+    ai.AI_DIR.mkdir(parents=True, exist_ok=True)
+    record = receipts.sign({"id": rid, "kind": "ai", "started_at": NOON, **fields})
+    (ai.AI_DIR / f"{rid}.json").write_text(json.dumps(record))
+    return record
+
+
+def layered(mid="mid", gb=18.0, layers=30):
+    return model(mid, 50, gb, active=3.0, layers=layers)
+
+
+def run_of(rid, state, *, layers=18, devices="CUDA0,RPC0", split="2,16", far=(), reason=None, ms=None,
+           overrides="", file="mid-Q4_K_M.gguf", **extra):
+    return save_record(rid, state=state, reason=reason, timings={"ms_per_word": ms} if ms else {},
+                       command=["./llama-completion", "-m", f"~/models/{file}", "-p", "hi"],
+                       settings={"layers": layers, "devices": devices, "split": split, "overrides": overrides},
+                       machines={"engine": "big-box", "helper": True, "far_helpers": list(far)}, **extra)
+
+
+def test_how_much_each_machine_held_comes_from_the_layers():
+    mid = layered()
+    record = {"settings": {"layers": 28, "devices": "CUDA0,RPC0,RPC1", "split": "2,16,10", "overrides": ""},
+              "machines": {"engine": "big-box", "helper": True, "far_helpers": ["old-mac"]}}
+    held = ai_pick.held_gb(record, mid, mid["quants"][0], lambda h: h, "this Mac")
+    # 0.6 GB a layer: big-box keeps 2 layers and its card takes 2, this Mac 16, old-mac 10
+    assert held == {"big-box": 2.4, "this Mac": 9.6, "old-mac": 6.0}
+    record["settings"]["overrides"] = "exps=CPU"
+    assert ai_pick.held_gb(record, mid, mid["quants"][0], lambda h: h, "this Mac") is None
+    record["settings"].update(overrides="", split="")
+    assert ai_pick.held_gb(record, mid, mid["quants"][0], lambda h: h, "this Mac") is None
+
+
+def test_an_answered_run_shows_its_measured_speed_next_to_the_estimate():
+    run_of("ai-20261114-100000-aaaa", "answered", ms=250.0)
+    result = ai_pick.pick(fleet(), catalogue(layered()), past=ai_pick.history(fleet(), catalogue(layered())))
+    text = "\n".join(ai_pick.report(result, None, []))
+    assert "(estimate)" in text
+    assert ("ran here: 4.0 words a second on big-box and this Mac, 14 Nov "
+            "(record ai-20261114-100000-aaaa, measured)") in text
+    run = ai_pick.as_json(result, None, [])["best"]["runs"][0]
+    assert run["held"] == {"big-box": 8.4, "this Mac": 9.6} and run["words_per_second"] == 4.0
+
+
+def test_a_machine_that_ran_short_of_memory_counts_less_room_after():
+    run_of("ai-20261114-110000-bbbb", "stopped", reason="this machine is short of memory")
+    machines = fleet()
+    past = ai_pick.history(machines, catalogue(layered()))
+    assert past["caps"]["this Mac"]["gb"] == 7.7  # 80% of the 9.6 GB it held
+    result = ai_pick.pick(machines, catalogue(layered()), past=past)
+    assert machines[0].room_gb == 7.7
+    text = "\n".join(ai_pick.report(result, None, []))
+    assert ("counted at 7.7 GB, not 12.0: it ran short of memory holding about 9.6 GB on 14 Nov "
+            "(record ai-20261114-110000-bbbb)") in text
+    assert "tried here: stopped, this machine is short of memory, 14 Nov (record ai-20261114-110000-bbbb)" in text
+
+
+def test_a_run_that_answered_holding_more_lifts_the_limit():
+    run_of("ai-20261114-110000-bbbb", "stopped", reason="this machine is short of memory")
+    run_of("ai-20261114-120000-cccc", "answered", ms=300.0, layers=20, split="2,18")  # this Mac held 10.8
+    past = ai_pick.history(fleet(), catalogue(layered()))
+    assert past["caps"]["this Mac"]["gb"] == 10.8
+
+
+def test_a_far_helper_or_the_engine_running_short_is_read_too():
+    run_of("ai-20261114-110000-bbbb", "stopped", layers=28, devices="CUDA0,RPC0,RPC1", split="2,16,10",
+           far=["old-mac"], reason="old-mac is short of memory")
+    run_of("ai-20261114-120000-cccc", "stopped", reason="under 1500 MB free on the engine machine")
+    caps = ai_pick.history(fleet(), catalogue(layered()))["caps"]
+    assert caps["old-mac"]["gb"] == 4.8 and caps["big-box"]["gb"] == 6.7  # 80% of 6.0 and of 8.4
+    machines = fleet()
+    ai_pick.pick(machines, catalogue(layered()), past={"runs": {}, "caps": caps})
+    assert machines[2].room_gb == 4.0 and "cap_gb" not in machines[2]  # already below the limit
+    assert machines[1].room_gb == 6.7
+
+
+def test_unsealed_refused_and_hand_split_runs_change_nothing():
+    tampered = run_of("ai-20261114-090000-dddd", "answered", ms=100.0)
+    tampered["timings"]["ms_per_word"] = 10.0
+    (ai.AI_DIR / "ai-20261114-090000-dddd.json").write_text(json.dumps(tampered))
+    run_of("ai-20261114-100000-eeee", "refused", reason="this machine is short of memory")
+    run_of("ai-20261114-110000-ffff", "stopped", reason="this machine is short of memory", overrides="exps=CPU")
+    past = ai_pick.history(fleet(), catalogue(layered()))
+    assert past["caps"] == {}
+    assert [r["id"] for r in past["runs"][("mid", "Q4_K_M")]] == ["ai-20261114-110000-ffff"]
+
+
+def test_a_served_answer_is_read_through_its_session():
+    save_record("ais-20261114-100000-1111", kind="ai-session", state="stopped", reason="idle",
+                command=["./llama-server", "-m", "~/models/mid-Q4_K_M.gguf"],
+                settings={"layers": 18, "devices": "CUDA0,RPC0", "split": "2,16", "overrides": ""},
+                machines={"engine": "big-box", "helper": True, "far_helpers": []})
+    save_record("ai-20261114-100500-2222", via="server", session="ais-20261114-100000-1111", state="answered",
+                timings={"ms_per_word": 500.0}, machines={"engine": "big-box", "helper": True, "far_helpers": []},
+                settings={"layers": 18, "devices": "CUDA0,RPC0", "split": "2,16", "overrides": ""})
+    runs = ai_pick.history(fleet(), catalogue(layered()))["runs"][("mid", "Q4_K_M")]
+    assert [(r["id"], r["words_per_second"]) for r in runs] == [("ai-20261114-100500-2222", 2.0)]
+
+
+def test_the_stop_reasons_read_here_are_the_ones_orchard_ai_writes():
+    import inspect
+    source = inspect.getsource(ai._Pool._why_stop)
+    assert '"this machine is short of memory"' in source
+    assert 'f"{h[\'host\']} is short of memory"' in source
+    assert 'f"under {stop_at} MB free on the engine machine"' in source
+    who = {"machines": {"engine": "big-box"}}
+    assert ai_pick.short_of_memory("this machine is short of memory", who, str, "this Mac") == "this Mac"
+    assert ai_pick.short_of_memory("old-mac is short of memory", who, str, "this Mac") == "old-mac"
+    assert ai_pick.short_of_memory("under 1500 MB free on the engine machine", who, str, "this Mac") == "big-box"
+    assert ai_pick.short_of_memory("old-mac is in use: a job", who, str, "this Mac") is None
+
+
+def test_linux_in_windows_counts_what_windows_has_free(monkeypatch):
+    box = machine("big-box", 8, wsl=True, system="Linux")
+    box["free_mb"] = 7 * GIB
+    monkeypatch.setattr(ai_pick, "read_machine", lambda name, target: box)
+    monkeypatch.setattr(ai_pick.config, "load_workers", lambda: [])
+    monkeypatch.setattr(ai, "load_settings", lambda *a, **k: {"engine": {"host": "big-box"}, "windows": {"host": "win"}})
+    monkeypatch.setattr(ai, "has_windows", lambda cfg: True)
+    monkeypatch.setattr(ai_pick, "windows_disk", lambda host: 40.0)
+    seen = []
+    monkeypatch.setattr(ai, "_remote", lambda host, cmd, timeout: seen.append((host, cmd)) or type(
+        "R", (), {"stdout": '"(PDH-CSV 4.0)","\\\\WIN\\Memory\\Available MBytes"\n"11/14/2026 12:00:00.000","2048.000000"\n'})())
+    machines = ai_pick.read_machines()
+    assert machines[0]["free_mb"] == 2048 and machines[0]["disk_free_gb"] == 40.0
+    assert seen == [("win", ai_pick.WINDOWS_FREE)]
