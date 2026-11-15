@@ -123,8 +123,8 @@ if f["system"] == "Linux":
     m = re.search(r"model name\s*:\s*(.+)", open("/proc/cpuinfo").read())
     f["chip"] = m.group(1).strip() if m else ""
 else:
-    # macOS's own figure for free memory, the one its memory pressure follows:
-    # it counts what macOS can free by compressing apps that sit idle.
+    # macOS's own free figure, the percentage memory_pressure reports: memory not
+    # wired down or already compressed. The most that could be made free.
     level = run(["sysctl", "-n", "kern.memorystatus_level"]).strip()
     if level.isdigit() and 0 <= int(level) <= 100:
         f["free_mb"] = f["ram_mb"] * int(level) // 100
@@ -361,8 +361,12 @@ def active_share(model: dict) -> float:
 
 def plan_memory(need: float, machines: list[Machine],
                 room_of: Callable[[Machine], float] = lambda m: m.room_gb) -> list[tuple[Machine, float]] | None:
-    """The fewest machines that hold `need` GB between them, most room first,
-    each given a share in proportion to its room. None if they can't."""
+    """The fastest machine that holds `need` GB on its own; else the fewest that
+    hold it between them, most room first, each given a share in proportion to
+    its room. None if they can't."""
+    alone = [m for m in machines if room_of(m) >= need]
+    if alone:
+        return [(max(alone, key=lambda m: (m.speed_gbs, room_of(m))), round(need, 1))]
     ranked = sorted(machines, key=lambda m: (room_of(m), m.speed_gbs), reverse=True)
     chosen: list[Machine] = []
     for machine in ranked:

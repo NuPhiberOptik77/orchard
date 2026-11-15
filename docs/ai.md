@@ -167,29 +167,29 @@ you've run a model before, it shows what that run measured next to the estimate
 ```console
 $ orchard ai pick --for coding
 Your machines
-  this Mac   macOS arm64, 16 GB memory, Apple M5 GPU: room for 12.0 GB of model (3.3 GB of it free right now), 8.3 GB free disk, reads memory at 38.6 GB/s
-  old-mac    macOS x86_64, 8 GB memory, Intel Iris Plus Graphics 645: room for 4.0 GB of model (2.5 GB of it free right now), 13.6 GB free disk, reads memory at 8.8 GB/s
-  big-box    Linux in Windows x86_64, 8 GB memory, NVIDIA GeForce GTX 1050 2 GB: room for 7.4 GB of model (6.1 GB of it free right now), 63.3 GB free disk (the Windows drive), reads memory at 7.4 GB/s
-  Together: room for 23.4 GB of model in memory, 11.9 GB of it free right now.
+  this Mac   macOS arm64, 16 GB memory, Apple M5 GPU: room for 12.0 GB of model (6.8 GB of it free right now), 7.8 GB free disk, reads memory at 47.7 GB/s
+  old-mac    macOS x86_64, 8 GB memory, Intel Iris Plus Graphics 645: room for 4.0 GB of model (2.0 GB of it free right now), 14.4 GB free disk, reads memory at 6.1 GB/s
+  big-box    Linux in Windows x86_64, 8 GB memory, NVIDIA GeForce GTX 1050 2 GB: room for 7.4 GB of model (4.3 GB of it free right now), 63.3 GB free disk (the Windows drive), reads memory at 7.4 GB/s
+  Together: room for 23.4 GB of model in memory, 13.1 GB of it free right now.
 The picks are for when your machines are quiet. "Right now" says only what is free at this moment; `orchard ai ask` waits for memory before it starts.
 
 Best pick for coding
   Gemma 4 26B A4B (UD-Q4_K_M, 16.9 GB file)
     scores: coding 40.1% (SciCode), agents 1.9% (AutomationBench), reasoning 19.3% (Humanity's Last Exam), pictures 69.2% (MMMU-Pro), chat 1437.4 (Text Arena rating)
-    held in memory: this Mac 10.1 GB, big-box 6.2 GB, old-mac 3.4 GB; about 5.2 words a second (estimate)
-    right now: busy (this Mac has 3.3 GB free for its 10.1 GB share; big-box has 6.1 GB free for its 6.2 GB share; old-mac has 2.5 GB free for its 3.4 GB share); it should fit when this Mac, big-box and old-mac are quieter
+    held in memory: this Mac 10.1 GB, big-box 6.2 GB, old-mac 3.4 GB; about 4.8 words a second (estimate)
+    right now: busy (this Mac has 6.8 GB free for its 10.1 GB share; big-box has 4.3 GB free for its 6.2 GB share; old-mac has 2.0 GB free for its 3.4 GB share); it should fit when this Mac, big-box and old-mac are quieter
     ran here: 4.2 words a second on big-box and this Mac, 14 Nov (record ai-20261114-135432-5cae, measured)
     made for chat, coding, agents, pictures; takes in 256K tokens at once (about 197K words); 25B parameters, 3.8B at work per word
     licence apache-2.0; from huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF
     the strongest at coding by SciCode of those here that should answer at 2 or more words a second, kept at 3.5 or more bits a weight
 
 Best that fits right now
-  MiniCPM5 2B (Q4_K_M, 1.6 GB file)
-    scores: coding 26.3% (SciCode), general 221 (Progress Index), agents 1.8% (AutomationBench), reasoning 8.9% (Humanity's Last Exam)
-    held in memory: big-box 2.7 GB; about 4.7 words a second (estimate)
+  Qwen3.5 9B (Q4_K_M, 5.7 GB file)
+    scores: coding 29.5% (SciCode), agents 1.1% (AutomationBench), reasoning 14.9% (Humanity's Last Exam), pictures 69.2% (MMMU-Pro)
+    held in memory: this Mac 4.4 GB, big-box 2.8 GB; about 2.7 words a second (estimate)
     right now: fits
-    made for chat; takes in 128K tokens at once (about 98K words); 2.5B parameters
-    licence apache-2.0; from huggingface.co/openbmb/MiniCPM5-2B-GGUF
+    made for chat, coding, agents, pictures; takes in 256K tokens at once (about 197K words); 9.0B parameters
+    licence apache-2.0; from huggingface.co/unsloth/Qwen3.5-9B-GGUF
 ...
 Ranked for coding by SciCode (Artificial Analysis): 24 of the 29 models have a score; the rest come after them, those made for it first.
 ```
@@ -208,23 +208,24 @@ or your machines is sent. `--machines` limits which machines count, and
 **How it judges.** Each machine keeps a quarter of its memory for itself, at
 least 2 GB, and at least 4 GB on a Mac, since macOS and its background work take
 that much (an 8 GB Mac ran short of memory holding 5.5 GB of a model); a
-graphics card adds most of its own memory. A model needs its file
-size plus a tenth, and 1 GB for its working memory. The machines with the most
-room are used first, as few as will hold it, each given a share in proportion to
-its room. The speed estimate assumes each word reads the model's active weights
-once, each machine its share, at the memory speed measured on that machine (one
-core copying memory, so it leaves out what graphics chips add and what the
-network between machines takes). Read the speeds as a rough guide; a short test
-run gives the real number. A model with no score on a leaderboard wasn't found
-there, which doesn't mean it is weak. Speeds, here and in `orchard ai ask`,
-count the engine's tokens, which Orchard calls words; a token is about three
-quarters of an English word.
+graphics card adds most of its own memory. A model needs its file size plus a
+tenth, and 1 GB for its working memory. The machines with the most room are used
+first, as few as will hold it, each given a share in proportion to its room; a
+model that one machine can hold goes on the fastest that can. The speed estimate
+assumes each word reads the model's active weights once, each machine its share,
+at the memory speed measured on that machine (one core copying memory, so it
+leaves out what graphics chips add and what the network between machines takes).
+Read the speeds as a rough guide; a short test run gives the real number. A
+model with no score on a leaderboard wasn't found there, which doesn't mean it
+is weak. Speeds, here and in `orchard ai ask`, count the engine's tokens, which
+Orchard calls words; a token is about three quarters of an English word.
 
 **Right now** is what each machine has free at this moment, less 1 GB, plus most
 of a graphics card's own memory, and never more than its room. On a Mac, free
-is macOS's own figure, the one its memory pressure follows, so memory it can
-free by compressing apps that sit idle counts as free; on Linux it is what the
-system says is available. For the machine
+is macOS's own figure, the free percentage `memory_pressure` reports: memory not
+wired down or already compressed, so it includes apps' memory macOS would have
+to compress first. Read it as the most that could be made free. On Linux it is
+what the system says is available. For the machine
 that runs the engine under Linux inside Windows, it is the smaller of what Linux
 and Windows have free, since Linux can only grow into what Windows has. The best
 that fits right now is judged where it would sit right now, with the speed

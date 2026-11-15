@@ -751,3 +751,12 @@ def test_room_now_never_goes_below_zero_and_a_model_is_not_shown_twice():
     assert result["best_now"]["model"]["id"] == "small" and result["overall"]["model"]["id"] == "small"
     text = "\n".join(ai_pick.report(result, None, []))
     assert text.count("  Small (Q4_K_M") == 1 and "(also the strongest overall here, by general score)" in text
+
+
+def test_a_model_one_machine_can_hold_goes_on_the_fastest_that_can():
+    roomy_slow = machine("big-box", 16, system="Linux", speed=8.0)
+    small_fast = machine("this Mac", 8, gpu="apple", speed=40.0)
+    split = ai_pick.plan_memory(3.0, [roomy_slow, small_fast])
+    assert [(m["name"], gb) for m, gb in split] == [("this Mac", 3.0)]
+    split = ai_pick.plan_memory(10.0, [roomy_slow, small_fast])
+    assert [(m["name"], gb) for m, gb in split] == [("big-box", 10.0)]
