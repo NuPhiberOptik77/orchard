@@ -167,7 +167,9 @@ reasoning or reading pictures) and says which of the strongest open models at
 that your machines can run, fast from memory or slowly from disk, with each
 model's scores and how it would split across them. It says whether each fits
 right now, and shows what your own earlier runs measured: a machine that ran
-short of memory in a run counts less room from then on. See [docs/ai.md](docs/ai.md).
+short of memory in a run counts less room from then on. Name a model with
+`orchard ai ask --model` (or `serve --model`) and Orchard lays it out across your
+machines itself; `orchard ai plan` shows how. See [docs/ai.md](docs/ai.md).
 
 ## Menu-bar apps (optional)
 

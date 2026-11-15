@@ -1185,10 +1185,16 @@ def clear_leftovers(say: Callable[[str], None]) -> list[str]:
     return cancelled
 
 
-def serve(port: int | None = None, keep_alive: int | None = None, say: Callable[[str], None] = lambda _: None) -> int:
+def serve(port: int | None = None, keep_alive: int | None = None, say: Callable[[str], None] = lambda _: None,
+          model: str | None = None) -> int:
     """Run until stopped, then put everything back. Raises ai.ConfigError on
-    bad settings or a port that's taken."""
+    bad settings or a port that's taken. `model` names a listed model to lay
+    out across the machines, read once at the start."""
     cfg = load_settings()
+    if model:
+        from . import ai_auto
+        cfg, layout = ai_auto.apply(cfg, model, say)
+        cfg["server"]["name"] = cfg["server"]["name"] or layout["model"]
     if port is not None:
         cfg["server"]["port"] = port
     if keep_alive is not None:

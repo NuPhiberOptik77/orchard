@@ -941,6 +941,7 @@ def ai_ask(
     overrides: Optional[str] = typer.Option(None, "--overrides", envvar="ORCHARD_AI_OVERRIDES", help="which device holds which tensors"),
     no_pause: bool = typer.Option(False, "--no-pause", envvar="ORCHARD_AI_NO_PAUSE", help="leave the sync apps running"),
     no_hold: bool = typer.Option(False, "--no-hold", help="don't hold the machine in Orchard's queue"),
+    model: Optional[str] = typer.Option(None, "--model", help="a model from `orchard ai pick`'s list, laid out across your machines"),
     json_out: bool = typer.Option(False, "--json", help="machine-readable output"),
 ) -> None:
     """Put one question to the pool, put everything back, keep a sealed record.
@@ -960,7 +961,7 @@ def ai_ask(
 
     try:
         record = ai.ask(text, threads=threads, split=split, overrides=overrides, words=words,
-                        pause=not no_pause, hold=not no_hold, say=say, echo=None if json_out else echo)
+                        pause=not no_pause, hold=not no_hold, say=say, echo=None if json_out else echo, model=model)
     except ai.ConfigError as exc:
         print(f"ai: {exc}", file=sys.stderr)
         raise typer.Exit(2)
@@ -978,6 +979,7 @@ def ai_ask(
 def ai_serve(
     port: Optional[int] = typer.Option(None, "--port", help="port on this machine's loopback (default 6724)"),
     keep_alive: Optional[int] = typer.Option(None, "--keep-alive", help="seconds without a question before the model unloads"),
+    model: Optional[str] = typer.Option(None, "--model", help="a model from `orchard ai pick`'s list, laid out across your machines"),
 ) -> None:
     """Keep the model ready for tools that speak OpenAI, Claude or Ollama.
 
@@ -989,11 +991,39 @@ def ai_serve(
         print(f"ai: {time.strftime('%H:%M:%S')} {message}", file=sys.stderr, flush=True)
 
     try:
-        code = ai_server.serve(port=port, keep_alive=keep_alive, say=say)
+        code = ai_server.serve(port=port, keep_alive=keep_alive, say=say, model=model)
     except ai.ConfigError as exc:
         print(f"ai: {exc}", file=sys.stderr)
         raise typer.Exit(2)
     raise typer.Exit(code)
+
+
+@ai_app.command("plan")
+def ai_plan(
+    model: str = typer.Argument(..., help="a model from `orchard ai pick`'s list, by id or name"),
+    json_out: bool = typer.Option(False, "--json", help="machine-readable output"),
+) -> None:
+    """Show how `--model` would lay a model out across your machines. Reads
+    the machines and looks for the model's file; runs nothing.
+    Exit 0 it fits, 2 it doesn't or the settings are wrong."""
+    from . import ai_auto
+
+    def say(message: str) -> None:
+        if not json_out:
+            print(f"ai: {message}", file=sys.stderr, flush=True)
+
+    try:
+        cfg, layout = ai_auto.apply(ai.load_settings(), model, say, announce=False)
+    except ai.ConfigError as exc:
+        print(f"ai: {exc}", file=sys.stderr)
+        raise typer.Exit(2)
+    e = cfg["engine"]
+    if json_out:
+        print(json.dumps(layout | {"devices": e["devices"], "split": e["split"], "gpu_layers": e["layers"]}, indent=2))
+        return
+    print(ai_auto.describe(layout))
+    print(f"file: {e['model']}")
+    print(f"engine flags: --device {e['devices'] or '(none)'} -ngl {e['layers']} -ts {e['split'] or '(none)'}")
 
 
 def _can_ask() -> bool:

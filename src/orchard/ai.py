@@ -69,7 +69,7 @@ DEFAULTS = {
         "binary": "llama-completion", "busy_pattern": r"^\./llama-|^\./ggml-rpc", "threads": 4, "context": 512,
         "layers": 99, "devices": "", "split": "", "overrides": "", "args": [], "env": {}, "words": 200,
         "cap_seconds": 2400, "worker": "", "worker_tags": [], "hold_wait_seconds": 900, "start_free_mb": 0,
-        "stop_free_mb": 0, "settle_seconds": 300, "thinking_end": "",
+        "stop_free_mb": 0, "settle_seconds": 300, "thinking_end": "", "models_folder": "~/llm/models",
     },
     "helper": {"binary": "ggml-rpc-server", "device": "", "port": 50052, "tunnel_port": 50072},
     # Each [[far_helper]] gets these, with its ports moved on by its place in the list.
@@ -89,6 +89,7 @@ TEMPLATE = """\
 host = "CHANGE"                                     # ssh name of the machine that holds the model
 folder = "~/llm/engine"                             # holds the llama.cpp binaries
 model = "~/llm/models/CHANGE-00001-of-00006.gguf"   # first file of the model
+models_folder = "~/llm/models"                      # where --model looks for a listed model's file
 threads = 4
 context = 512
 layers = 99
@@ -894,10 +895,17 @@ def _digest(path: Path) -> str | None:
 
 def ask(question: str, *, threads: int | None = None, split: str | None = None, overrides: str | None = None,
         words: int | None = None, pause: bool = True, hold: bool = True, say: Callable[[str], None] = lambda _: None,
-        echo: Callable[[str], None] | None = None) -> dict:
+        echo: Callable[[str], None] | None = None, model: str | None = None) -> dict:
     """Put one question to the pool. Raises ConfigError on bad settings; every
-    other outcome, a refusal included, comes back as a saved record."""
+    other outcome, a refusal included, comes back as a saved record. `model`
+    names a listed model to lay out across the machines for this run."""
     cfg = load_settings(threads, split, overrides, words)
+    layout = None
+    if model:
+        if split or overrides:
+            raise ConfigError("--model works out the split itself: leave out --split and --overrides")
+        from . import ai_auto  # it reads the picker's list, which needs this module first
+        cfg, layout = ai_auto.apply(cfg, model, say)
     e = cfg["engine"]
     AI_DIR.mkdir(parents=True, exist_ok=True)
     rid = _new_id()
@@ -910,6 +918,8 @@ def ask(question: str, *, threads: int | None = None, split: str | None = None, 
         "machines": {"engine": e["host"], "helper": has_helper(cfg), "windows": cfg["windows"].get("host", ""),
                      "far_helpers": [h["host"] for h in cfg["far_helpers"]]},
     }
+    if layout:
+        record["layout"] = layout
     _save(record)
     pool = _Pool(cfg, folder, say)
     state, reason, rc = "failed", None, None

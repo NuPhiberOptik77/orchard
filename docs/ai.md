@@ -246,6 +246,54 @@ by hand (`overrides`, or engine flags such as `--n-cpu-moe` in `args`) or left
 the split to the engine aren't measured that way, and a record whose seal
 doesn't check out is ignored.
 
+## Name a model, Orchard lays it out
+
+Once you've picked a model and downloaded its file to the engine machine, name
+it and Orchard works out where each part goes:
+
+```console
+$ orchard ai plan "gemma 4 26b"
+ai: finding Gemma 4 26B A4B on big-box
+ai: reading the machines
+Gemma 4 26B A4B (UD-Q4_K_M, 30 layers): big-box 9 layers (5.5 GB, 2 on its graphics card); this Mac 19 layers (11.8 GB); old-mac 2 layers (1.2 GB)
+file: ~/llm/models/picks/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf
+engine flags: --device CUDA0,RPC0,RPC1 -ngl 23 -ts 2,19,2
+```
+
+That is a real plan on three machines, 15 November 2026 (machines renamed, the
+home folder shortened to `~`). `orchard ai plan` only reads; to run it, ask with
+`--model`:
+
+```bash
+orchard ai ask --model gemma-4-26b-a4b "Explain in two sentences why the sky is blue."
+orchard ai serve --model gemma-4-26b-a4b
+```
+
+The model can be named by its id from `orchard ai pick --json`, its name, or the
+start of either when only one model has it. Orchard looks for its file on the
+engine machine under `models_folder` (default `~/llm/models`) and the folder of
+the settings' `model`, three folders deep, and uses the largest file you have
+that fits. A model you haven't downloaded is refused with the file to get and
+where; one that doesn't fit is refused with how many of its layers the machines
+have room for.
+
+**Where each layer goes.** Each machine's room is the picker's (see "How it
+judges" above), less 1 GB on the engine machine for its working memory, and
+each layer needs its share of the file plus a tenth. The layers fill:
+
+1. the engine machine's graphics card, as many as fit;
+2. helper machines whose memory is at least twice as fast as the engine
+   machine's own, fastest first, since every word crosses the network to them;
+3. the engine machine's own memory;
+4. the other helpers, fastest first.
+
+A helper that gets no layers isn't started. The layout replaces the settings'
+`model`, `devices`, `split` and `layers` for that run, and is kept in the run's
+sealed record; everything else, the helpers' addresses included, comes from the
+settings file, so the machines it can use are the ones the file lists
+(`[helper]` and each `[[far_helper]]`). `--model` can't be combined with
+`--split` or `overrides`, which place layers by hand.
+
 ## Keep it ready for your tools
 
 `orchard ai serve` keeps the model ready for the tools you already use. It
