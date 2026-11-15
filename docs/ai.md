@@ -257,7 +257,7 @@ ai: finding Gemma 4 26B A4B on big-box
 ai: reading the machines
 Gemma 4 26B A4B (UD-Q4_K_M, 30 layers): big-box 9 layers (5.5 GB, 2 on its graphics card); this Mac 19 layers (11.8 GB); old-mac 2 layers (1.2 GB)
 file: ~/llm/models/picks/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf
-engine flags: --device CUDA0,RPC0,RPC1 -ngl 23 -ts 2,19,2
+engine flags: --device CUDA0,RPC0,RPC1 -ngl 24 -ts 2,19,3
 ```
 
 That is a real plan on three machines, 15 November 2026 (machines renamed, the
@@ -281,18 +281,22 @@ have room for.
 judges" above), less 1 GB on the engine machine for its working memory, and
 each layer needs its share of the file plus a tenth. The layers fill:
 
-1. the engine machine's graphics card, as many as fit;
+1. the engine machine's graphics card, as many as fit (only its first card);
 2. helper machines whose memory is at least twice as fast as the engine
    machine's own, fastest first, since every word crosses the network to them;
 3. the engine machine's own memory;
 4. the other helpers, fastest first.
 
-A helper that gets no layers isn't started. The layout replaces the settings'
-`model`, `devices`, `split` and `layers` for that run, and is kept in the run's
-sealed record; everything else, the helpers' addresses included, comes from the
-settings file, so the machines it can use are the ones the file lists
-(`[helper]` and each `[[far_helper]]`). `--model` can't be combined with
-`--split` or `overrides`, which place layers by hand.
+A helper that gets no layers isn't started. The engine counts the model's
+output layer as one more layer after the last, so `-ngl` is one more than the
+layers sent out and the last device holds that one too, as in the example. The
+layout replaces the settings' `model`, `devices`, `split` and `layers` for that
+run, and is kept in the sealed record (for `serve`, the session's, and tools see
+the model's id as its name); everything else, the helpers' addresses included,
+comes from the settings file, so the machines it can use are the ones the file
+lists (`[helper]` and each `[[far_helper]]`). `--model` can't be combined with
+`--split`, `overrides`, or `args` that place layers by hand (`-ngl`, `-ts`,
+`--device`, `-ot`, `--n-cpu-moe` and the like).
 
 ## Keep it ready for your tools
 

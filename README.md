@@ -73,12 +73,16 @@ hidden-`.pth` problem with editable installs on macOS. Add an alias or put
 `bin/` on your PATH.
 
 `orchard find` looks for a few seconds for machines on your network that
-announce SSH over Bonjour (a Mac with Remote Login on, or Linux with Avahi). For
-each one it says whether it is already a worker and whether your SSH keys open
-it, and for those they do, prints the lines to add to `~/.orchard/config.toml`.
-It opens no port, records no host key and changes nothing: nobody on the
-network can join, and adding a machine stays your step. Machines that don't
-announce themselves, like most Windows ones, are added by hand.
+announce SSH over Bonjour (a Mac with Remote Login on, or Linux with Avahi set up
+to announce SSH), and says whether each is already a worker. `--check-keys` also
+tries your SSH keys on each new one, but only where you already trust its host
+key (it is in your `known_hosts`), so your user name and keys never go to a
+machine you haven't checked; no password is tried and nothing is forwarded. For
+those your keys open, it prints the lines to add to `~/.orchard/workers.toml`.
+It opens no port and changes nothing: nobody on the network can join, and adding
+a machine stays your step. What a machine announces is checked before it is
+printed. Machines that don't announce themselves, like most Windows ones, are
+added by hand.
 
 ## Use
 

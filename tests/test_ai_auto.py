@@ -129,12 +129,13 @@ def test_the_run_gets_the_file_devices_split_and_layers_and_only_the_helpers_it_
                                 remote=fake_remote({"mid-Q4_K_M.gguf": "/m/mid-Q4_K_M.gguf"}))
     e = cfg["engine"]
     # 0.29 GB a layer: the card 5, this Mac the other 25; old-mac isn't needed
-    assert (e["model"], e["devices"], e["split"], e["layers"]) == ("/m/mid-Q4_K_M.gguf", "CUDA0,RPC0", "5,25", 30)
+    # -ngl counts the engine's output layer too, which the last device holds
+    assert (e["model"], e["devices"], e["split"], e["layers"]) == ("/m/mid-Q4_K_M.gguf", "CUDA0,RPC0", "5,26", 31)
     assert cfg["far_helpers"] == [] and ai.has_helper(cfg)
     assert layout["not_started"] == ["old-mac"]
     argv = ai.engine_command(cfg, "q", 10)
     assert argv[argv.index("--rpc") + 1] == "127.0.0.1:50072"
-    assert ai_auto.describe(layout) == ("Mid (Q4_K_M, 30 layers): big-box 5 layers (1.5 GB, all on its graphics chip); "
+    assert ai_auto.describe(layout) == ("Mid (Q4_K_M, 30 layers): big-box 5 layers (1.5 GB, all on its graphics card); "
                                         "this Mac 25 layers (7.3 GB); not needed: old-mac")
 
 
@@ -201,7 +202,43 @@ def test_ai_plan_prints_the_layout_and_the_engine_flags(monkeypatch):
     result = runner.invoke(cli.app, ["ai", "plan", "mid"])
     assert result.exit_code == 0, result.output
     assert "Mid (Q4_K_M, 30 layers): big-box 5 layers" in result.stdout
-    assert "engine flags: --device CUDA0,RPC0 -ngl 30 -ts 5,25" in result.stdout
+    assert "engine flags: --device CUDA0,RPC0 -ngl 31 -ts 5,26" in result.stdout
     result = runner.invoke(cli.app, ["ai", "plan", "mid", "--json"])
     data = json.loads(result.stdout)
     assert data["devices"] == "CUDA0,RPC0" and data["parts"][0]["machine"] == "big-box"
+
+
+def test_the_engine_keeps_exactly_the_layers_the_plan_gives_it():
+    # llama.cpp keeps layers below (block count + 1 - ngl) on the engine's own memory.
+    cfg, layout = ai_auto.apply(settings(), "mid", catalogue={"models": [model()]}, read=reader(pool()),
+                                remote=fake_remote({"mid-Q4_K_M.gguf": "/m/mid-Q4_K_M.gguf"}))
+    e = cfg["engine"]
+    planned = next(p["layers"] for p in layout["parts"] if p["device"] == "CPU")
+    assert (e["devices"], e["split"], e["layers"]) == ("CUDA0,RPC0,RPC1", "2,18,4", 24)
+    assert 30 + 1 - e["layers"] == planned == 7
+
+
+def test_two_far_helpers_on_one_host_get_their_own_devices_and_only_the_first_card_counts():
+    box, mac, old = pool()
+    box["gpus"].append({"name": "GeForce", "kind": "nvidia", "memory_mb": 2 * GIB})
+    twin = ai_pick.Machine(**{k: v for k, v in old.items() if k != "part"})
+    cfg = settings(helper=False)
+    cfg["far_helpers"].append({**cfg["far_helpers"][0], "port": 50053, "local_port": 50063, "tunnel_port": 50074})
+    seq = iter([box, old, twin])
+    out, layout = ai_auto.apply(cfg, "mid", catalogue={"models": [model(gb=12.0)]},
+                                read=lambda name, target: ai_pick.Machine(**{k: v for k, v in next(seq).items() if k != "part"}),
+                                remote=fake_remote({"mid-Q4_K_M.gguf": "/m/a.gguf"}))
+    devices = out["engine"]["devices"].split(",")
+    assert devices[0] == "CUDA0" and len(set(devices)) == len(devices)
+    gpu = next(p for p in layout["parts"] if p["device"] == "CUDA0")
+    assert gpu["layers"] == 3  # one 2 GB card's room (1.6 GB) at 0.44 GB a layer, not both cards'
+
+
+def test_settings_that_place_layers_by_hand_are_refused_with_model():
+    cfg = settings()
+    cfg["engine"]["args"] = ["--temp", "0", "--n-cpu-moe", "20"]
+    with pytest.raises(ai.ConfigError, match=r"engine.args places layers by hand \(--n-cpu-moe\)"):
+        ai_auto.apply(cfg, "mid", catalogue={"models": [model()]})
+    cfg["engine"]["args"], cfg["server"]["args"] = [], ["-ngl=10"]
+    with pytest.raises(ai.ConfigError, match=r"server.args places layers by hand \(-ngl\)"):
+        ai_auto.apply(cfg, "mid", catalogue={"models": [model()]})

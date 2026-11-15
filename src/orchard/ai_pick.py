@@ -606,7 +606,10 @@ def held_gb(record: dict, model: dict, quant: dict, name_of: Callable[[str | Non
     helpers = ([here] if who.get("helper") else []) + [name_of(h) for h in who.get("far_helpers") or []]
     engine = name_of(who.get("engine"))
     per_layer = quant["bytes"] / GB / blocks
-    out: dict[str, float] = {engine: (blocks - sent) * per_layer}
+    # The engine counts its output layer as one more, so -ngl N sends N - 1 of
+    # the model's layers and the output layer; the engine keeps the rest.
+    sent = min(int(settings.get("layers") or 0), blocks + 1)
+    out: dict[str, float] = {engine: (blocks - max(sent - 1, 0)) * per_layer}
     for device, part in zip(devices, parts):
         index = device[3:]
         if device.upper().startswith("RPC") and not (index.isdigit() and int(index) < len(helpers)):

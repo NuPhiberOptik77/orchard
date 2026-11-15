@@ -83,10 +83,13 @@ def read_pool(cfg: dict, read: Callable | None = None) -> list[ai_pick.Machine]:
     wanted += [("far", h["host"], h["host"]) for h in cfg.get("far_helpers", [])]
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(wanted)) as pool:
         machines = list(pool.map(lambda w: read(w[1], w[2]), wanted))
+    far = 0
     for (part, _, _), m in zip(wanted, machines):
         if not m.get("reachable"):
             raise ai.ConfigError(f"cannot read {m['name']}: {m.get('why') or 'no answer'}")
         m["part"] = part
+        if part == "far":
+            m["far_index"], far = far, far + 1
     return machines
 
 
@@ -101,8 +104,10 @@ def _devices(machines: list[ai_pick.Machine]) -> list[dict]:
         out.append({"machine": engine, "device": "MTL0", "room": engine.room_gb - ai_pick.NEED_EXTRA_GB})
         own = None
     else:
-        if engine.vram_gb > 0:
-            out.append({"machine": engine, "device": "CUDA0", "room": engine.vram_gb})
+        first = next((g for g in engine["gpus"] if g["kind"] == "nvidia" and g["memory_mb"]), None)
+        if first:
+            # Only the first card takes layers; any others are left alone.
+            out.append({"machine": engine, "device": "CUDA0", "room": first["memory_mb"] * ai_pick.VRAM_SHARE / 1024})
         own = {"machine": engine, "device": "CPU", "room": engine.room_gb - engine.vram_gb - ai_pick.NEED_EXTRA_GB}
     fast = sorted([m for m in helpers if own is None or m.speed_gbs >= HELPER_EDGE * engine.speed_gbs],
                   key=lambda m: m.speed_gbs, reverse=True)
@@ -141,6 +146,10 @@ def apply(cfg: dict, name: str, say: Callable[[str], None] = lambda _: None, *,
     e = cfg["engine"]
     if e.get("overrides"):
         raise ai.ConfigError("--model works out where each layer goes: leave out overrides")
+    for where, args in (("engine.args", e.get("args")), ("server.args", cfg.get("server", {}).get("args"))):
+        words = {str(a).split("=", 1)[0] for a in args or []}
+        if hand := sorted(words & (ai_pick.PLACEMENT_FLAGS | set().union(*ai_pick.POSITION_FLAGS))):
+            raise ai.ConfigError(f"{where} places layers by hand ({', '.join(hand)}): take that out to use --model")
     catalogue = catalogue or ai_pick.builtin_list()
     model = find_model(name, catalogue)
     say(f"finding {model['name']} on {e['host']}")
@@ -173,24 +182,29 @@ def apply(cfg: dict, name: str, say: Callable[[str], None] = lambda _: None, *,
     helper_used = any(d["machine"]["part"] == "helper" for d in used)
     if not helper_used:
         out["helper"]["folder"] = ""
-    far_used = {d["machine"]["name"] for d in used if d["machine"]["part"] == "far"}
-    out["far_helpers"] = [h for h in cfg.get("far_helpers", []) if h["host"] in far_used]
+    far_used = sorted({d["machine"]["far_index"] for d in used if d["machine"]["part"] == "far"})
+    out["far_helpers"] = [cfg["far_helpers"][i] for i in far_used]
     # RPC numbers follow the engine's --rpc list: this machine's helper, then each far helper kept.
-    rpc = (["helper"] if helper_used else []) + [h["host"] for h in out["far_helpers"]]
+    rpc = (["helper"] if helper_used else []) + [("far", i) for i in far_used]
     offloaded = []
     for d in used:
         if d["device"] == "CPU":
             continue
         if d["device"] == "RPC":
-            key = "helper" if d["machine"]["part"] == "helper" else d["machine"]["name"]
+            key = "helper" if d["machine"]["part"] == "helper" else ("far", d["machine"]["far_index"])
             d["device"] = f"RPC{rpc.index(key)}"
         offloaded.append(d)
-    offloaded.sort(key=lambda d: (not d["device"].startswith(("CUDA", "MTL")), d["device"]))
+    offloaded.sort(key=lambda d: (not d["device"].startswith(("CUDA", "MTL")), int(d["device"].lstrip("CUDAMTLRPC") or 0)))
     oe = out["engine"]
     oe["model"] = found[quant["quant"]]
+    # The engine counts the output layer as one more layer, placed after the last
+    # one: -ngl takes it too, and the last device holds it.
+    counts = [d["layers"] for d in offloaded]
+    if counts:
+        counts[-1] += 1
     oe["devices"] = ",".join(d["device"] for d in offloaded)
-    oe["split"] = ",".join(str(d["layers"]) for d in offloaded)
-    oe["layers"] = sum(d["layers"] for d in offloaded)
+    oe["split"] = ",".join(str(c) for c in counts)
+    oe["layers"] = sum(counts)
     record = {"model": model["id"], "name": model["name"], "quant": quant["quant"], "file": oe["model"],
               "layers": model["layers"],
               "parts": [{"machine": d["machine"]["name"], "device": d["device"], "layers": d["layers"], "gb": d["gb"]}
@@ -213,7 +227,8 @@ def describe(record: dict) -> str:
         mine = [p for p in record["parts"] if p["machine"] == name]
         gpu = sum(p["layers"] for p in mine if p["device"].startswith(("CUDA", "MTL")))
         layers, gb = sum(p["layers"] for p in mine), round(sum(p["gb"] for p in mine), 1)
-        on_card = "" if not gpu else ", all on its graphics chip" if gpu == layers else f", {gpu} on its graphics card"
+        chip = "graphics chip" if any(p["device"].startswith("MTL") for p in mine) else "graphics card"
+        on_card = "" if not gpu else f", all on its {chip}" if gpu == layers else f", {gpu} on its {chip}"
         parts.append(f"{name} {layers} layers ({gb} GB{on_card})")
     rest = f"; not needed: {', '.join(record['not_started'])}" if record["not_started"] else ""
     return f"{record['name']} ({record['quant']}, {record['layers']} layers): {'; '.join(parts)}{rest}"

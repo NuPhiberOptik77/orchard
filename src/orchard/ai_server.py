@@ -338,6 +338,8 @@ class Engine:
                          "far_helpers": [h["host"] for h in self.cfg.get("far_helpers", [])]},
             "command": server_command(self.server_cfg), "answers": [],
         }
+        if self.cfg.get("layout"):
+            self.session["layout"] = self.cfg["layout"]
         ai._save(self.session)
         self.state, self.stop_reason = "loading", None
         self.pool = _ServerPool(self.server_cfg, folder, self.say)
@@ -1194,7 +1196,7 @@ def serve(port: int | None = None, keep_alive: int | None = None, say: Callable[
     if model:
         from . import ai_auto
         cfg, layout = ai_auto.apply(cfg, model, say)
-        cfg["server"]["name"] = cfg["server"]["name"] or layout["model"]
+        cfg["server"]["name"], cfg["layout"] = layout["model"], layout
     if port is not None:
         cfg["server"]["port"] = port
     if keep_alive is not None:

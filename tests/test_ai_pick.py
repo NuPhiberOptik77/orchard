@@ -591,8 +591,9 @@ def test_how_much_each_machine_held_comes_from_the_layers():
     record = {"settings": {"layers": 28, "devices": "CUDA0,RPC0,RPC1", "split": "2,16,10", "overrides": ""},
               "machines": {"engine": "big-box", "helper": True, "far_helpers": ["old-mac"]}}
     held = ai_pick.held_gb(record, mid, mid["quants"][0], lambda h: h, "this Mac")
-    # 0.6 GB a layer: big-box keeps 2 layers and its card takes 2, this Mac 16, old-mac 10
-    assert held == {"big-box": 2.4, "this Mac": 9.6, "old-mac": 6.0}
+    # 0.6 GB a layer; -ngl 28 sends 27 layers and the output layer: big-box keeps 3 and
+    # its card takes 2, this Mac 16, old-mac 10 (one of them the output layer)
+    assert held == {"big-box": 3.0, "this Mac": 9.6, "old-mac": 6.0}
     record["settings"]["overrides"] = "exps=CPU"
     assert ai_pick.held_gb(record, mid, mid["quants"][0], lambda h: h, "this Mac") is None
     record["settings"].update(overrides="", split="")
@@ -607,7 +608,7 @@ def test_an_answered_run_shows_its_measured_speed_next_to_the_estimate():
     assert ("ran here: 4.0 words a second on big-box and this Mac, 14 Nov "
             "(record ai-20261114-100000-aaaa, measured)") in text
     run = ai_pick.as_json(result, None, [])["best"]["runs"][0]
-    assert run["held"] == {"big-box": 8.4, "this Mac": 9.6} and run["words_per_second"] == 4.0
+    assert run["held"] == {"big-box": 9.0, "this Mac": 9.6} and run["words_per_second"] == 4.0
 
 
 def test_a_machine_that_ran_short_of_memory_counts_less_room_after():
@@ -635,11 +636,11 @@ def test_a_far_helper_or_the_engine_running_short_is_read_too():
            far=["old-mac"], reason="old-mac is short of memory")
     run_of("ai-20261114-120000-cccc", "stopped", reason="under 1500 MB free on the engine machine")
     caps = ai_pick.history(fleet(), catalogue(layered()))["caps"]
-    assert caps["old-mac"]["gb"] == 4.8 and caps["big-box"]["gb"] == 6.7  # 80% of 6.0 and of 8.4
+    assert caps["old-mac"]["gb"] == 4.8 and caps["big-box"]["gb"] == 7.2  # 80% of 6.0 and of 9.0
     machines = fleet()
     ai_pick.pick(machines, catalogue(layered()), past={"runs": {}, "caps": caps})
     assert machines[2].room_gb == 4.0 and "cap_gb" not in machines[2]  # already below the limit
-    assert machines[1].room_gb == 6.7
+    assert machines[1].room_gb == 7.2
 
 
 def test_unsealed_refused_and_hand_split_runs_change_nothing():

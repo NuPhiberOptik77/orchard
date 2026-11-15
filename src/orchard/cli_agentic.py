@@ -1029,14 +1029,16 @@ def ai_plan(
 @app.command("find")
 def find_machines(
     seconds: float = typer.Option(3.0, "--seconds", help="how long to look"),
+    check_keys: bool = typer.Option(False, "--check-keys", help="try your ssh keys on machines whose host key you trust"),
     json_out: bool = typer.Option(False, "--json", help="machine-readable output"),
 ) -> None:
     """Find machines on this network that Orchard could use, and say how to add
-    them. Looks for machines announcing ssh over Bonjour, checks which your ssh
-    keys open, and changes nothing. Exit 0."""
+    them. Looks for machines announcing ssh over Bonjour and changes nothing;
+    --check-keys also tries your ssh keys, only where you already trust the
+    machine's host key. Exit 0."""
     from . import discover
 
-    found = discover.find(seconds)
+    found = discover.find(seconds, check_keys=check_keys)
     if json_out:
         print(json.dumps(found, indent=2))
         return

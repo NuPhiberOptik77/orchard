@@ -57,39 +57,61 @@ def test_each_machine_is_this_one_a_worker_one_your_keys_open_or_not(monkeypatch
              {"name": "Studio", "host": "studio.local", "port": 22},
              {"name": "Kitchen", "host": "kitchen.local", "port": 2222}]
     tried = []
-    result = discover.find(1, look_fn=lambda s: found,
+    found.append({"name": "Cafe", "host": "cafe.local", "port": 22})
+    statuses = {"studio.local": "opens", "kitchen.local": "closed", "cafe.local": "unverified"}
+    result = discover.find(1, check_keys=True, look_fn=lambda s: found,
                            hostname=lambda target: "old-mac.local" if target == "old-mac" else target,
-                           opens=lambda host, port, user: tried.append((host, port, user)) or host == "studio.local",
+                           opens=lambda host, port, user: tried.append((host, port, user)) or statuses[host],
                            here=lambda: "this-mac.local", user="me")
-    assert [r["status"] for r in result] == ["this machine", "worker", "opens", "closed"]
+    assert [r["status"] for r in result] == ["this machine", "worker", "opens", "closed", "unverified"]
     assert result[1]["worker"] == "old-mac" and result[2]["suggest"] == "studio"
-    assert sorted(tried) == [("kitchen.local", 2222, "me"), ("studio.local", 22, "me")]  # never this one or a worker
+    assert sorted(tried) == [("cafe.local", 22, "me"), ("kitchen.local", 2222, "me"), ("studio.local", 22, "me")]
     text = "\n".join(discover.report(result, 1))
     assert "Studio: studio.local, your ssh keys open it as me. To add it, put this in" in text
     assert '      name = "studio"\n      host = "studio.local"' in text
     assert "Kitchen: kitchen.local:2222, found, but your ssh keys don't open it as me" in text
     assert "Old Mac: Old-Mac.local., already an Orchard worker (old-mac)" in text
+    assert "Cafe: cafe.local, its host key isn't one you trust yet, so no key was tried" in text
     assert text.endswith("Nothing was changed.")
+    # Without --check-keys no key is tried at all.
+    tried.clear()
+    plain = discover.find(1, look_fn=lambda s: found, hostname=lambda t: t, here=lambda: "",
+                          opens=lambda *a: tried.append(a) or "opens", user="me")
+    assert tried == [] and {r["status"] for r in plain} == {"found"}
 
 
-def test_the_key_check_records_nothing_and_forwards_nothing(monkeypatch):
-    seen = []
-    monkeypatch.setattr(discover.subprocess, "run", lambda argv, **k: seen.append(argv) or type("R", (), {"returncode": 0})())
-    assert discover.keys_open("studio.local", 22, "me")
+def test_the_key_check_trusts_only_known_host_keys_and_forwards_nothing(monkeypatch):
+    seen, answer = [], {"returncode": 0, "stderr": ""}
+    monkeypatch.setattr(discover.subprocess, "run", lambda argv, **k: seen.append(argv) or type("R", (), answer)())
+    assert discover.keys_open("studio.local", 22, "me") == "opens"
     argv = seen[0]
-    for option in ("BatchMode=yes", "UserKnownHostsFile=/dev/null", "ForwardAgent=no", "ClearAllForwardings=yes"):
+    for option in ("BatchMode=yes", "StrictHostKeyChecking=yes", "PasswordAuthentication=no",
+                   "KbdInteractiveAuthentication=no", "ForwardAgent=no", "ForwardX11=no", "ClearAllForwardings=yes"):
         assert option in argv
+    assert "UserKnownHostsFile=/dev/null" not in argv
+    answer.update(returncode=255, stderr="No ED25519 host key is known for studio.local\nHost key verification failed.")
+    assert discover.keys_open("studio.local", 22, "me") == "unverified"
+    answer.update(stderr="me@studio.local: Permission denied (publickey).")
+    assert discover.keys_open("studio.local", 22, "me") == "closed"
     assert argv[-2:] == ["me@studio.local", "true"]
 
 
 def test_orchard_find_prints_and_changes_nothing(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "CONFIG_PATH", tmp_path / "config.toml")
     monkeypatch.setattr(discover, "look", lambda seconds: [{"name": "Studio", "host": "studio.local", "port": 22}])
-    monkeypatch.setattr(discover, "keys_open", lambda host, port, user: True)
+    monkeypatch.setattr(discover, "keys_open", lambda host, port, user: "opens")
     monkeypatch.setattr(discover, "_this_host", lambda: "")
     monkeypatch.setattr(discover, "_ssh_hostname", lambda target: target)
-    result = runner.invoke(cli.app, ["find", "--seconds", "1"])
+    result = runner.invoke(cli.app, ["find", "--seconds", "1", "--check-keys"])
     assert result.exit_code == 0 and "your ssh keys open it" in result.stdout
     assert not (tmp_path / "config.toml").exists()
     data = json.loads(runner.invoke(cli.app, ["find", "--json"]).stdout)
-    assert data[0]["status"] == "opens"
+    assert data[0]["status"] == "found"
+
+
+def test_what_a_machine_announces_is_checked_before_it_is_printed():
+    assert discover.parse_lookup("x can be reached at evil;rm -rf ~.local.:22 (interface 12)") is None
+    assert discover.parse_lookup("x can be reached at $(id).local.:22") is None
+    assert discover.parse_lookup("x can be reached at ok-box.local.:99999") is None
+    bad = "=;wlan0;IPv4;n;_ssh._tcp;local;a|b.local;192.0.2.1;22;\n=;wlan0;IPv4;caf\\233\\027[2Jx;_ssh._tcp;local;fine.local;192.0.2.2;22;"
+    assert discover.parse_avahi(bad) == [{"name": "caf\u00e9[2Jx", "host": "fine.local", "port": 22}]
