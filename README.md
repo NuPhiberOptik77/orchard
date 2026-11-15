@@ -218,3 +218,5 @@ uv run pytest
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+Made by Alistair Akrofi-Mantey at [Allwhen Labs](https://allwhengroup.com).

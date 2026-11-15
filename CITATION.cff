@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: Orchard
+type: software
+authors:
+  - given-names: Alistair
+    family-names: Akrofi-Mantey
+license: MIT
+url: "https://allwhengroup.com/orchard"
