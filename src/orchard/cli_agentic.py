@@ -1026,24 +1026,93 @@ def ai_plan(
     print(f"engine flags: --device {e['devices'] or '(none)'} -ngl {e['layers']} -ts {e['split'] or '(none)'}")
 
 
+@ai_app.command("install")
+def ai_install(
+    role: str = typer.Option(..., "--role", help="engine (holds the model) or helper (lends its memory)"),
+    host: str = typer.Option("", "--host", help="ssh name of the machine; leave out for this one"),
+    folder: str = typer.Option("", "--folder", help="where it goes; ~/llm/engine or ~/llm/helper by default"),
+    yes: bool = typer.Option(False, "--yes", help="download and install; without it, only say what it would do"),
+    undo: bool = typer.Option(False, "--undo", help="remove what the last install put there"),
+    json_out: bool = typer.Option(False, "--json", help="machine-readable output"),
+) -> None:
+    """Put llama.cpp's engine or helper on a machine in one step. Says first
+    what it would download, from where, how big and into which folder; only
+    --yes downloads. Every file is checked against a pinned digest, and --undo
+    removes exactly what was put there. Exit 0 done or planned, 1 refused or
+    failed, 2 bad input."""
+    from . import ai_install as inst
+
+    try:
+        if undo:
+            result = inst.undo(role, host)
+            if json_out:
+                print(json.dumps(result, indent=2))
+                return
+            if result["gone_already"]:
+                print(f"install: {result['folder']} was already gone; forgot the install")
+                return
+            kept = result["listed"] - result["removed"]
+            print(f"install: removed {result['removed']} files from {result['folder']}"
+                  + (f", and kept {kept} changed since the install" if kept else "")
+                  + ("; the folder too" if result["folder_gone"] else
+                     f"; left what wasn't Orchard's: {result['left']}" if result["left"] else ""))
+            return
+        p = inst.plan(role, host, folder)
+        if not yes:
+            if json_out:
+                print(json.dumps(p, indent=2))
+                return
+            for line in inst.describe(p):
+                print(line)
+            where = f" --host {host}" if host else ""
+            more = f" --folder {folder}" if folder else ""
+            print(f"Nothing was downloaded. To go ahead: orchard ai install --role {role}{where}{more} --yes")
+            return
+        if not json_out:
+            for line in inst.describe(p):
+                print(line)
+        record = inst.install(p)
+    except inst.InstallError as exc:
+        print(f"install: {exc}", file=sys.stderr)
+        raise typer.Exit(2 if isinstance(exc, inst.BadInput) else 1)
+    if json_out:
+        print(json.dumps(record, indent=2))
+        return
+    where = f" --host {host}" if host else ""
+    print(f"install: {len(record['files'])} files in {record['folder']}, and {p['binary']} starts there.")
+    print(f"Undo: orchard ai install --role {role}{where} --undo")
+
+
 @app.command("find")
 def find_machines(
     seconds: float = typer.Option(3.0, "--seconds", help="how long to look"),
     check_keys: bool = typer.Option(False, "--check-keys", help="try your ssh keys on machines whose host key you trust"),
+    add: bool = typer.Option(False, "--add", help="add the machines your keys open as workers (implies --check-keys)"),
+    undo: bool = typer.Option(False, "--undo", help="put the workers file back as it was before --add first changed it"),
     json_out: bool = typer.Option(False, "--json", help="machine-readable output"),
 ) -> None:
     """Find machines on this network that Orchard could use, and say how to add
     them. Looks for machines announcing ssh over Bonjour and changes nothing;
     --check-keys also tries your ssh keys, only where you already trust the
-    machine's host key. Exit 0."""
+    machine's host key; --add adds those your keys open, and --undo takes
+    that back. Exit 0, or 1 when there is nothing to undo."""
     from . import discover
 
-    found = discover.find(seconds, check_keys=check_keys)
+    if undo:
+        done = discover.undo()
+        print(f"find: {done}" if done else "find: nothing to undo")
+        raise typer.Exit(0 if done else 1)
+    found = discover.find(seconds, check_keys=check_keys or add)
+    added = discover.add(found) if add else []
     if json_out:
-        print(json.dumps(found, indent=2))
+        print(json.dumps({"found": found, "added": [w.name for w in added]} if add else found, indent=2))
         return
     for line in discover.report(found, seconds):
         print(line)
+    if add:
+        for w in added:
+            print(f"added worker {w.name} ({w.target})")
+        print("Undo: orchard find --undo" if added else "No machine to add.")
 
 
 def _can_ask() -> bool:

@@ -193,3 +193,56 @@ def report(found: list[dict], seconds: float) -> list[str]:
     lines.append("Machines that don't announce themselves, like most Windows and Linux ones, can be added by hand. "
                  "Nothing was changed.")
     return lines
+
+
+# Adding what was found, with an undo.
+
+ABSENT = "# orchard find: there was no workers file before\n"
+
+
+def undo_path():
+    return config.CONFIG_PATH.with_name(config.CONFIG_PATH.name + ".undo")
+
+
+def add(found: list[dict]) -> list[config.Worker]:
+    """Add each machine your keys open as a worker. The workers file as it was
+    before the first --add is kept, so `orchard find --undo` puts it back, even
+    after several. Only machines whose host key you already trust can be
+    "opens"; nothing else is added."""
+    workers = config.load_workers()
+    names = {w.name for w in workers}
+    hosts = {w.host.lower().rstrip(".") for w in workers}
+    added = []
+    for f in found:
+        if f.get("status") != "opens" or f["host"].lower().rstrip(".") in hosts or f.get("port", 22) != 22:
+            continue
+        name, n = f["suggest"], 2
+        while name in names:
+            name, n = f"{f['suggest']}-{n}", n + 1
+        names.add(name)
+        hosts.add(f["host"].lower().rstrip("."))
+        who = f.get("user")
+        added.append(config.Worker(name=name, host=f["host"], user=None if who in (None, getpass.getuser()) else who))
+    if added:
+        if not undo_path().exists():
+            before = config.CONFIG_PATH.read_text() if config.CONFIG_PATH.exists() else ABSENT
+            undo_path().parent.mkdir(parents=True, exist_ok=True)
+            undo_path().write_text(before)
+        config.save_workers(workers + added)
+    return added
+
+
+def undo() -> str | None:
+    """Put the workers file back as it was before `orchard find --add` first
+    changed it. Changes made to it since, by hand too, are dropped."""
+    keep = undo_path()
+    if not keep.exists():
+        return None
+    before = keep.read_text()
+    if before == ABSENT:
+        config.CONFIG_PATH.unlink(missing_ok=True)
+    else:
+        config.CONFIG_PATH.write_text(before)
+    keep.unlink()
+    return ("removed the workers file, which orchard find --add had made" if before == ABSENT
+            else "put the workers file back as it was before orchard find --add")

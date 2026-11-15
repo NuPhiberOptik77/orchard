@@ -35,14 +35,43 @@ record ai-20261106-091520-92d5
 
 ## Setting it up
 
-1. Build the engine on the machine that holds the model, and the helper on the
-   machine lending a GPU. See [contrib/ai](../contrib/ai/README.md).
+1. Put the engine on the machine that holds the model, and the helper on each
+   machine lending its memory: `orchard ai install` (below) does it in one step,
+   or build them yourself with [contrib/ai](../contrib/ai/README.md).
 2. Download a model. That and its licence are yours to do: Orchard never fetches
    one.
 3. Run `orchard ai setup`. It writes `~/.orchard/ai.toml` for you to fill in.
 4. Run `orchard ai setup` again. It checks each machine and changes nothing: the
    engine, the model files, free disk, memory, which GPUs it found, and the
    Orchard worker.
+
+### Install in one step
+
+```bash
+orchard ai install --role engine --host big-box
+orchard ai install --role helper --host old-mac
+```
+
+Each first reads the machine and says what it would fetch, and changes nothing:
+the file from llama.cpp's own release, where from, its size, the digest it will
+be checked against, and the folder (`~/llm/engine` or `~/llm/helper`, or
+`--folder`). Leave out `--host` for this machine. It picks the release file for
+the machine: a Mac with Apple silicon or Intel, or Linux on x86_64 (the NVIDIA
+build when `nvidia-smi` is there) or arm64. Anything else is built by hand.
+
+Add `--yes` to go ahead. The machine downloads the files itself, checks each
+against its digest, unpacks them, and starts the binary once; only if all of
+that works does anything go into the folder, which must be new or empty. What
+went in is written, with its digest, to `~/.orchard/install/` on this machine.
+`orchard ai install --role helper --host old-mac --undo` removes each of those
+files that is still as the install left it, the folders it made once they are
+empty, and the folder itself if the install made it. Files you added or changed
+there since stay.
+
+The release is pinned to the one the engine was tested with. It runs models that
+fit in memory as they are. For a model larger than memory, build the engine into
+a folder of its own with `build-engine.sh` in contrib/ai instead: it adds two
+patches the release doesn't have.
 
 ## What happens when you ask
 
@@ -81,6 +110,7 @@ capitals. `orchard ai resume` tries again.
 | `orchard ai ask "question"` | Ask. `-` reads the question from stdin. Exit 0 answered, 1 failed, 2 refused, 3 stopped. |
 | `orchard ai serve` | Keep the model ready for OpenAI, Claude and Ollama tools. `--port`, `--keep-alive`. Ctrl-C puts everything back. |
 | `orchard ai pick` | Which of the strongest open models for your use your machines can run, with their scores, and how they'd split. Asks the use, or `--for coding` (`agents`, `chat`, `reasoning`, `vision`, `general`); `--offline`, `--machines`, `--json`. |
+| `orchard ai install --role engine\|helper` | Say what it would download for a machine; `--yes` installs it, `--undo` removes it. `--host`, `--folder`, `--json`. Exit 0 done or planned, 1 refused or failed, 2 bad input. |
 | `orchard ai setup` | Write the settings file, or check the machines against it. |
 | `orchard ai show ID` | Show a record and check its seal. |
 | `orchard ai list` | Recent questions. |

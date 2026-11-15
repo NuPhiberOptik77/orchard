@@ -84,6 +84,12 @@ a machine stays your step. What a machine announces is checked before it is
 printed. Machines that don't announce themselves, like most Windows ones, are
 added by hand.
 
+`orchard find --add` does that step for you: it checks keys the same way and
+adds each machine they open as a worker, with a name of its own. It never adds a
+machine whose host key you haven't trusted. It keeps the workers file as it was
+before the first `--add`, and `orchard find --undo` puts it back, dropping any
+change made since.
+
 ## Use
 
 | Command | What it does |
