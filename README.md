@@ -72,8 +72,13 @@ Use `./bin/orchard` rather than `uv run orchard`; the launcher sidesteps a
 hidden-`.pth` problem with editable installs on macOS. Add an alias or put
 `bin/` on your PATH.
 
-`orchard discover` lists Macs advertising SSH over Bonjour if you need the
-worker's name.
+`orchard find` looks for a few seconds for machines on your network that
+announce SSH over Bonjour (a Mac with Remote Login on, or Linux with Avahi). For
+each one it says whether it is already a worker and whether your SSH keys open
+it, and for those they do, prints the lines to add to `~/.orchard/config.toml`.
+It opens no port, records no host key and changes nothing: nobody on the
+network can join, and adding a machine stays your step. Machines that don't
+announce themselves, like most Windows ones, are added by hand.
 
 ## Use
 

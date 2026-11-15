@@ -1044,7 +1044,7 @@ def discover(seconds: float = typer.Option(4.0, "--seconds", "-s", help="listen 
         return
     for name in found:
         print(f"found: {name}")
-    print("hint: orchard init --host <name>.local")
+    print("hint: orchard init --host <name>.local; orchard find says which of these your keys open")
 
 
 @app.command()

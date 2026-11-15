@@ -1026,6 +1026,24 @@ def ai_plan(
     print(f"engine flags: --device {e['devices'] or '(none)'} -ngl {e['layers']} -ts {e['split'] or '(none)'}")
 
 
+@app.command("find")
+def find_machines(
+    seconds: float = typer.Option(3.0, "--seconds", help="how long to look"),
+    json_out: bool = typer.Option(False, "--json", help="machine-readable output"),
+) -> None:
+    """Find machines on this network that Orchard could use, and say how to add
+    them. Looks for machines announcing ssh over Bonjour, checks which your ssh
+    keys open, and changes nothing. Exit 0."""
+    from . import discover
+
+    found = discover.find(seconds)
+    if json_out:
+        print(json.dumps(found, indent=2))
+        return
+    for line in discover.report(found, seconds):
+        print(line)
+
+
 def _can_ask() -> bool:
     """Someone is at the keyboard to answer a question, and the output isn't piped."""
     try:
