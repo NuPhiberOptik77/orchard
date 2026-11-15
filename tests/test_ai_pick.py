@@ -187,6 +187,15 @@ def test_the_probe_reads_this_machine():
     assert m.room_gb > 0
 
 
+@pytest.mark.skipif(__import__("sys").platform != "darwin", reason="macOS only")
+def test_on_a_mac_free_memory_is_the_figure_macos_itself_uses():
+    # What macOS can free by compressing idle apps counts as free, as its memory pressure does.
+    import subprocess
+    m = ai_pick.read_machine("this Mac", None)
+    level = int(subprocess.run(["sysctl", "-n", "kern.memorystatus_level"], capture_output=True, text=True).stdout)
+    assert abs(m["free_mb"] - m["ram_mb"] * level / 100) <= m["ram_mb"] * 0.05
+
+
 def test_a_machine_that_does_not_answer_is_marked(monkeypatch):
     monkeypatch.setattr(ai, "_ssh", lambda host: ["false"])
     m = ai_pick.read_machine("old-mac", "old-mac")
@@ -539,8 +548,10 @@ def test_a_pick_that_does_not_fit_now_names_the_busy_machine_and_the_best_that_d
     assert result["best_now"]["model"]["id"] == "small"
     text = "\n".join(ai_pick.report(result, None, []))
     assert "room for 12.0 GB of model (2.0 GB of it free right now)" in text
-    assert "right now: doesn't fit (this Mac has 2.0 GB free for its 10.6 GB share" in text
-    assert "it fits when this Mac, big-box and old-mac are quieter" in text
+    assert "right now: busy (this Mac has 2.0 GB free for its 10.6 GB share" in text
+    assert "it should fit when this Mac, big-box and old-mac are quieter" in text
+    assert "doesn't fit" not in text and "won't fit" not in text
+    assert "The picks are for when your machines are quiet." in text
     assert "Best that fits right now\n  Small (Q4_K_M, 3.0 GB file)" in text
     assert "held in memory: big-box 4.3 GB; about" in text  # where it would sit right now
     assert "Together: room for 23.6 GB of model in memory, 9.6 GB of it free right now." in text

@@ -156,25 +156,28 @@ squeezed model is weaker than its scores say; those are marked). When the
 strongest model overall is a different one, it is shown too. A model you
 already use with `orchard ai` is marked.
 
-Each model that fits also says whether it fits **right now**, from what each
-machine has free at this moment. If the best pick doesn't, it names the machines
-that are short and by how much, and shows the best model that does fit right
-now. And where you've run a model before, it shows what that run measured next
-to the estimate (see "It learns from your runs" below).
+The picks are for when your machines are quiet: apps you have open don't change
+them. Each model that fits also says whether it fits **right now**, from what
+each machine has free at this moment. If your machines are busy, it says so,
+names each busy machine and how much it has free, and shows the best model that
+does fit right now; the pick itself should fit once they're quieter. And where
+you've run a model before, it shows what that run measured next to the estimate
+(see "It learns from your runs" below).
 
 ```console
 $ orchard ai pick --for coding
 Your machines
-  this Mac   macOS arm64, 16 GB memory, Apple M5 GPU: room for 12.0 GB of model (3.7 GB of it free right now), 16.4 GB free disk, reads memory at 39.1 GB/s
-  old-mac    macOS x86_64, 8 GB memory, Intel Iris Plus Graphics 645: room for 4.0 GB of model (0.3 GB of it free right now), 17.2 GB free disk, reads memory at 8.1 GB/s
-  big-box    Linux in Windows x86_64, 8 GB memory, NVIDIA GeForce GTX 1050 2 GB: room for 7.4 GB of model (7.4 GB of it free right now), 65.6 GB free disk (the Windows drive), reads memory at 8.0 GB/s
-  Together: room for 23.4 GB of model in memory, 11.4 GB of it free right now.
+  this Mac   macOS arm64, 16 GB memory, Apple M5 GPU: room for 12.0 GB of model (3.3 GB of it free right now), 8.3 GB free disk, reads memory at 38.6 GB/s
+  old-mac    macOS x86_64, 8 GB memory, Intel Iris Plus Graphics 645: room for 4.0 GB of model (2.5 GB of it free right now), 13.6 GB free disk, reads memory at 8.8 GB/s
+  big-box    Linux in Windows x86_64, 8 GB memory, NVIDIA GeForce GTX 1050 2 GB: room for 7.4 GB of model (6.1 GB of it free right now), 63.3 GB free disk (the Windows drive), reads memory at 7.4 GB/s
+  Together: room for 23.4 GB of model in memory, 11.9 GB of it free right now.
+The picks are for when your machines are quiet. "Right now" says only what is free at this moment; `orchard ai ask` waits for memory before it starts.
 
 Best pick for coding
   Gemma 4 26B A4B (UD-Q4_K_M, 16.9 GB file)
     scores: coding 40.1% (SciCode), agents 1.9% (AutomationBench), reasoning 19.3% (Humanity's Last Exam), pictures 69.2% (MMMU-Pro), chat 1437.4 (Text Arena rating)
-    held in memory: this Mac 10.1 GB, big-box 6.2 GB, old-mac 3.4 GB; about 5.3 words a second (estimate)
-    right now: doesn't fit (this Mac has 3.7 GB free for its 10.1 GB share; old-mac has 0.3 GB free for its 3.4 GB share); it fits when this Mac and old-mac are quieter
+    held in memory: this Mac 10.1 GB, big-box 6.2 GB, old-mac 3.4 GB; about 5.2 words a second (estimate)
+    right now: busy (this Mac has 3.3 GB free for its 10.1 GB share; big-box has 6.1 GB free for its 6.2 GB share; old-mac has 2.5 GB free for its 3.4 GB share); it should fit when this Mac, big-box and old-mac are quieter
     ran here: 4.2 words a second on big-box and this Mac, 14 Nov (record ai-20261114-135432-5cae, measured)
     made for chat, coding, agents, pictures; takes in 256K tokens at once (about 197K words); 25B parameters, 3.8B at work per word
     licence apache-2.0; from huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF
@@ -183,7 +186,7 @@ Best pick for coding
 Best that fits right now
   MiniCPM5 2B (Q4_K_M, 1.6 GB file)
     scores: coding 26.3% (SciCode), general 221 (Progress Index), agents 1.8% (AutomationBench), reasoning 8.9% (Humanity's Last Exam)
-    held in memory: big-box 2.7 GB; about 5.1 words a second (estimate)
+    held in memory: big-box 2.7 GB; about 4.7 words a second (estimate)
     right now: fits
     made for chat; takes in 128K tokens at once (about 98K words); 2.5B parameters
     licence apache-2.0; from huggingface.co/openbmb/MiniCPM5-2B-GGUF
@@ -191,9 +194,9 @@ Best that fits right now
 Ranked for coding by SciCode (Artificial Analysis): 24 of the 29 models have a score; the rest come after them, those made for it first.
 ```
 
-That is a real run on three machines, 14 November 2026, while this Mac was busy
-with other work: Gemma had answered on two of them earlier that day, measured
-below the estimate. It downloads nothing.
+That is a real run on three machines, 15 November 2026, while all three were
+busy with other work: Gemma had answered on two of them the day before,
+measured below the estimate. It downloads nothing.
 The list ships with Orchard (`src/orchard/ai_models.json`): exact file sizes
 read from Hugging Face, and scores read from the named leaderboards, with the
 exact entry each was matched to. Unless you pass `--offline`, it also asks
@@ -218,7 +221,10 @@ count the engine's tokens, which Orchard calls words; a token is about three
 quarters of an English word.
 
 **Right now** is what each machine has free at this moment, less 1 GB, plus most
-of a graphics card's own memory, and never more than its room. For the machine
+of a graphics card's own memory, and never more than its room. On a Mac, free
+is macOS's own figure, the one its memory pressure follows, so memory it can
+free by compressing apps that sit idle counts as free; on Linux it is what the
+system says is available. For the machine
 that runs the engine under Linux inside Windows, it is the smaller of what Linux
 and Windows have free, since Linux can only grow into what Windows has. The best
 that fits right now is judged where it would sit right now, with the speed

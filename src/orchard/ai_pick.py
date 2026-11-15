@@ -123,14 +123,20 @@ if f["system"] == "Linux":
     m = re.search(r"model name\s*:\s*(.+)", open("/proc/cpuinfo").read())
     f["chip"] = m.group(1).strip() if m else ""
 else:
-    out = run(["vm_stat"])
-    m = re.search(r"page size of (\d+)", out)
-    page = int(m.group(1)) if m else 4096
-    pages = 0
-    for key in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"):
-        m = re.search(key + r":\s+(\d+)", out)
-        pages += int(m.group(1)) if m else 0
-    f["free_mb"] = pages * page // (1 << 20) if out else None
+    # macOS's own figure for free memory, the one its memory pressure follows:
+    # it counts what macOS can free by compressing apps that sit idle.
+    level = run(["sysctl", "-n", "kern.memorystatus_level"]).strip()
+    if level.isdigit() and 0 <= int(level) <= 100:
+        f["free_mb"] = f["ram_mb"] * int(level) // 100
+    else:
+        out = run(["vm_stat"])
+        m = re.search(r"page size of (\d+)", out)
+        page = int(m.group(1)) if m else 4096
+        pages = 0
+        for key in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"):
+            m = re.search(key + r":\s+(\d+)", out)
+            pages += int(m.group(1)) if m else 0
+        f["free_mb"] = pages * page // (1 << 20) if out else None
     f["chip"] = run(["sysctl", "-n", "machdep.cpu.brand_string"]).strip()
 for tool in ("nvidia-smi", "/usr/lib/wsl/lib/nvidia-smi"):
     if shutil.which(tool) or os.path.exists(tool):
@@ -769,11 +775,12 @@ def _now_text(row: dict) -> str | None:
         return "    right now: fits" + (f", held as {where}; about {row['words_per_second_now']} words a second there"
                                        if moved else "")
     if not row["short_now"]:
-        return "    right now: doesn't fit, with what your machines have free"
+        return "    right now: your machines are busy; it should fit when they're quieter"
     short = "; ".join(f"{m['name']} has {now} GB free for its {share} GB share" for m, share, now in row["short_now"])
     names = [m["name"] for m, _, _ in row["short_now"]]
     names = ", ".join(names[:-1]) + " and " + names[-1] if len(names) > 1 else names[0]
-    return f"    right now: doesn't fit ({short}); it fits when {names} {'is' if len(row['short_now']) == 1 else 'are'} quieter"
+    return (f"    right now: busy ({short}); it should fit when {names} "
+            f"{'is' if len(row['short_now']) == 1 else 'are'} quieter")
 
 
 def _runs_text(row: dict) -> list[str]:
@@ -848,6 +855,8 @@ def report(result: dict, online: dict | None, new: list[dict]) -> list[str]:
     if ready and all(m.room_now_gb is not None for m in ready):
         together += f", {round(sum(m.room_now_gb for m in ready), 1)} GB of it free right now"
     lines.append(together + ".")
+    lines.append("The picks are for when your machines are quiet. \"Right now\" says only what is free at this "
+                 "moment; `orchard ai ask` waits for memory before it starts.")
     lines.append("")
     best = result["best"]
     if best:
@@ -860,7 +869,8 @@ def report(result: dict, online: dict | None, new: list[dict]) -> list[str]:
         if best_now:
             lines += ["", "Best that fits right now"] + _row_lines(best_now, result)
         elif best.get("fits_now") is False:
-            lines += ["", "Nothing on the list fits in memory right now; try again when your machines are quieter."]
+            lines += ["", "Your machines are too busy right now for any model on the list; "
+                      "try again when they're quieter."]
         overall = result.get("overall")
         if overall and not (best_now and overall["model"] is best_now["model"]):
             lines += ["", "Strongest overall here, by general score"] + _row_lines(overall, result)
